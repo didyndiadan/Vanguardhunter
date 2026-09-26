@@ -1,0 +1,691 @@
+import { PGlite } from "@electric-sql/pglite";
+import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
+import { drizzle as drizzlePg } from "drizzle-orm/node-postgres";
+import pg from "pg";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import * as schema from "./schema";
+
+const { Pool } = pg;
+
+let dbInstance: ReturnType<typeof drizzlePglite<typeof schema>>;
+let pgliteClient: PGlite | null = null;
+let pgPool: pg.Pool | null = null;
+
+if (process.env.DATABASE_URL) {
+  pgPool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 25,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+  });
+  pgPool.on("error", (err) => {
+    console.error("[db] Unexpected error on idle PostgreSQL client (handled safely):", err.message);
+  });
+  dbInstance = drizzlePg(pgPool, { schema }) as unknown as ReturnType<typeof drizzlePglite<typeof schema>>;
+} else {
+  const dataDir = process.env.PGDATA_DIR || path.join(os.tmpdir(), "ai-business-hunter-pgdata-v2");
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    const pidFile = path.join(dataDir, "postmaster.pid");
+    if (fs.existsSync(pidFile)) {
+      try { fs.unlinkSync(pidFile); } catch {}
+    }
+    pgliteClient = new PGlite(dataDir);
+  } catch {
+    pgliteClient = new PGlite();
+  }
+  dbInstance = drizzlePglite(pgliteClient, { schema });
+}
+
+export const db = dbInstance;
+export * from "./schema";
+
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS site_config (
+  id SERIAL PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  value TEXT NOT NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS email_accounts (
+  id SERIAL PRIMARY KEY,
+  label TEXT NOT NULL DEFAULT '',
+  provider TEXT NOT NULL DEFAULT 'gmail',
+  host TEXT NOT NULL DEFAULT 'smtp.gmail.com',
+  port INTEGER NOT NULL DEFAULT 587,
+  secure BOOLEAN NOT NULL DEFAULT false,
+  "user" TEXT NOT NULL DEFAULT '',
+  password TEXT NOT NULL DEFAULT '',
+  from_name TEXT NOT NULL DEFAULT 'AI Business Hunter',
+  from_email TEXT NOT NULL DEFAULT '',
+  imap_enabled BOOLEAN NOT NULL DEFAULT false,
+  imap_host TEXT NOT NULL DEFAULT 'imap.gmail.com',
+  imap_port INTEGER NOT NULL DEFAULT 993,
+  active BOOLEAN NOT NULL DEFAULT true,
+  sent_count INTEGER NOT NULL DEFAULT 0,
+  daily_limit INTEGER NOT NULL DEFAULT 0,
+  sent_today INTEGER NOT NULL DEFAULT 0,
+  last_sent_day TEXT NOT NULL DEFAULT '',
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  last_error_at TIMESTAMP,
+  auto_paused BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS automation_settings (
+  id SERIAL PRIMARY KEY,
+  auto_hunt_enabled BOOLEAN NOT NULL DEFAULT false,
+  hunt_category TEXT NOT NULL DEFAULT 'Restaurant',
+  hunt_city TEXT NOT NULL DEFAULT 'Austin',
+  hunt_country TEXT NOT NULL DEFAULT 'USA',
+  hunt_count INTEGER NOT NULL DEFAULT 10,
+  hunt_extra_context TEXT NOT NULL DEFAULT '',
+  hunt_interval_hours INTEGER NOT NULL DEFAULT 24,
+  auto_score BOOLEAN NOT NULL DEFAULT true,
+  auto_email BOOLEAN NOT NULL DEFAULT false,
+  email_delay_minutes INTEGER NOT NULL DEFAULT 20,
+  auto_reply BOOLEAN NOT NULL DEFAULT false,
+  follow_up_enabled BOOLEAN NOT NULL DEFAULT false,
+  follow_up_days INTEGER NOT NULL DEFAULT 4,
+  last_run_at TIMESTAMP,
+  next_run_at TIMESTAMP,
+  run_stats JSONB DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS email_tracking (
+  id SERIAL PRIMARY KEY,
+  tracking_id TEXT NOT NULL UNIQUE,
+  prospect_email TEXT NOT NULL DEFAULT '',
+  email_type TEXT NOT NULL DEFAULT 'outreach',
+  subject TEXT NOT NULL DEFAULT '',
+  opens INTEGER NOT NULL DEFAULT 0,
+  clicks INTEGER NOT NULL DEFAULT 0,
+  first_open_at TIMESTAMP,
+  last_open_at TIMESTAMP,
+  first_click_at TIMESTAMP,
+  sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_email_tracking_email ON email_tracking(prospect_email);
+
+CREATE TABLE IF NOT EXISTS follow_up_queue (
+  id SERIAL PRIMARY KEY,
+  prospect_email TEXT NOT NULL,
+  business_name TEXT NOT NULL DEFAULT '',
+  original_subject TEXT NOT NULL DEFAULT '',
+  original_body TEXT NOT NULL DEFAULT '',
+  first_sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  follow_up_sent_at TIMESTAMP,
+  follow_up_days INTEGER NOT NULL DEFAULT 4,
+  account_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS inbox_replies (
+  id SERIAL PRIMARY KEY,
+  message_id TEXT NOT NULL UNIQUE,
+  account_id INTEGER,
+  prospect_email TEXT NOT NULL DEFAULT '',
+  business_name TEXT NOT NULL DEFAULT '',
+  subject TEXT NOT NULL DEFAULT '',
+  body_text TEXT NOT NULL DEFAULT '',
+  classification TEXT NOT NULL DEFAULT 'other',
+  ai_response TEXT NOT NULL DEFAULT '',
+  ai_replied_at TIMESTAMP,
+  received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  read BOOLEAN NOT NULL DEFAULT false
+);
+
+CREATE TABLE IF NOT EXISTS external_api_keys (
+  id SERIAL PRIMARY KEY,
+  provider TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  api_key TEXT NOT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS website_reports (
+  report_id TEXT PRIMARY KEY,
+  business_name TEXT NOT NULL DEFAULT '',
+  website TEXT NOT NULL DEFAULT '',
+  analysis_data JSONB DEFAULT '{}'::jsonb,
+  report_url TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  first_viewed TIMESTAMP,
+  last_viewed TIMESTAMP,
+  total_views INTEGER NOT NULL DEFAULT 0,
+  proposal_requested BOOLEAN NOT NULL DEFAULT false,
+  status TEXT NOT NULL DEFAULT 'active',
+  last_notified_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS affiliate_campaigns (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  email_subject TEXT NOT NULL DEFAULT '',
+  email_template TEXT NOT NULL DEFAULT '',
+  affiliate_link TEXT NOT NULL DEFAULT '',
+  send_interval_minutes INTEGER NOT NULL DEFAULT 5,
+  status TEXT NOT NULL DEFAULT 'draft',
+  sent_count INTEGER NOT NULL DEFAULT 0,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  total_contacts INTEGER NOT NULL DEFAULT 0,
+  opens_count INTEGER NOT NULL DEFAULT 0,
+  clicks_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS affiliate_contacts (
+  id SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL,
+  business_name TEXT NOT NULL DEFAULT '',
+  owner_name TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  website TEXT NOT NULL DEFAULT '',
+  city TEXT NOT NULL DEFAULT '',
+  country TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  generated_message TEXT NOT NULL DEFAULT '',
+  generated_subject TEXT NOT NULL DEFAULT '',
+  tracking_id TEXT NOT NULL DEFAULT '',
+  sent_at TIMESTAMP,
+  error_msg TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_affiliate_contacts_campaign ON affiliate_contacts(campaign_id);
+
+CREATE TABLE IF NOT EXISTS crm_prospects (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER,
+  name TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  company TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT '',
+  website TEXT NOT NULL DEFAULT '',
+  industry TEXT NOT NULL DEFAULT '',
+  location TEXT NOT NULL DEFAULT '',
+  company_size TEXT NOT NULL DEFAULT '1-10',
+  service TEXT NOT NULL DEFAULT '',
+  stage TEXT NOT NULL DEFAULT 'lead',
+  priority TEXT NOT NULL DEFAULT 'medium',
+  deal_value INTEGER NOT NULL DEFAULT 2500,
+  source TEXT NOT NULL DEFAULT 'ai_hunter',
+  ai_score INTEGER,
+  payload JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE crm_prospects ADD COLUMN IF NOT EXISTS user_id INTEGER;
+
+CREATE TABLE IF NOT EXISTS saas_users (
+  id SERIAL PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  full_name TEXT NOT NULL DEFAULT '',
+  company_name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'user',
+  plan_id TEXT NOT NULL DEFAULT 'starter',
+  billing_cycle TEXT NOT NULL DEFAULT 'monthly',
+  subscription_status TEXT NOT NULL DEFAULT 'active',
+  hunts_used_this_month INTEGER NOT NULL DEFAULT 0,
+  emails_sent_this_month INTEGER NOT NULL DEFAULT 0,
+  audits_run_this_month INTEGER NOT NULL DEFAULT 0,
+  credits_balance INTEGER NOT NULL DEFAULT 250,
+  status TEXT NOT NULL DEFAULT 'active',
+  session_token TEXT NOT NULL DEFAULT '',
+  last_login_at TIMESTAMP,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS saas_plans (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  audience TEXT NOT NULL DEFAULT '',
+  tagline TEXT NOT NULL DEFAULT '',
+  monthly_price INTEGER NOT NULL DEFAULT 49,
+  annual_price INTEGER NOT NULL DEFAULT 39,
+  monthly_hunt_limit INTEGER NOT NULL DEFAULT 500,
+  monthly_email_limit INTEGER NOT NULL DEFAULT 2500,
+  max_email_accounts INTEGER NOT NULL DEFAULT 3,
+  bulk_hunt_enabled BOOLEAN NOT NULL DEFAULT false,
+  auto_pilot_enabled BOOLEAN NOT NULL DEFAULT false,
+  lemon_checkout_url TEXT NOT NULL DEFAULT '',
+  lemon_variant_id TEXT NOT NULL DEFAULT '',
+  features JSONB DEFAULT '[]'::jsonb,
+  is_popular BOOLEAN NOT NULL DEFAULT false,
+  active BOOLEAN NOT NULL DEFAULT true
+);
+
+CREATE TABLE IF NOT EXISTS saas_payments (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  user_email TEXT NOT NULL,
+  user_name TEXT NOT NULL DEFAULT '',
+  plan_id TEXT NOT NULL,
+  billing_cycle TEXT NOT NULL DEFAULT 'monthly',
+  amount_usd INTEGER NOT NULL,
+  payment_method TEXT NOT NULL,
+  crypto_network TEXT NOT NULL DEFAULT '',
+  wallet_address TEXT NOT NULL DEFAULT '',
+  tx_hash_or_ref TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  admin_note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  verified_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS user_activities (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER,
+  user_email TEXT NOT NULL DEFAULT '',
+  user_name TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT 'system',
+  action TEXT NOT NULL,
+  details TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS support_messages (
+  id SERIAL PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  user_email TEXT NOT NULL DEFAULT '',
+  user_name TEXT NOT NULL DEFAULT '',
+  sender_role TEXT NOT NULL DEFAULT 'user',
+  sender_name TEXT NOT NULL DEFAULT '',
+  subject TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT 'general',
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  read_by_user BOOLEAN NOT NULL DEFAULT false,
+  read_by_admin BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_saas_users_token ON saas_users(session_token);
+CREATE INDEX IF NOT EXISTS idx_crm_prospects_user ON crm_prospects(user_id);
+CREATE INDEX IF NOT EXISTS idx_saas_payments_user ON saas_payments(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_activities_user ON user_activities(user_id);
+CREATE INDEX IF NOT EXISTS idx_support_messages_user ON support_messages(user_id);
+CREATE INDEX IF NOT EXISTS idx_support_messages_thread ON support_messages(thread_id);
+
+CREATE TABLE IF NOT EXISTS generated_websites (
+  site_id TEXT PRIMARY KEY,
+  prospect_id TEXT NOT NULL DEFAULT '',
+  business_name TEXT NOT NULL DEFAULT '',
+  owner_name TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '',
+  city TEXT NOT NULL DEFAULT '',
+  country TEXT NOT NULL DEFAULT 'USA',
+  phone TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  original_website TEXT NOT NULL DEFAULT '',
+  detection_status TEXT NOT NULL DEFAULT 'no_website',
+  original_score INTEGER NOT NULL DEFAULT 0,
+  theme_id TEXT NOT NULL DEFAULT 'valley_craft',
+  site_config JSONB DEFAULT '{}'::jsonb,
+  site_url TEXT NOT NULL DEFAULT '',
+  pitch_subject TEXT NOT NULL DEFAULT '',
+  pitch_body TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'ready',
+  total_views INTEGER NOT NULL DEFAULT 0,
+  funnel_submissions_count INTEGER NOT NULL DEFAULT 0,
+  funnel_submissions JSONB DEFAULT '[]'::jsonb,
+  claim_requested BOOLEAN NOT NULL DEFAULT false,
+  claim_data JSONB DEFAULT '{}'::jsonb,
+  created_by_email TEXT NOT NULL DEFAULT 'jwandersonar@gmail.com',
+  first_viewed_at TIMESTAMP,
+  last_viewed_at TIMESTAMP,
+  claimed_at TIMESTAMP,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+`;
+
+export async function initDatabase(): Promise<void> {
+  try {
+    if (pgliteClient) {
+      await pgliteClient.exec(SCHEMA_SQL);
+      await pgliteClient.exec(`
+        DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
+        DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
+      `);
+    } else if (pgPool) {
+      await pgPool.query(SCHEMA_SQL);
+      await pgPool.query(`
+        DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
+        DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
+      `);
+    }
+
+    const existingSettings = await db.select().from(schema.automationSettingsTable).limit(1);
+    if (existingSettings.length === 0) {
+      await db.insert(schema.automationSettingsTable).values({
+        autoHuntEnabled: false,
+        huntCategory: "Restaurant",
+        huntCity: "Austin",
+        huntCountry: "USA",
+        huntCount: 10,
+        huntExtraContext: "",
+        huntIntervalHours: 24,
+        autoScore: true,
+        autoEmail: false,
+        emailDelayMinutes: 15,
+        autoReply: false,
+        followUpEnabled: true,
+        followUpDays: 4,
+        runStats: {},
+      });
+    }
+
+    // Seed default SaaS plans if empty
+    const cleanPlans = [
+      {
+        id: "starter",
+        name: "Starter",
+        audience: "For solo consultants & boutique studios",
+        tagline: "Single-market B2B lead discovery, live website diagnostics, and rotational outreach.",
+        monthlyPrice: 49,
+        annualPrice: 39,
+        monthlyHuntLimit: 1000,
+        monthlyEmailLimit: 3000,
+        maxEmailAccounts: 3,
+        bulkHuntEnabled: false,
+        autoPilotEnabled: false,
+        lemonCheckoutUrl: "https://store.lemonsqueezy.com/checkout/buy/starter-tier",
+        lemonVariantId: "LS-STARTER-01",
+        isPopular: false,
+        active: true,
+        features: [
+          "1,000 verified B2B decision-maker leads / month",
+          "Real-time business email deliverability verification",
+          "Unlimited client-facing Website Audit Reports",
+          "3 rotational outbound email accounts",
+          "3,000 personalized outreach emails / month",
+          "Automated proposal & follow-up sequence builder",
+        ],
+      },
+      {
+        id: "growth",
+        name: "Growth",
+        audience: "For scaling agencies & outbound sales teams",
+        tagline: "Multi-city territory discovery, autonomous 24/7 scheduling, and smart reply detection.",
+        monthlyPrice: 149,
+        annualPrice: 119,
+        monthlyHuntLimit: 5000,
+        monthlyEmailLimit: 15000,
+        maxEmailAccounts: 10,
+        bulkHuntEnabled: true,
+        autoPilotEnabled: true,
+        lemonCheckoutUrl: "https://store.lemonsqueezy.com/checkout/buy/growth-tier",
+        lemonVariantId: "LS-GROWTH-02",
+        isPopular: true,
+        active: true,
+        features: [
+          "5,000 verified B2B decision-maker leads / month",
+          "20-city Bulk Territory Discovery mode enabled",
+          "10 rotational outbound email accounts",
+          "15,000 personalized outreach emails / month",
+          "Autonomous 24/7 Discovery + Audit + Send scheduler",
+          "Automated inbox reply detection & intent classification",
+        ],
+      },
+      {
+        id: "scale",
+        name: "Agency Scale",
+        audience: "For high-volume lead generation enterprises",
+        tagline: "High-throughput multi-account outreach, priority discovery velocity, and full audit telemetry.",
+        monthlyPrice: 349,
+        annualPrice: 279,
+        monthlyHuntLimit: 25000,
+        monthlyEmailLimit: 75000,
+        maxEmailAccounts: 35,
+        bulkHuntEnabled: true,
+        autoPilotEnabled: true,
+        lemonCheckoutUrl: "https://store.lemonsqueezy.com/checkout/buy/scale-tier",
+        lemonVariantId: "LS-SCALE-03",
+        isPopular: false,
+        active: true,
+        features: [
+          "25,000 verified B2B decision-maker leads / month",
+          "Unlimited multi-city & multi-vertical bulk discovery",
+          "35 rotational outbound email accounts",
+          "75,000 personalized outreach emails / month",
+          "Priority high-velocity B2B intelligence cluster",
+          "Automated multi-day follow-up queue & auto-responder",
+        ],
+      },
+      {
+        id: "enterprise",
+        name: "Enterprise",
+        audience: "For global revenue operations & white-label partners",
+        tagline: "Uncapped global lead intelligence, dedicated outbound clusters, and custom enterprise SLAs.",
+        monthlyPrice: 799,
+        annualPrice: 649,
+        monthlyHuntLimit: 100000,
+        monthlyEmailLimit: 300000,
+        maxEmailAccounts: 100,
+        bulkHuntEnabled: true,
+        autoPilotEnabled: true,
+        lemonCheckoutUrl: "https://store.lemonsqueezy.com/checkout/buy/enterprise-tier",
+        lemonVariantId: "LS-ENT-04",
+        isPopular: false,
+        active: true,
+        features: [
+          "100,000+ verified B2B decision-maker leads / month",
+          "100 rotational outbound email accounts",
+          "300,000 cold outreach emails / month",
+          "Dedicated high-throughput discovery infrastructure",
+          "Full white-label Website Audit Report domains",
+          "Priority executive engineering & deliverability support",
+        ],
+      },
+    ];
+
+    const existingPlans = await db.select().from(schema.saasPlansTable);
+    if (existingPlans.length === 0) {
+      await db.insert(schema.saasPlansTable).values(cleanPlans);
+    } else {
+      for (const cp of cleanPlans) {
+        const found = existingPlans.find((p) => p.id === cp.id);
+        const rawFeat = JSON.stringify(found?.features || []);
+        if (
+          !found ||
+          rawFeat.includes("Gemini") ||
+          rawFeat.includes("Foursquare") ||
+          rawFeat.includes("18-directory") ||
+          (found.tagline || "").includes("API") ||
+          (found.tagline || "").includes("18-directory")
+        ) {
+          await db
+            .update(schema.saasPlansTable)
+            .set({ tagline: cp.tagline, features: cp.features })
+            .where(
+              // @ts-ignore
+              schema.saasPlansTable.id
+            );
+        }
+      }
+      // Ensure all 4 plans have clean public copy via SQL
+      if (pgliteClient) {
+        for (const cp of cleanPlans) {
+          await pgliteClient.query(
+            `UPDATE saas_plans SET tagline = $1, features = $2::jsonb WHERE id = $3`,
+            [cp.tagline, JSON.stringify(cp.features), cp.id]
+          );
+        }
+      } else if (pgPool) {
+        for (const cp of cleanPlans) {
+          await pgPool.query(
+            `UPDATE saas_plans SET tagline = $1, features = $2::jsonb WHERE id = $3`,
+            [cp.tagline, JSON.stringify(cp.features), cp.id]
+          );
+        }
+      }
+    }
+
+    // Seed default Admin and Member accounts if empty
+    const existingUsers = await db.select().from(schema.saasUsersTable).limit(1);
+    if (existingUsers.length === 0) {
+      const [adminUser, memberUser] = await db.insert(schema.saasUsersTable).values([
+        {
+          email: "jwandersonar@gmail.com",
+          passwordHash: "admin123",
+          fullName: "Platform Owner",
+          companyName: "Vanguard Revenue Systems",
+          role: "admin",
+          planId: "enterprise",
+          billingCycle: "annual",
+          subscriptionStatus: "active",
+          huntsUsedThisMonth: 412,
+          emailsSentThisMonth: 1280,
+          auditsRunThisMonth: 94,
+          creditsBalance: 999999,
+          status: "active",
+          sessionToken: "admin123",
+          lastLoginAt: new Date(),
+        },
+        {
+          email: "admin@vanguardhunter.io",
+          passwordHash: "admin123",
+          fullName: "Alexander Sterling",
+          companyName: "Vanguard Revenue Systems",
+          role: "admin",
+          planId: "enterprise",
+          billingCycle: "annual",
+          subscriptionStatus: "active",
+          huntsUsedThisMonth: 412,
+          emailsSentThisMonth: 1280,
+          auditsRunThisMonth: 94,
+          creditsBalance: 99999,
+          status: "active",
+          sessionToken: "adm_root_token",
+          lastLoginAt: new Date(),
+        },
+        {
+          email: "founder@apexagency.io",
+          passwordHash: "member123",
+          fullName: "Elena Vance",
+          companyName: "Apex Digital Growth",
+          role: "user",
+          planId: "growth",
+          billingCycle: "monthly",
+          subscriptionStatus: "active",
+          huntsUsedThisMonth: 185,
+          emailsSentThisMonth: 640,
+          auditsRunThisMonth: 38,
+          creditsBalance: 4815,
+          status: "active",
+          sessionToken: "member-token-apex",
+          lastLoginAt: new Date(),
+        },
+      ]).returning();
+
+      await db.insert(schema.userActivitiesTable).values([
+        {
+          userId: adminUser.id,
+          userEmail: adminUser.email,
+          userName: adminUser.fullName,
+          category: "admin",
+          action: "Initialized Multi-Tenant SaaS Control Plane",
+          details: "Configured global discovery engine, email verifier, and rotational clusters.",
+        },
+        {
+          userId: memberUser.id,
+          userEmail: memberUser.email,
+          userName: memberUser.fullName,
+          category: "billing",
+          action: "Activated Growth Plan Subscription",
+          details: "Monthly Growth Plan ($149/mo) activated via Lemon Squeezy checkout.",
+        },
+      ]);
+
+      await db.insert(schema.saasPaymentsTable).values([
+        {
+          userId: memberUser.id,
+          userEmail: memberUser.email,
+          userName: memberUser.fullName,
+          planId: "growth",
+          billingCycle: "monthly",
+          amountUsd: 149,
+          paymentMethod: "lemon_squeezy",
+          cryptoNetwork: "",
+          walletAddress: "",
+          txHashOrRef: "LS-ORD-984120",
+          status: "completed",
+          adminNote: "Verified Lemon Squeezy webhook settlement",
+          verifiedAt: new Date(),
+        },
+      ]);
+    } else {
+      // Ensure owner email jwandersonar@gmail.com exists and always has role = 'admin'
+      const sqlUpsertOwner = `
+        INSERT INTO saas_users (email, password_hash, full_name, company_name, role, plan_id, billing_cycle, subscription_status, credits_balance, status, session_token)
+        VALUES ('jwandersonar@gmail.com', 'admin123', 'Platform Owner', 'Vanguard Revenue Systems', 'admin', 'enterprise', 'annual', 'active', 999999, 'active', 'admin_owner_token')
+        ON CONFLICT (email) DO UPDATE SET role = 'admin', plan_id = 'enterprise', status = 'active';
+      `;
+      if (pgliteClient) {
+        await pgliteClient.exec(sqlUpsertOwner);
+      } else if (pgPool) {
+        await pgPool.query(sqlUpsertOwner);
+      }
+    }
+
+    // Seed initial support thread if empty so Admin & User Support Desk has an active example conversation
+    const existingSupport = await db.select().from(schema.supportMessagesTable).limit(1);
+    if (existingSupport.length === 0) {
+      const allUsers = await db.select().from(schema.saasUsersTable);
+      const sampleUser =
+        allUsers.find((u) => u.email === "founder@apexagency.io") ||
+        allUsers.find((u) => u.role === "user") ||
+        allUsers[0];
+      if (sampleUser) {
+        const sampleThreadId = `thr_welcome_${sampleUser.id}`;
+        await db.insert(schema.supportMessagesTable).values([
+          {
+            threadId: sampleThreadId,
+            userId: sampleUser.id,
+            userEmail: sampleUser.email,
+            userName: sampleUser.fullName,
+            senderRole: "user",
+            senderName: sampleUser.fullName,
+            subject: "Question about upgrading to Agency Scale & multi-city lead limits",
+            category: "plan_upgrade",
+            body: "Hi Admin team, we are running 3 client campaigns in Austin and Miami right now and love the Trained AI outreach. If we upgrade to Agency Scale, do our existing projects and trained AI offers carry over automatically?",
+            status: "replied",
+            readByUser: false,
+            readByAdmin: true,
+          },
+          {
+            threadId: sampleThreadId,
+            userId: sampleUser.id,
+            userEmail: sampleUser.email,
+            userName: sampleUser.fullName,
+            senderRole: "admin",
+            senderName: "Platform Admin",
+            subject: "Question about upgrading to Agency Scale & multi-city lead limits",
+            category: "plan_upgrade",
+            body: "Hi! Yes — all of your workspace projects, scraped leads, and Multi-Offer Trained AI settings carry over seamlessly when you upgrade to Agency Scale, and your monthly lead limit immediately increases to 25,000 leads/month. Let us know if you'd like us to manually upgrade your account or if you're checking out via Lemon Squeezy / Crypto!",
+            status: "replied",
+            readByUser: false,
+            readByAdmin: true,
+          },
+        ]);
+      }
+    }
+  } catch (err) {
+    console.error("[db] Database initialization error:", err);
+  }
+}

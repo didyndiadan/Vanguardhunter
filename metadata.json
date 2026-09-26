@@ -1,0 +1,6 @@
+{
+  "name": "AI Business Hunter — Autonomous Lead Discovery & Outreach CRM",
+  "description": "Standalone AI-powered B2B lead discovery, multi-directory business scraping, website audit report generator, cold email outreach, proposal builder, and sales pipeline CRM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
