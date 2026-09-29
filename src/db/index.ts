@@ -15,11 +15,16 @@ let pgliteClient: PGlite | null = null;
 let pgPool: pg.Pool | null = null;
 
 if (process.env.DATABASE_URL) {
+  const dbUrl = process.env.DATABASE_URL;
+  const needsSsl =
+    /sslmode=require|render\.com|neon\.tech|supabase\.co|aws\.neon\.tech|cockroachlabs/i.test(dbUrl) ||
+    process.env.PGSSLMODE === "require";
   pgPool = new Pool({
-    connectionString: process.env.DATABASE_URL,
+    connectionString: dbUrl,
     max: 25,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 10000,
+    ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
   });
   pgPool.on("error", (err) => {
     console.error("[db] Unexpected error on idle PostgreSQL client (handled safely):", err.message);

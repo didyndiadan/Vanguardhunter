@@ -24,6 +24,9 @@ function resolvePort(): number {
     return Number(process.env.DEFAULT_APP_PORT) || 3000;
   }
   const envPort = Number(process.env.PORT);
+  if (process.env.RENDER && envPort > 0) {
+    return envPort;
+  }
   if (envPort && String(envPort) !== process.env.NGINX_PORT && envPort !== 8080) {
     return envPort;
   }
