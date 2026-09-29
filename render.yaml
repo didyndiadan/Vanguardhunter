@@ -10,7 +10,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: NODE_OPTIONS
-        value: --max-old-space-size=320
+        value: --no-warnings --max-old-space-size=384
       - key: GEMINI_API_KEY
         sync: false
       - key: DATABASE_URL

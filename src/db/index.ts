@@ -1,8 +1,8 @@
-import { PGlite } from "@electric-sql/pglite";
-import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
-import { drizzle as drizzlePg } from "drizzle-orm/node-postgres";
-import { sql } from "drizzle-orm";
-import { execFileSync } from "child_process";
+import { DatabaseSync } from "node:sqlite";
+import { drizzle as drizzleProxy } from "drizzle-orm/pg-proxy";
+import { drizzle as drizzlePg, type NodePgDatabase } from "drizzle-orm/node-postgres";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { Table, SQL, Param, is, sql } from "drizzle-orm";
 import pg from "pg";
 import fs from "fs";
 import os from "os";
@@ -11,64 +11,135 @@ import * as schema from "./schema";
 
 const { Pool } = pg;
 
-let dbInstance: ReturnType<typeof drizzlePglite<typeof schema>>;
-let pgliteClient: PGlite | null = null;
+type AppDb = NodePgDatabase<typeof schema>;
+
+let dbInstance: AppDb;
+let sqliteDb: DatabaseSync | null = null;
 let pgPool: pg.Pool | null = null;
 
-const PGLITE_LOW_MEM_START_PARAMS = [
-  ...PGlite.defaultStartParams,
-  "-c",
-  "shared_buffers=4MB",
-  "-c",
-  "work_mem=1MB",
-  "-c",
-  "temp_buffers=1MB",
-  "-c",
-  "wal_buffers=256kB",
-];
-
-function prepareCleanPgliteDataDir(forceReset = false): string {
-  const dataDir = process.env.PGDATA_DIR || path.join(os.tmpdir(), "ai-business-hunter-pgdata-v3");
-  const templateDir = path.join(process.cwd(), "dist", "pgdata-template");
-
-  try {
-    const pidFile = path.join(dataDir, "postmaster.pid");
-    if (forceReset || fs.existsSync(pidFile)) {
-      fs.rmSync(dataDir, { recursive: true, force: true });
-    }
-
-    if (!fs.existsSync(path.join(dataDir, "PG_VERSION"))) {
-      if (!fs.existsSync(path.join(templateDir, "PG_VERSION"))) {
-        const scriptPath = path.join(process.cwd(), "scripts", "prebuild-pgdata.mjs");
-        if (fs.existsSync(scriptPath)) {
-          try {
-            execFileSync(process.execPath, [scriptPath], { stdio: "ignore", timeout: 25000 });
-          } catch {}
+class SqlitePgDialect extends PgDialect {
+  override buildInsertQuery({ table, values: valuesOrSelect, onConflict, returning, withList }: any) {
+    const valuesSqlList: any[] = [];
+    const columns = table[Table.Symbol.Columns];
+    const colEntries = Object.entries(columns).filter(([_, col]: any) => !col.shouldDisableInsert());
+    const insertOrder = colEntries.map(([, column]: any) => sql.identifier(this.casing.getColumnCasing(column)));
+    const values = valuesOrSelect;
+    valuesSqlList.push(sql.raw("values "));
+    for (const [valueIndex, value] of values.entries()) {
+      const valueList: any[] = [];
+      for (const [fieldName, col] of colEntries as any) {
+        const colValue = value[fieldName];
+        if (colValue === void 0 || (is(colValue, Param) && colValue.value === void 0)) {
+          if (col.columnType === "PgSerial") {
+            valueList.push(sql`null`);
+          } else if (col.default !== null && col.default !== void 0) {
+            if (is(col.default, SQL)) {
+              valueList.push(sql`CURRENT_TIMESTAMP`);
+            } else {
+              valueList.push(sql.param(col.default, col));
+            }
+          } else if (col.defaultFn !== void 0) {
+            const defaultFnResult = col.defaultFn();
+            valueList.push(is(defaultFnResult, SQL) ? defaultFnResult : sql.param(defaultFnResult, col));
+          } else if (col.notNull) {
+            if (col.dataType === "number" || col.dataType === "boolean") valueList.push(sql`0`);
+            else if (col.dataType === "date") valueList.push(sql`CURRENT_TIMESTAMP`);
+            else if (col.dataType === "json") valueList.push(sql`'{}'`);
+            else valueList.push(sql`''`);
+          } else {
+            valueList.push(sql`null`);
+          }
+        } else {
+          valueList.push(colValue);
         }
       }
-      if (fs.existsSync(path.join(templateDir, "PG_VERSION"))) {
-        fs.rmSync(dataDir, { recursive: true, force: true });
-        fs.cpSync(templateDir, dataDir, { recursive: true });
-      } else {
-        fs.mkdirSync(dataDir, { recursive: true });
-      }
+      valuesSqlList.push(valueList);
+      if (valueIndex < values.length - 1) valuesSqlList.push(sql`, `);
     }
-  } catch {
-    try {
-      fs.mkdirSync(dataDir, { recursive: true });
-    } catch {}
+    const withSql = this.buildWithCTE(withList);
+    const valuesSql = sql.join(valuesSqlList);
+    const returningSql = returning ? sql` returning ${this.buildSelection(returning, { isSingleTable: true })}` : void 0;
+    const onConflictSql = onConflict ? sql` on conflict ${onConflict}` : void 0;
+    return sql`${withSql}insert into ${table} ${insertOrder} ${valuesSql}${onConflictSql}${returningSql}`;
   }
-
-  return dataDir;
 }
 
-function initPgliteFallback(forceReset = false) {
-  const dataDir = prepareCleanPgliteDataDir(forceReset);
-  pgliteClient = new PGlite(dataDir, {
-    relaxedDurability: true,
-    startParams: PGLITE_LOW_MEM_START_PARAMS,
-  });
-  dbInstance = drizzlePglite(pgliteClient, { schema });
+function normalizeSqliteParam(val: any): any {
+  if (val === undefined || val === null) return null;
+  if (typeof val === "boolean") return val ? 1 : 0;
+  if (val instanceof Date) return val.toISOString().replace("T", " ").replace(/Z$/, "");
+  if (typeof val === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(val)) {
+    return val.replace("T", " ").replace(/Z$/, "");
+  }
+  if (typeof val === "object" && !(val instanceof Uint8Array)) {
+    return JSON.stringify(val);
+  }
+  return val;
+}
+
+function translatePgSqlToSqlite(queryStr: string, params: any[]): { sqlText: string; boundParams: any[] } {
+  const boundParams: any[] = [];
+  let sqlText = queryStr
+    .replace(/::(int|integer|text|jsonb|json|boolean|timestamp|numeric|float8|varchar)\b/gi, "")
+    .replace(/\bILIKE\b/gi, "LIKE")
+    .replace(/\$(\d+)/g, (_match, idxStr) => {
+      const idx = Number(idxStr) - 1;
+      boundParams.push(normalizeSqliteParam(params[idx]));
+      return "?";
+    });
+  return { sqlText, boundParams };
+}
+
+function initSqliteFallback(forceReset = false) {
+  const dataDir = process.env.PGDATA_DIR || path.join(os.tmpdir(), "ai-business-hunter-sqlite-v4");
+  const dbFilePath = path.join(dataDir, "vanguard.sqlite");
+  try {
+    if (sqliteDb) {
+      try {
+        sqliteDb.close();
+      } catch {}
+      sqliteDb = null;
+    }
+    if (forceReset && fs.existsSync(dbFilePath)) {
+      fs.rmSync(dbFilePath, { force: true });
+    }
+    fs.mkdirSync(dataDir, { recursive: true });
+    sqliteDb = new DatabaseSync(dbFilePath);
+    sqliteDb.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;");
+  } catch {
+    sqliteDb = new DatabaseSync(":memory:");
+  }
+
+  dbInstance = drizzleProxy(
+    async (queryStr, params, method) => {
+      if (!sqliteDb) initSqliteFallback();
+      const { sqlText, boundParams } = translatePgSqlToSqlite(queryStr, params);
+      const stmt = sqliteDb!.prepare(sqlText);
+      const isReturningOrSelect = /^\s*(select\b|with\b|pragma\b)|\breturning\b/i.test(sqlText);
+      if (method === "all" || isReturningOrSelect) {
+        stmt.setReturnArrays(true);
+        const rawRows = stmt.all(...boundParams) as unknown as any[][];
+        const colMeta = stmt.columns ? stmt.columns() : [];
+        const rows = rawRows.map((row) =>
+          row.map((val, c) => {
+            if (val === null || val === undefined) return null;
+            const cType = String(colMeta[c]?.type || "").toUpperCase();
+            if (cType.includes("BOOL")) return Boolean(val);
+            if (cType.includes("TIMESTAMP") && typeof val === "string") {
+              return val.replace("T", " ").replace(/Z$/, "");
+            }
+            return val;
+          })
+        );
+        return { rows };
+      } else {
+        stmt.run(...boundParams);
+        return { rows: [] };
+      }
+    },
+    { schema },
+    () => new SqlitePgDialect()
+  ) as unknown as AppDb;
 }
 
 const rawDbUrl = (process.env.DATABASE_URL || "").trim();
@@ -79,7 +150,7 @@ if (/^postgres(ql)?:\/\//i.test(rawDbUrl)) {
     process.env.PGSSLMODE === "require";
   pgPool = new Pool({
     connectionString: rawDbUrl,
-    max: 25,
+    max: 15,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 6000,
     ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
@@ -87,12 +158,12 @@ if (/^postgres(ql)?:\/\//i.test(rawDbUrl)) {
   pgPool.on("error", (err) => {
     console.error("[db] Unexpected error on idle PostgreSQL client (handled safely):", err.message);
   });
-  dbInstance = drizzlePg(pgPool, { schema }) as unknown as ReturnType<typeof drizzlePglite<typeof schema>>;
+  dbInstance = drizzlePg(pgPool, { schema });
 } else {
-  initPgliteFallback();
+  initSqliteFallback();
 }
 
-export const db = new Proxy({} as ReturnType<typeof drizzlePglite<typeof schema>>, {
+export const db = new Proxy({} as AppDb, {
   get(_target, prop, receiver) {
     const value = Reflect.get(dbInstance, prop, receiver);
     return typeof value === "function" ? value.bind(dbInstance) : value;
@@ -439,18 +510,18 @@ export async function initDatabase(): Promise<void> {
           pgPool.on("error", (err) => {
             console.error("[db] Unexpected error on idle PostgreSQL client (handled safely):", err.message);
           });
-          dbInstance = drizzlePg(pgPool, { schema }) as unknown as ReturnType<typeof drizzlePglite<typeof schema>>;
+          dbInstance = drizzlePg(pgPool, { schema });
           await pgPool.query("SELECT 1");
           pgConnected = true;
         } catch (secondErr: any) {
           console.warn(
             "[db] PostgreSQL DATABASE_URL unreachable (" +
               String(secondErr?.message || secondErr) +
-              "), falling back to embedded PGlite database."
+              "), falling back to embedded SQLite database."
           );
           await pgPool?.end().catch(() => {});
           pgPool = null;
-          initPgliteFallback();
+          initSqliteFallback();
         }
       }
 
@@ -462,26 +533,28 @@ export async function initDatabase(): Promise<void> {
             DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
           `);
         } catch (schemaErr: any) {
-          console.warn("[db] PostgreSQL schema init failed, falling back to embedded PGlite:", schemaErr?.message);
+          console.warn("[db] PostgreSQL schema init failed, falling back to embedded SQLite:", schemaErr?.message);
           await pgPool.end().catch(() => {});
           pgPool = null;
-          initPgliteFallback();
+          initSqliteFallback();
         }
       }
     }
 
-    if (pgliteClient) {
+    if (sqliteDb) {
+      const sqliteSchemaSql = SCHEMA_SQL
+        .replace(/SERIAL PRIMARY KEY/gi, "INTEGER PRIMARY KEY AUTOINCREMENT")
+        .replace(/::jsonb/gi, "")
+        .replace(/\bDEFAULT\s+false\b/gi, "DEFAULT 0")
+        .replace(/\bDEFAULT\s+true\b/gi, "DEFAULT 1");
       try {
-        await pgliteClient.exec(SCHEMA_SQL);
-      } catch (pgliteErr) {
-        console.warn("[db] On-disk PGlite recovery needed, resetting from clean disk template:", pgliteErr);
-        try {
-          await pgliteClient.close();
-        } catch {}
-        initPgliteFallback(true);
-        await pgliteClient.exec(SCHEMA_SQL);
+        sqliteDb.exec(sqliteSchemaSql);
+      } catch (sqliteErr) {
+        console.warn("[db] Embedded SQLite recovery needed, resetting database:", sqliteErr);
+        initSqliteFallback(true);
+        sqliteDb!.exec(sqliteSchemaSql);
       }
-      await pgliteClient.exec(`
+      sqliteDb.exec(`
         DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
         DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
       `);
@@ -644,11 +717,12 @@ export async function initDatabase(): Promise<void> {
       for (const cp of cleanPlans) {
         if (!existingPlanIds.has(cp.id)) {
           await db.insert(schema.saasPlansTable).values(cp);
-        } else if (pgliteClient) {
-          await pgliteClient.query(
-            `UPDATE saas_plans SET name = $1, audience = $2, tagline = $3, features = $4::jsonb, lemon_checkout_url = CASE WHEN lemon_checkout_url = '' THEN $5 ELSE lemon_checkout_url END, lemon_variant_id = CASE WHEN lemon_variant_id = '' THEN $6 ELSE lemon_variant_id END WHERE id = $7`,
-            [cp.name, cp.audience, cp.tagline, JSON.stringify(cp.features), cp.lemonCheckoutUrl, cp.lemonVariantId, cp.id]
-          );
+        } else if (sqliteDb) {
+          sqliteDb
+            .prepare(
+              `UPDATE saas_plans SET name = ?, audience = ?, tagline = ?, features = ?, lemon_checkout_url = CASE WHEN lemon_checkout_url = '' THEN ? ELSE lemon_checkout_url END, lemon_variant_id = CASE WHEN lemon_variant_id = '' THEN ? ELSE lemon_variant_id END WHERE id = ?`
+            )
+            .run(cp.name, cp.audience, cp.tagline, JSON.stringify(cp.features), cp.lemonCheckoutUrl, cp.lemonVariantId, cp.id);
         } else if (pgPool) {
           await pgPool.query(
             `UPDATE saas_plans SET name = $1, audience = $2, tagline = $3, features = $4::jsonb, lemon_checkout_url = CASE WHEN lemon_checkout_url = '' THEN $5 ELSE lemon_checkout_url END, lemon_variant_id = CASE WHEN lemon_variant_id = '' THEN $6 ELSE lemon_variant_id END WHERE id = $7`,
@@ -807,8 +881,8 @@ export async function initDatabase(): Promise<void> {
         ON CONFLICT (email) DO UPDATE SET status = 'active';
         UPDATE saas_users SET role = 'admin', plan_id = 'enterprise', status = 'active' WHERE email IN ('jwandersonar@gmail.com', 'admin@vanguardhunter.io');
       `;
-      if (pgliteClient) {
-        await pgliteClient.exec(sqlUpsertSeeded);
+      if (sqliteDb) {
+        sqliteDb.exec(sqlUpsertSeeded);
       } else if (pgPool) {
         await pgPool.query(sqlUpsertSeeded);
       }

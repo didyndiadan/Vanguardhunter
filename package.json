@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "start": "NODE_ENV=production node --max-old-space-size=320 dist/server.mjs",
-    "build": "vite build && npx esbuild server.ts --bundle --platform=node --packages=external --format=esm --outfile=dist/server.mjs && node scripts/prebuild-pgdata.mjs",
+    "start": "NODE_ENV=production node --no-warnings --max-old-space-size=384 dist/server.mjs",
+    "build": "vite build && npx esbuild server.ts --bundle --platform=node --packages=external --format=esm --outfile=dist/server.mjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
@@ -26,6 +26,7 @@
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "drizzle-orm": "^0.45.3",
+    "esbuild": "^0.28.0",
     "express": "^4.21.2",
     "framer-motion": "^13.4.4",
     "imapflow": "^2.0.7",
