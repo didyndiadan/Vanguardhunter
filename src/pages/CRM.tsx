@@ -347,6 +347,72 @@ async function generateInlineLeadAssets(lead: {
   };
 }
 
+function buildQuickWhatsAppText(
+  lead: {
+    businessName: string;
+    ownerName?: string;
+    city?: string;
+    category?: string;
+    generatedWhatsApp?: string;
+    generatedSiteUrl?: string;
+    generatedReviewUrl?: string;
+    reportUrl?: string;
+  },
+  primaryOffer?: string | null
+): string {
+  if (lead.generatedWhatsApp && lead.generatedWhatsApp.trim()) {
+    return lead.generatedWhatsApp.trim();
+  }
+  const firstOwner = lead.ownerName ? lead.ownerName.split(" ")[0] : "there";
+  const offerLabel = primaryOffer || "Website & Conversion Upgrade";
+  const links: string[] = [];
+  if (lead.generatedSiteUrl) links.push(`Website Preview: ${lead.generatedSiteUrl}`);
+  if (lead.generatedReviewUrl) links.push(`5-Star Review Funnel: ${lead.generatedReviewUrl}`);
+  if (lead.reportUrl && !lead.generatedSiteUrl) links.push(`Audit Report: ${lead.reportUrl}`);
+  const linksBlock = links.length > 0 ? `\n\n${links.join("\n")}` : "";
+  return `Hi ${firstOwner}! 👋 I was checking out ${lead.businessName}${lead.city ? ` in ${lead.city}` : ""} and put together a custom ${offerLabel} idea to help you capture more local clients automatically.${linksBlock}\n\nOpen to taking a quick 60-second look?`;
+}
+
+function buildQuickLinkedInText(
+  lead: {
+    businessName: string;
+    ownerName?: string;
+    city?: string;
+    category?: string;
+    generatedLinkedIn?: string;
+    generatedSiteUrl?: string;
+  },
+  primaryOffer?: string | null
+): string {
+  if (lead.generatedLinkedIn && lead.generatedLinkedIn.trim()) {
+    return lead.generatedLinkedIn.trim();
+  }
+  const firstOwner = lead.ownerName ? lead.ownerName.split(" ")[0] : "there";
+  const offerLabel = primaryOffer || "conversion & booking";
+  return `Hi ${firstOwner}, impressed by ${lead.businessName}'s work${lead.city ? ` in ${lead.city}` : ""}. I put together a tailored ${offerLabel} idea for your ${lead.category || "business"}${lead.generatedSiteUrl ? ` (${lead.generatedSiteUrl})` : ""} — would love to connect and share!`.slice(0, 295);
+}
+
+function getWhatsAppHref(phone: string | undefined, message: string): string {
+  const digits = (phone || "").replace(/\D/g, "");
+  return digits
+    ? `https://wa.me/${digits}?text=${encodeURIComponent(message)}`
+    : `https://wa.me/?text=${encodeURIComponent(message)}`;
+}
+
+function getLinkedInHref(lead: {
+  linkedin?: string;
+  ownerName?: string;
+  businessName: string;
+  city?: string;
+}): string {
+  const raw = (lead.linkedin || "").trim();
+  if (raw) {
+    return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  }
+  const query = `${lead.ownerName || ""} ${lead.businessName} ${lead.city || ""}`.trim();
+  return `https://www.linkedin.com/search/results/all/?keywords=${encodeURIComponent(query)}`;
+}
+
 interface Prospect {
   id: number;
   projectId?: string;
@@ -1244,9 +1310,11 @@ function EmailSettingsPanel() {
 function AIHunterPanel({
   onImport,
   activeProject,
+  onOpenTrainAI,
 }: {
   onImport: (prospects: Omit<Prospect, "id" | "addedAt">[]) => void;
   activeProject?: LeadProject | null;
+  onOpenTrainAI?: () => void;
 }) {
   // `categories` supports selecting one or many business types at once.
   // Kept as an array from the start (default: a single category) so every
@@ -2100,9 +2168,9 @@ function AIHunterPanel({
         </div>
         <div className="grid grid-cols-3 gap-3 text-center">
           {[
-            { v: "Auto", l: "Business Discovery" },
-            { v: "AI", l: "Analysis & Scoring" },
-            { v: "Ready", l: "Emails & Proposals" },
+            { v: "Step 1", l: "Train AI Offers First" },
+            { v: "Step 2", l: "Hunt & Audit Leads" },
+            { v: "Step 3", l: "Personalized Cold Emails" },
           ].map(s => (
             <div key={s.l} className="bg-white/10 rounded-xl p-2">
               <div className="font-extrabold text-sm">{s.v}</div>
@@ -2110,6 +2178,32 @@ function AIHunterPanel({
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Onboarding Step 1 Callout: Train Your AI First */}
+      <div className="rounded-xl border border-purple-200 bg-purple-50/70 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="space-y-1">
+          <div className="inline-flex items-center gap-1.5 text-xs font-extrabold text-purple-800 uppercase tracking-wide">
+            <Wand2 className="w-3.5 h-3.5 text-purple-600" />
+            <span>Onboarding Step 1 · Train Your AI First</span>
+          </div>
+          <p className="text-xs text-slate-700 leading-relaxed">
+            Before hunting leads, make sure you add your <strong>Service Offers, Pain Points &amp; Cold Email Blueprint</strong> in <strong>Train Your AI (My Offers)</strong> so every generated cold email is tailored to your exact offer.{" "}
+            <span className="font-semibold text-purple-900">
+              Active Primary Offer: {trainedOffer.primaryOfferName}
+            </span>
+          </p>
+        </div>
+        {onOpenTrainAI && (
+          <Button
+            type="button"
+            onClick={onOpenTrainAI}
+            className="bg-purple-700 hover:bg-purple-800 text-white text-xs font-bold gap-1.5 shrink-0"
+          >
+            <Wand2 className="w-3.5 h-3.5" />
+            <span>Train Your AI (My Offers) →</span>
+          </Button>
+        )}
       </div>
 
       {/* Hunt config */}
@@ -2756,6 +2850,49 @@ function AIHunterPanel({
                               {b.generatingInlineEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" /> : <Mail className="w-3.5 h-3.5 shrink-0" />}
                               <span>{b.generatedEmail ? (b.inlineOpen ? "Hide Cold Email" : "View Cold Email") : "Generate Cold Email"}</span>
                             </button>
+                            {b.generatedEmail && (
+                              <button
+                                type="button"
+                                disabled={b.sendingInlineEmail || !b.email}
+                                onClick={() => {
+                                  if (!b.email) {
+                                    setResults(prev => prev.map((r, idx) => idx === i ? { ...r, inlineOpen: true } : r));
+                                    return;
+                                  }
+                                  sendInlineEmailForHunted(i);
+                                }}
+                                className="flex-1 sm:flex-initial justify-center px-3 py-2 sm:py-1 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white inline-flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                              >
+                                {b.sendingInlineEmail ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : <Send className="w-3 h-3 shrink-0" />}
+                                <span>{b.sendingInlineEmail ? "Sending…" : b.inlineEmailSent ? "✓ Email Sent" : "Send Email"}</span>
+                              </button>
+                            )}
+                            <a
+                              href={getWhatsAppHref(b.phone, buildQuickWhatsAppText(b, offerRes.primaryOffer))}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={e => e.stopPropagation()}
+                              className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-semibold bg-green-600 hover:bg-green-700 text-white inline-flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                            >
+                              <MessageCircle className="w-3 h-3 shrink-0" />
+                              <span>Send on WhatsApp</span>
+                            </a>
+                            <a
+                              href={getLinkedInHref(b)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={e => {
+                                e.stopPropagation();
+                                try {
+                                  navigator.clipboard.writeText(buildQuickLinkedInText(b, offerRes.primaryOffer));
+                                } catch {}
+                              }}
+                              title="Copies personalized LinkedIn message & opens LinkedIn"
+                              className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-semibold bg-[#0A66C2] hover:bg-[#004182] text-white inline-flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                            >
+                              <Linkedin className="w-3 h-3 shrink-0" />
+                              <span>Send on LinkedIn</span>
+                            </a>
                           </div>
                         </div>
 
@@ -2800,18 +2937,64 @@ function AIHunterPanel({
                                   <RefreshCw className={`w-3 h-3 ${b.generatingInlineEmail ? "animate-spin" : ""}`} />
                                   Regenerate
                                 </Button>
-                                {b.email && (
+                                <Button
+                                  size="sm"
+                                  onClick={() => sendInlineEmailForHunted(i)}
+                                  disabled={b.sendingInlineEmail || !b.email?.trim()}
+                                  className="h-7 text-xs gap-1 bg-blue-600 hover:bg-blue-700 text-white"
+                                >
+                                  <Send className="w-3 h-3" />
+                                  {b.sendingInlineEmail ? "Sending…" : "Send Email"}
+                                </Button>
+                                <a
+                                  href={getWhatsAppHref(b.phone, buildQuickWhatsAppText(b, offerRes.primaryOffer))}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                >
                                   <Button
+                                    type="button"
                                     size="sm"
-                                    onClick={() => sendInlineEmailForHunted(i)}
-                                    disabled={b.sendingInlineEmail}
-                                    className="h-7 text-xs gap-1 bg-slate-900 hover:bg-slate-800 text-white"
+                                    className="h-7 text-xs gap-1 bg-green-600 hover:bg-green-700 text-white"
                                   >
-                                    <Send className="w-3 h-3" />
-                                    {b.sendingInlineEmail ? "Sending…" : "Send Email"}
+                                    <MessageCircle className="w-3 h-3" />
+                                    Send on WhatsApp
                                   </Button>
-                                )}
+                                </a>
+                                <a
+                                  href={getLinkedInHref(b)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={() => {
+                                    try {
+                                      navigator.clipboard.writeText(buildQuickLinkedInText(b, offerRes.primaryOffer));
+                                    } catch {}
+                                  }}
+                                >
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    className="h-7 text-xs gap-1 bg-[#0A66C2] hover:bg-[#004182] text-white"
+                                  >
+                                    <Linkedin className="w-3 h-3" />
+                                    Send on LinkedIn
+                                  </Button>
+                                </a>
                               </div>
+                            </div>
+                            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                              <span className="text-[11px] font-semibold text-slate-600 shrink-0">To Email:</span>
+                              <Input
+                                value={b.email || ""}
+                                placeholder="Enter recipient email address to send…"
+                                onChange={(e) =>
+                                  setResults(prev =>
+                                    prev.map((r, idx) =>
+                                      idx === i ? { ...r, email: e.target.value } : r
+                                    )
+                                  )
+                                }
+                                className="h-7 text-xs flex-1"
+                              />
                             </div>
                             <Input
                               value={b.generatedEmail.subject}
@@ -3692,11 +3875,15 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
               {loadingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Mail className="w-3.5 h-3.5" />}
               {prospect.generatedEmail ? "Regenerate Cold Email" : "Generate Cold Email"}
             </Button>
-            {prospect.generatedEmail && prospect.email && (
-              <Button size="sm" onClick={sendEmail} disabled={sendingEmail}
-                className="w-full sm:w-auto h-8 sm:h-7 text-xs gap-1 bg-primary hover:bg-primary/90 text-white font-semibold">
+            {prospect.generatedEmail && (
+              <Button
+                size="sm"
+                onClick={sendEmail}
+                disabled={sendingEmail || !prospect.email?.trim()}
+                className="w-full sm:w-auto h-8 sm:h-7 text-xs gap-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+              >
                 {sendingEmail ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
-                {sendingEmail ? "Sending…" : "Send Now"}
+                {sendingEmail ? "Sending…" : "Send Email"}
               </Button>
             )}
           </div>
@@ -3751,11 +3938,24 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         )}
         {loadingEmail ? <OutreachCopySkeleton label={`Crafting personalized cold email for ${prospect.businessName}…`} /> : prospect.generatedEmail ? (
           <div className="p-4 space-y-3">
-            {prospect.email && (
-              <div className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2 break-all">
-                Sending to: <span className="font-semibold text-foreground">{prospect.email}</span>
-              </div>
-            )}
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2 bg-muted/30 rounded-lg px-3 py-2">
+              <span className="text-xs font-semibold text-muted-foreground shrink-0">Recipient Email (To):</span>
+              <Input
+                value={prospect.email || ""}
+                onChange={e => onUpdate({ ...prospect, email: e.target.value })}
+                placeholder="Enter recipient email address (e.g. owner@business.com)…"
+                className="h-8 text-xs bg-white flex-1"
+              />
+              <Button
+                size="sm"
+                onClick={sendEmail}
+                disabled={sendingEmail || !prospect.email?.trim()}
+                className="h-8 text-xs gap-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold shrink-0"
+              >
+                {sendingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                {sendingEmail ? "Sending…" : "Send Email"}
+              </Button>
+            </div>
             <div className="bg-muted/30 rounded-lg p-3">
               <div className="text-xs font-bold text-muted-foreground mb-1">SUBJECT</div>
               <Input value={prospect.generatedEmail.subject}
@@ -3765,11 +3965,18 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
             <Textarea value={prospect.generatedEmail.body}
               onChange={e => onUpdate({ ...prospect, generatedEmail: { ...prospect.generatedEmail!, body: e.target.value } })}
               rows={7} className="text-sm" />
-            {!prospect.email && (
-              <div className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                No email address for this prospect — add one to enable sending.
-              </div>
-            )}
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+              <CopyButton text={`Subject: ${prospect.generatedEmail.subject}\n\n${prospect.generatedEmail.body}`} />
+              <Button
+                size="sm"
+                onClick={sendEmail}
+                disabled={sendingEmail || !prospect.email?.trim()}
+                className="h-8 text-xs gap-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+              >
+                {sendingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                {sendingEmail ? "Sending…" : "Send Email"}
+              </Button>
+            </div>
           </div>
         ) : (
           <div className="p-6 text-center space-y-3">
@@ -3790,61 +3997,160 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
 
       {/* WhatsApp */}
       <div className="rounded-xl border border-border/50 overflow-hidden">
-        <div className="p-4 border-b border-border/50 bg-muted/20 flex items-center justify-between">
+        <div className="p-4 border-b border-border/50 bg-muted/20 flex flex-wrap items-center justify-between gap-2">
           <h4 className="font-bold text-sm flex items-center gap-2"><MessageCircle className="w-4 h-4 text-green-600" /> WhatsApp Message</h4>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {prospect.generatedWhatsApp && <CopyButton text={prospect.generatedWhatsApp} />}
             <Button size="sm" variant="outline" onClick={genWA} disabled={loadingWA} className="h-7 text-xs gap-1">
               {loadingWA ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
               {prospect.generatedWhatsApp ? "Regenerate" : "Generate"}
             </Button>
-            {prospect.generatedWhatsApp && prospect.phone && (
-              <a
-                href={`https://wa.me/${prospect.phone.replace(/\D/g, "")}?text=${encodeURIComponent(prospect.generatedWhatsApp!)}`}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <Button size="sm" className="h-7 text-xs gap-1 bg-green-600 hover:bg-green-700 text-white">
-                  <MessageCircle className="w-3 h-3" /> Open WA
-                </Button>
-              </a>
-            )}
+            <a
+              href={getWhatsAppHref(prospect.phone, buildQuickWhatsAppText(prospect, effectivePrimaryOffer))}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={() => {
+                if (!prospect.generatedWhatsApp) {
+                  onUpdate({
+                    ...prospect,
+                    status: prospect.status === "new" ? "contacted" : prospect.status,
+                    generatedWhatsApp: buildQuickWhatsAppText(prospect, effectivePrimaryOffer),
+                  });
+                } else if (prospect.status === "new") {
+                  onUpdate({ ...prospect, status: "contacted" });
+                }
+              }}
+            >
+              <Button size="sm" className="h-7 text-xs gap-1 bg-green-600 hover:bg-green-700 text-white font-semibold">
+                <MessageCircle className="w-3 h-3" /> Send on WhatsApp
+              </Button>
+            </a>
           </div>
         </div>
-        {loadingWA ? <OutreachCopySkeleton label="Writing high-response WhatsApp outreach message…" /> : prospect.generatedWhatsApp ? (
-          <div className="p-4">
-            <Textarea value={prospect.generatedWhatsApp}
-              onChange={e => onUpdate({ ...prospect, generatedWhatsApp: e.target.value })} rows={5} className="text-sm" />
+        {loadingWA ? <OutreachCopySkeleton label="Writing high-response WhatsApp outreach message…" /> : (
+          <div className="p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2 bg-muted/30 rounded-lg px-3 py-2">
+              <span className="text-xs font-semibold text-muted-foreground shrink-0">WhatsApp / Phone:</span>
+              <Input
+                value={prospect.phone || ""}
+                onChange={e => onUpdate({ ...prospect, phone: e.target.value })}
+                placeholder="Enter WhatsApp phone number (e.g. +1 555 234 5678)…"
+                className="h-8 text-xs bg-white flex-1"
+              />
+              <a
+                href={getWhatsAppHref(prospect.phone, buildQuickWhatsAppText(prospect, effectivePrimaryOffer))}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => {
+                  if (prospect.status === "new") {
+                    onUpdate({ ...prospect, status: "contacted" });
+                  }
+                }}
+              >
+                <Button size="sm" className="h-8 text-xs gap-1.5 bg-green-600 hover:bg-green-700 text-white font-semibold">
+                  <MessageCircle className="w-3.5 h-3.5" /> Send on WhatsApp
+                </Button>
+              </a>
+            </div>
+            <Textarea
+              value={prospect.generatedWhatsApp ?? buildQuickWhatsAppText(prospect, effectivePrimaryOffer)}
+              onChange={e => onUpdate({ ...prospect, generatedWhatsApp: e.target.value })}
+              rows={5}
+              className="text-sm"
+            />
           </div>
-        ) : <div className="p-6 text-center text-sm text-muted-foreground">Generate a short WhatsApp message</div>}
+        )}
       </div>
 
       {/* LinkedIn */}
       <div className="rounded-xl border border-border/50 overflow-hidden">
-        <div className="p-4 border-b border-border/50 bg-muted/20 flex items-center justify-between">
+        <div className="p-4 border-b border-border/50 bg-muted/20 flex flex-wrap items-center justify-between gap-2">
           <h4 className="font-bold text-sm flex items-center gap-2"><Linkedin className="w-4 h-4 text-blue-700" /> LinkedIn Message</h4>
-          <div className="flex gap-2">
-            {prospect.generatedLinkedIn && <CopyButton text={prospect.generatedLinkedIn} />}
+          <div className="flex flex-wrap items-center gap-2">
+            <CopyButton text={prospect.generatedLinkedIn ?? buildQuickLinkedInText(prospect, effectivePrimaryOffer)} />
             <Button size="sm" variant="outline" onClick={genLI} disabled={loadingLI} className="h-7 text-xs gap-1">
               {loadingLI ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
               {prospect.generatedLinkedIn ? "Regenerate" : "Generate"}
             </Button>
+            <a
+              href={getLinkedInHref(prospect)}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={() => {
+                const msgToCopy = prospect.generatedLinkedIn ?? buildQuickLinkedInText(prospect, effectivePrimaryOffer);
+                try {
+                  navigator.clipboard.writeText(msgToCopy);
+                } catch {}
+                setSendStatus({
+                  type: "success",
+                  msg: "LinkedIn message copied to clipboard & opened LinkedIn — paste it into your message or connection note!",
+                });
+                if (!prospect.generatedLinkedIn) {
+                  onUpdate({
+                    ...prospect,
+                    status: prospect.status === "new" ? "contacted" : prospect.status,
+                    generatedLinkedIn: msgToCopy,
+                  });
+                } else if (prospect.status === "new") {
+                  onUpdate({ ...prospect, status: "contacted" });
+                }
+              }}
+            >
+              <Button size="sm" className="h-7 text-xs gap-1 bg-[#0A66C2] hover:bg-[#004182] text-white font-semibold">
+                <Linkedin className="w-3 h-3" /> Send on LinkedIn
+              </Button>
+            </a>
           </div>
         </div>
-        {loadingLI ? <OutreachCopySkeleton label="Writing LinkedIn decision-maker connection note…" /> : prospect.generatedLinkedIn ? (
-          <div className="p-4">
-            <Textarea value={prospect.generatedLinkedIn}
-              onChange={e => onUpdate({ ...prospect, generatedLinkedIn: e.target.value })} rows={3} className="text-sm" />
-            <div className="text-xs text-muted-foreground mt-2">{prospect.generatedLinkedIn.length}/300 characters</div>
+        {loadingLI ? <OutreachCopySkeleton label="Writing LinkedIn decision-maker connection note…" /> : (
+          <div className="p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2 bg-muted/30 rounded-lg px-3 py-2">
+              <span className="text-xs font-semibold text-muted-foreground shrink-0">LinkedIn URL:</span>
+              <Input
+                value={prospect.linkedin || ""}
+                onChange={e => onUpdate({ ...prospect, linkedin: e.target.value })}
+                placeholder="Paste LinkedIn profile/company URL (or leave blank to auto-search owner on LinkedIn)…"
+                className="h-8 text-xs bg-white flex-1"
+              />
+              <a
+                href={getLinkedInHref(prospect)}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => {
+                  const msgToCopy = prospect.generatedLinkedIn ?? buildQuickLinkedInText(prospect, effectivePrimaryOffer);
+                  try {
+                    navigator.clipboard.writeText(msgToCopy);
+                  } catch {}
+                  setSendStatus({
+                    type: "success",
+                    msg: "LinkedIn message copied to clipboard & opened LinkedIn — paste it into your message or connection note!",
+                  });
+                }}
+              >
+                <Button size="sm" className="h-8 text-xs gap-1.5 bg-[#0A66C2] hover:bg-[#004182] text-white font-semibold">
+                  <Linkedin className="w-3.5 h-3.5" /> Send on LinkedIn
+                </Button>
+              </a>
+            </div>
+            <Textarea
+              value={prospect.generatedLinkedIn ?? buildQuickLinkedInText(prospect, effectivePrimaryOffer)}
+              onChange={e => onUpdate({ ...prospect, generatedLinkedIn: e.target.value })}
+              rows={3}
+              className="text-sm"
+            />
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <span>Clicking "Send on LinkedIn" copies your message &amp; opens the prospect on LinkedIn</span>
+              <span>{(prospect.generatedLinkedIn ?? buildQuickLinkedInText(prospect, effectivePrimaryOffer)).length}/300 characters</span>
+            </div>
           </div>
-        ) : <div className="p-6 text-center text-sm text-muted-foreground">Generate a 300-char LinkedIn connection request</div>}
+        )}
       </div>
 
       {/* Follow-up */}
       <div className="rounded-xl border border-border/50 overflow-hidden">
-        <div className="p-4 border-b border-border/50 bg-muted/20 flex items-center justify-between">
+        <div className="p-4 border-b border-border/50 bg-muted/20 flex flex-wrap items-center justify-between gap-2">
           <h4 className="font-bold text-sm flex items-center gap-2"><Clock className="w-4 h-4 text-orange-600" /> Follow-up Generator</h4>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Select value={followupDay} onValueChange={setFollowupDay}>
               <SelectTrigger className="w-24 h-7 text-xs"><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -3859,6 +4165,36 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
               Generate
             </Button>
             {followup && <CopyButton text={`Subject: ${followup.subject}\n\n${followup.body}`} />}
+            {followup && (
+              <Button
+                size="sm"
+                disabled={sendingEmail || !prospect.email?.trim()}
+                onClick={async () => {
+                  if (!prospect.email || !followup) return;
+                  setSendingEmail(true);
+                  setSendStatus(null);
+                  try {
+                    await callCRM("send-email", {
+                      to: prospect.email,
+                      subject: followup.subject,
+                      body: followup.body,
+                      prospectName: prospect.businessName,
+                      reportUrl: (prospect as any).reportUrl ?? undefined,
+                    });
+                    onUpdate({ ...prospect, status: "contacted", emailSentAt: new Date().toISOString() });
+                    setSendStatus({ type: "success", msg: `Day ${followupDay} follow-up email sent to ${prospect.email}` });
+                  } catch (e: any) {
+                    setSendStatus({ type: "error", msg: e.message });
+                  } finally {
+                    setSendingEmail(false);
+                  }
+                }}
+                className="h-7 text-xs gap-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+              >
+                {sendingEmail ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
+                Send Email
+              </Button>
+            )}
           </div>
         </div>
         {loadingFollowup ? <OutreachCopySkeleton label={`Writing Day ${followupDay} follow-up sequence…`} /> : followup ? (
@@ -5578,6 +5914,47 @@ function ProspectList({
                       {isGeneratingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" /> : <Mail className="w-3.5 h-3.5 shrink-0" />}
                       <span>{p.generatedEmail ? (isEmailOpen ? "Hide Cold Email" : "View Cold Email") : "Generate Cold Email"}</span>
                     </button>
+                    {p.generatedEmail && (
+                      <button
+                        type="button"
+                        disabled={isSendingEmail}
+                        onClick={() => {
+                          if (!p.email?.trim()) {
+                            setOpenEmailIds(prev => ({ ...prev, [p.id]: true }));
+                            return;
+                          }
+                          sendInlineEmailForProspect(p);
+                        }}
+                        className="flex-1 sm:flex-initial justify-center px-3 py-2 sm:py-1 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white inline-flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                      >
+                        {isSendingEmail ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : <Send className="w-3 h-3 shrink-0" />}
+                        <span>{isSendingEmail ? "Sending…" : p.emailSentAt ? "✓ Email Sent" : "Send Email"}</span>
+                      </button>
+                    )}
+                    <a
+                      href={getWhatsAppHref(p.phone, buildQuickWhatsAppText(p, offerRes.primaryOffer))}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-semibold bg-green-600 hover:bg-green-700 text-white inline-flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                    >
+                      <MessageCircle className="w-3 h-3 shrink-0" />
+                      <span>Send on WhatsApp</span>
+                    </a>
+                    <a
+                      href={getLinkedInHref(p)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={() => {
+                        try {
+                          navigator.clipboard.writeText(buildQuickLinkedInText(p, offerRes.primaryOffer));
+                        } catch {}
+                      }}
+                      title="Copies personalized LinkedIn message & opens LinkedIn"
+                      className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-semibold bg-[#0A66C2] hover:bg-[#004182] text-white inline-flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                    >
+                      <Linkedin className="w-3 h-3 shrink-0" />
+                      <span>Send on LinkedIn</span>
+                    </a>
                   </div>
 
                   {(p.generatedSiteUrl || p.generatedReviewUrl) && (
@@ -5621,18 +5998,58 @@ function ProspectList({
                             <RefreshCw className={`w-3 h-3 ${isGeneratingEmail ? "animate-spin" : ""}`} />
                             Regenerate
                           </Button>
-                          {p.email && (
+                          <Button
+                            size="sm"
+                            onClick={() => sendInlineEmailForProspect(p)}
+                            disabled={isSendingEmail || !p.email?.trim()}
+                            className="h-7 text-xs gap-1 bg-blue-600 hover:bg-blue-700 text-white"
+                          >
+                            <Send className="w-3 h-3" />
+                            {isSendingEmail ? "Sending…" : "Send Email"}
+                          </Button>
+                          <a
+                            href={getWhatsAppHref(p.phone, buildQuickWhatsAppText(p, offerRes.primaryOffer))}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
                             <Button
+                              type="button"
                               size="sm"
-                              onClick={() => sendInlineEmailForProspect(p)}
-                              disabled={isSendingEmail}
-                              className="h-7 text-xs gap-1 bg-slate-900 hover:bg-slate-800 text-white"
+                              className="h-7 text-xs gap-1 bg-green-600 hover:bg-green-700 text-white"
                             >
-                              <Send className="w-3 h-3" />
-                              {isSendingEmail ? "Sending…" : "Send Email"}
+                              <MessageCircle className="w-3 h-3" />
+                              Send on WhatsApp
                             </Button>
-                          )}
+                          </a>
+                          <a
+                            href={getLinkedInHref(p)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={() => {
+                              try {
+                                navigator.clipboard.writeText(buildQuickLinkedInText(p, offerRes.primaryOffer));
+                              } catch {}
+                            }}
+                          >
+                            <Button
+                              type="button"
+                              size="sm"
+                              className="h-7 text-xs gap-1 bg-[#0A66C2] hover:bg-[#004182] text-white"
+                            >
+                              <Linkedin className="w-3 h-3" />
+                              Send on LinkedIn
+                            </Button>
+                          </a>
                         </div>
+                      </div>
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <span className="text-[11px] font-semibold text-slate-600 shrink-0">To Email:</span>
+                        <Input
+                          value={p.email || ""}
+                          placeholder="Enter recipient email address to send…"
+                          onChange={(e) => onUpdate?.({ ...p, email: e.target.value })}
+                          className="h-7 text-xs flex-1"
+                        />
                       </div>
                       <Input
                         value={p.generatedEmail.subject}
@@ -6873,6 +7290,7 @@ export default function CRM() {
             <AIHunterPanel
               onImport={addProspects}
               activeProject={activeProject}
+              onOpenTrainAI={() => setTab("train-ai")}
             />
           </TabsContent>
 

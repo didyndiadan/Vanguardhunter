@@ -1761,19 +1761,27 @@ export default function UserDashboard() {
                     <div className="space-y-1">
                       <div className="flex items-center gap-2 text-xs font-semibold text-[#1D4ED8]">
                         <Compass className="w-4 h-4" />
-                        <span>Getting Started · First Lead Discovery Walkthrough</span>
+                        <span>Getting Started · Step 1: Train Your AI First</span>
                         <span aria-hidden="true">·</span>
                         <span className="font-mono-num text-[#525866]">~60 sec setup</span>
                       </div>
                       <h2 className="font-display text-lg sm:text-xl font-bold text-[#0B0F17]">
-                        How to Initiate Your First Autonomous Lead Discovery Search
+                        Start Here: Train Your AI With Your Offers First, Then Hunt Leads
                       </h2>
                       <p className="text-xs sm:text-sm text-[#525866] max-w-3xl">
-                        Follow the 4-step workflow below or launch the interactive Guided Tour to configure your target market, organize a campaign project, and discover verified businesses with automated website diagnostics.
+                        <strong>Important first step:</strong> Before hunting businesses or sending cold emails, train the AI with your service offers, pain points, and email blueprint in <strong>Train Your AI &amp; Offers</strong> so every cold email is hyper-personalized to what you sell.
                       </p>
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleSelectTab("train-ai")}
+                        className="px-4 py-2.5 text-xs font-bold text-white bg-purple-700 hover:bg-purple-800 rounded-lg transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Step 1: Train Your AI First →</span>
+                      </button>
                       <button
                         type="button"
                         onClick={() => openTourStep(1)}
@@ -1797,32 +1805,32 @@ export default function UserDashboard() {
                       {
                         step: 1 as const,
                         index: "01",
+                        title: "Train Your AI First (My Offers)",
+                        desc: "Start here! Add your service offers, target pain points, and cold email template so the AI writes personalized emails for your offers.",
+                        meta: user?.aiTrainingProfile?.offerDetails ? "Custom Offers Trained ✓" : "Click to train your AI offers first",
+                        done: Boolean(user?.aiTrainingProfile?.offerDetails),
+                      },
+                      {
+                        step: 2 as const,
+                        index: "02",
                         title: "Select Niche & City",
                         desc: "Choose from 120+ business verticals (e.g. Dentist, MedSpa, Roofing) and specify your target city.",
                         meta: `Current: ${quickCategory} · ${quickCity}`,
                         done: Boolean(quickCategory.trim() && quickCity.trim()),
                       },
                       {
-                        step: 2 as const,
-                        index: "02",
+                        step: 3 as const,
+                        index: "03",
                         title: "Assign Campaign Project",
                         desc: "Isolate scraped prospects, pipeline stages, and CSV/JSON exports inside a dedicated workspace project.",
                         meta: `${projects.length} active ${projects.length === 1 ? "project" : "projects"}`,
                         done: projects.length > 0,
                       },
                       {
-                        step: 3 as const,
-                        index: "03",
-                        title: "AI Website & Gap Scan",
-                        desc: "Automatically detect missing booking widgets, tech stacks, and generate shareable audit links.",
-                        meta: `Batch size: ${quickCount} leads`,
-                        done: savedProspectsList.length > 0 || recentReports.length > 0,
-                      },
-                      {
                         step: 4 as const,
                         index: "04",
-                        title: "Execute First Lead Hunt",
-                        desc: "Run the live discovery scan in the CRM Hunter or directly from the Quick-Launch bar below.",
+                        title: "Execute Lead Hunt & Outreach",
+                        desc: "Run the live discovery scan in the CRM Hunter and generate personalized cold emails matched to your trained offers.",
                         meta:
                           savedProspectsList.length > 0
                             ? `${savedProspectsList.length} leads in workspace`
@@ -3511,9 +3519,9 @@ export default function UserDashboard() {
             <div className="bg-[#FAF9F5] border-b border-[#E4E2DD] px-5 sm:px-7 py-3 grid grid-cols-2 sm:grid-cols-4 gap-2">
               {(
                 [
-                  { step: 1, label: "01. Target Market" },
-                  { step: 2, label: "02. Project Setup" },
-                  { step: 3, label: "03. AI Diagnostics" },
+                  { step: 1, label: "01. Train AI First" },
+                  { step: 2, label: "02. Target Market" },
+                  { step: 3, label: "03. Project & AI Scan" },
                   { step: 4, label: "04. Launch Search" },
                 ] as const
               ).map((item) => (
@@ -3537,12 +3545,85 @@ export default function UserDashboard() {
 
             {/* Modal Step Content Body */}
             <div className="p-5 sm:p-7 space-y-6 max-h-[70vh] overflow-y-auto">
-              {/* STEP 1: TARGET NICHE & GEOGRAPHY */}
+              {/* STEP 1: TRAIN YOUR AI FIRST (MY OFFERS) */}
               {tourStep === 1 && (
+                <div className="space-y-5">
+                  <div className="p-4 rounded-xl bg-purple-50 border border-purple-200 space-y-2">
+                    <div className="inline-flex items-center gap-1.5 text-xs font-bold text-purple-800 uppercase tracking-wider">
+                      <Sparkles className="w-4 h-4 text-purple-600" />
+                      <span>Mandatory First Step Before Hunting Leads</span>
+                    </div>
+                    <h3 className="font-display text-base sm:text-lg font-bold text-[#0B0F17]">
+                      01. Train Your AI With Your Service Offers First
+                    </h3>
+                    <p className="text-xs sm:text-sm text-[#525866] leading-relaxed">
+                      Before running your first lead hunt or sending cold emails, configure <strong>Train Your AI (My Offers)</strong>. The AI uses your custom service catalog, target pain points, subject line style, and static email blueprint to write personalized cold outreach for every business it audits.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
+                      <div className="font-mono-num text-xs font-bold text-purple-700">1. Your Offers</div>
+                      <div className="text-xs font-bold text-[#0B0F17]">Define What You Sell</div>
+                      <p className="text-[11px] text-[#525866] leading-relaxed">
+                        Add all your services (e.g. Website Creation, 5-Star Review Shield, AI Receptionist, SEO) and which business signals trigger each offer.
+                      </p>
+                    </div>
+                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
+                      <div className="font-mono-num text-xs font-bold text-purple-700">2. Email Blueprint</div>
+                      <div className="text-xs font-bold text-[#0B0F17]">Your Cold Email Style</div>
+                      <p className="text-[11px] text-[#525866] leading-relaxed">
+                        Set your sender name, agency name, subject line formula, call-to-action, and static email example.
+                      </p>
+                    </div>
+                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
+                      <div className="font-mono-num text-xs font-bold text-purple-700">3. Auto-Match</div>
+                      <div className="text-xs font-bold text-[#0B0F17]">Smart Offer Matching</div>
+                      <p className="text-[11px] text-[#525866] leading-relaxed">
+                        When you hunt leads, the AI audits each business and automatically pitches the exact offer they need most.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-white border border-purple-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-bold text-[#0B0F17]">
+                        Ready to customize your offers &amp; cold email AI?
+                      </div>
+                      <div className="text-[11px] text-[#525866] mt-0.5">
+                        Open the Train Your AI studio now, save your offers, then continue with Step 02 to hunt leads.
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowTourModal(false);
+                          setActiveTab("train-ai");
+                        }}
+                        className="px-4 py-2.5 rounded-xl bg-purple-700 hover:bg-purple-800 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Open Train Your AI Now →</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTourStep(2)}
+                        className="px-3.5 py-2.5 rounded-xl bg-[#FAF9F5] hover:bg-[#F2F0EA] text-[#0B0F17] border border-[#E4E2DD] text-xs font-semibold cursor-pointer"
+                      >
+                        Already Trained · Go to Step 02 →
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* STEP 2: TARGET NICHE & GEOGRAPHY */}
+              {tourStep === 2 && (
                 <div className="space-y-5">
                   <div>
                     <h3 className="font-display text-base sm:text-lg font-bold text-[#0B0F17]">
-                      01. Choose Your Target Business Vertical & City
+                      02. Choose Your Target Business Vertical & City
                     </h3>
                     <p className="text-xs sm:text-sm text-[#525866] mt-1 leading-relaxed">
                       Vanguard Hunter scans live business directories across 120+ industries, verifies active domains, and removes dead websites automatically. Pick a high-converting preset playbook below or type any custom niche and city.
@@ -3635,15 +3716,15 @@ export default function UserDashboard() {
                 </div>
               )}
 
-              {/* STEP 2: PROJECT WORKSPACE ORGANIZATION */}
-              {tourStep === 2 && (
+              {/* STEP 3: PROJECT WORKSPACE & AUTONOMOUS AI DIAGNOSTICS */}
+              {tourStep === 3 && (
                 <div className="space-y-5">
                   <div>
                     <h3 className="font-display text-base sm:text-lg font-bold text-[#0B0F17]">
-                      02. Assign Your Search to a Dedicated Campaign Project
+                      03. Assign Your Campaign Project & Configure AI Diagnostics
                     </h3>
                     <p className="text-xs sm:text-sm text-[#525866] mt-1 leading-relaxed">
-                      Every lead search is saved inside a Project workspace so your scraped businesses, CRM pipeline stages, and 1-click CSV/JSON exports stay organized by client or vertical.
+                      Every lead search is saved inside a Project workspace, and Vanguard Hunter automatically audits each business and matches it against your trained offers:
                     </p>
                   </div>
 
@@ -3721,44 +3802,6 @@ export default function UserDashboard() {
                       </p>
                     )}
                   </form>
-                </div>
-              )}
-
-              {/* STEP 3: AUTONOMOUS AI DIAGNOSTICS & ENRICHMENT */}
-              {tourStep === 3 && (
-                <div className="space-y-5">
-                  <div>
-                    <h3 className="font-display text-base sm:text-lg font-bold text-[#0B0F17]">
-                      03. Configure Discovery Volume & Autonomous AI Diagnostics
-                    </h3>
-                    <p className="text-xs sm:text-sm text-[#525866] mt-1 leading-relaxed">
-                      When you import discovered businesses into your CRM pipeline, Vanguard Hunter automatically runs a multi-layer diagnostic and prepares personalized outreach assets:
-                    </p>
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
-                      <div className="font-mono-num text-xs font-bold text-[#1D4ED8]">Layer 01</div>
-                      <div className="text-xs font-bold text-[#0B0F17]">Tech Stack & Gap Detection</div>
-                      <p className="text-[11px] text-[#525866] leading-relaxed">
-                        Detects CMS (WordPress, Wix, Squarespace), missing 24/7 chat/booking widgets, and mobile conversion bottlenecks.
-                      </p>
-                    </div>
-                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
-                      <div className="font-mono-num text-xs font-bold text-[#1D4ED8]">Layer 02</div>
-                      <div className="text-xs font-bold text-[#0B0F17]">Shareable Audit Page</div>
-                      <p className="text-[11px] text-[#525866] leading-relaxed">
-                        Generates a bespoke `/report/:id` diagnostic URL for each prospect that tracks live opens and consultation requests.
-                      </p>
-                    </div>
-                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
-                      <div className="font-mono-num text-xs font-bold text-[#1D4ED8]">Layer 03</div>
-                      <div className="text-xs font-bold text-[#0B0F17]">Omnichannel Pitch Ready</div>
-                      <p className="text-[11px] text-[#525866] leading-relaxed">
-                        Drafts Cold Email A/B/C variants, WhatsApp/LinkedIn messages, and a neural Studio Voice Pitch script automatically.
-                      </p>
-                    </div>
-                  </div>
 
                   <div className="p-4 rounded-xl bg-[#FAF9F5] border border-[#E4E2DD] grid grid-cols-1 sm:grid-cols-12 gap-4">
                     <div className="sm:col-span-4">
