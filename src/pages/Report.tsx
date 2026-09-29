@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { CheckCircle2, XCircle, AlertTriangle, Sparkles, ArrowLeft, Send, ExternalLink } from "lucide-react";
+import { WebsiteAuditReportSkeleton } from "@/components/ScrapingAndReportSkeletons";
 
 interface Analysis {
   websiteScore?: number;
@@ -150,14 +151,7 @@ export default function Report() {
   };
 
   if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50">
-        <div className="text-center">
-          <div className="w-12 h-12 border-4 border-gray-200 border-t-purple-700 rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-gray-500 font-serif">Loading your website analysis report…</p>
-        </div>
-      </div>
-    );
+    return <WebsiteAuditReportSkeleton fullPage />;
   }
 
   if (notFound || !report) {

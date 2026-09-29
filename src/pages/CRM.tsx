@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useLocation } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,9 +19,17 @@ import {
   Database, ArrowLeft,
 } from "lucide-react";
 import API_BASE from "@/lib/api";
-import { getCachedSaasUser, isUserAdmin, saasFetch } from "@/lib/saas-auth";
+import { getCachedSaasUser, getSaasToken, clearSaasSession, isUserAdmin, saasFetch } from "@/lib/saas-auth";
 import OwnerWebsiteBuilderPanel from "@/components/OwnerWebsiteBuilderPanel";
+import MultiSmtpManagerPanel, { SmtpAppPasswordGuide } from "@/components/MultiSmtpManagerPanel";
 import ProjectWorkspaceBar, { ExportLeadsBar } from "@/components/ProjectWorkspaceBar";
+import {
+  LeadScrapingProgressSkeleton,
+  BatchOperationProgressBanner,
+  WebsiteAuditReportSkeleton,
+  ProposalGenerationSkeleton,
+  OutreachCopySkeleton,
+} from "@/components/ScrapingAndReportSkeletons";
 import {
   LeadProject,
   DEFAULT_PROJECT_ID,
@@ -31,6 +40,8 @@ import {
   setActiveProjectId,
   loadProjectHuntedResults,
   saveProjectHuntedResults,
+  loadUserProspects,
+  saveUserProspects,
 } from "@/lib/projects";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -38,11 +49,309 @@ import {
 type LeadStatus = "new" | "contacted" | "waiting" | "proposal_sent" | "meeting" | "negotiating" | "won" | "lost" | "archive";
 type Priority = "low" | "medium" | "high";
 
+interface ApolloModuleConfig {
+  enabled: boolean;
+  techStack: boolean;
+  decisionMaker: boolean;
+  intentScoring: boolean;
+  warmSignals: boolean;
+  smartSnippets: boolean;
+  voiceNotePitch: boolean;
+  machinePhoneCaller: boolean;
+  accessMode: string;
+}
+
+const DEFAULT_APOLLO_CONFIG: ApolloModuleConfig = {
+  enabled: true,
+  techStack: true,
+  decisionMaker: true,
+  intentScoring: true,
+  warmSignals: true,
+  smartSnippets: true,
+  voiceNotePitch: true,
+  machinePhoneCaller: true,
+  accessMode: "all_plans",
+};
+
+function useApolloConfig(): ApolloModuleConfig {
+  const [cfg, setCfg] = useState<ApolloModuleConfig>(DEFAULT_APOLLO_CONFIG);
+  useEffect(() => {
+    saasFetch<{
+      enabled?: boolean;
+      accessMode?: string;
+      modules?: {
+        decisionMaker?: boolean;
+        techStackSignals?: boolean;
+        buyerIntentScore?: boolean;
+        smartFilters?: boolean;
+        multiChannelCockpit?: boolean;
+        voiceNotePitch?: boolean;
+        machinePhoneCaller?: boolean;
+      };
+      apollo?: Partial<ApolloModuleConfig>;
+    }>("/api/saas/apollo-config")
+      .then((d) => {
+        if (!d) return;
+        if (d.modules) {
+          setCfg({
+            enabled: Boolean(d.enabled),
+            decisionMaker: Boolean(d.modules.decisionMaker),
+            techStack: Boolean(d.modules.techStackSignals),
+            intentScoring: Boolean(d.modules.buyerIntentScore),
+            warmSignals: Boolean(d.modules.smartFilters),
+            smartSnippets: Boolean(d.modules.multiChannelCockpit),
+            voiceNotePitch: Boolean(d.modules.voiceNotePitch ?? true),
+            machinePhoneCaller: Boolean(d.modules.machinePhoneCaller ?? true),
+            accessMode: d.accessMode || "all_plans",
+          });
+        } else if (d.apollo) {
+          setCfg({ ...DEFAULT_APOLLO_CONFIG, ...d.apollo });
+        }
+      })
+      .catch(() => {});
+  }, []);
+  return cfg;
+}
+
+interface TrainedOfferSummary {
+  primaryOfferName: string;
+  hasWebsiteOffer: boolean;
+  hasReviewOffer: boolean;
+  websiteOfferName: string;
+  reviewOfferName: string;
+  servicesOffered: Array<{ id?: string; name: string; description: string; targetSignals?: string }>;
+  offerDetails: string;
+}
+
+function useTrainedOfferSummary(): TrainedOfferSummary {
+  const [summary, setSummary] = useState<TrainedOfferSummary>({
+    primaryOfferName: "Website Creation & Review Service",
+    hasWebsiteOffer: true,
+    hasReviewOffer: true,
+    websiteOfferName: "Website Creation & Mobile Redesign",
+    reviewOfferName: "5-Star Review Service & Reputation Shield",
+    servicesOffered: [],
+    offerDetails: "Custom conversion websites and 5-star Google review generation systems",
+  });
+
+  useEffect(() => {
+    saasFetch<{
+      profile?: {
+        offerDetails?: string;
+        servicesOffered?: Array<{ id?: string; name: string; description: string; targetSignals?: string }>;
+      };
+    }>("/api/saas/ai-training")
+      .then((res) => {
+        const p = res?.profile;
+        if (!p) return;
+        const list = Array.isArray(p.servicesOffered) ? p.servicesOffered.filter((s) => s?.name?.trim()) : [];
+        const combinedText = `${p.offerDetails || ""} ${list.map((s) => `${s.name} ${s.description}`).join(" ")}`;
+        const websiteSrv = list.find((s) => /website|web design|site|redesign|landing page/i.test(`${s.name} ${s.description}`));
+        const reviewSrv = list.find((s) => /review|reputation|5-star|star|google maps/i.test(`${s.name} ${s.description}`));
+        const hasWeb = list.length === 0 || Boolean(websiteSrv) || /website|web design|site|redesign|landing page/i.test(combinedText);
+        const hasRev = list.length === 0 || Boolean(reviewSrv) || /review|reputation|5-star|star|google maps/i.test(combinedText);
+        let primaryOfferName = "Website Creation & Review Service";
+        if (hasWeb && hasRev) {
+          primaryOfferName = "Website Creation & Review Service";
+        } else if (list.length > 0) {
+          primaryOfferName = list[0].name;
+        } else if (hasWeb) {
+          primaryOfferName = websiteSrv?.name || "Website Creation Service";
+        } else if (hasRev) {
+          primaryOfferName = reviewSrv?.name || "5-Star Review Service";
+        }
+        setSummary({
+          primaryOfferName,
+          hasWebsiteOffer: hasWeb,
+          hasReviewOffer: hasRev,
+          websiteOfferName: websiteSrv?.name || "Website Creation & Mobile Redesign",
+          reviewOfferName: reviewSrv?.name || "5-Star Review Service & Reputation Shield",
+          servicesOffered: list,
+          offerDetails: p.offerDetails || "Custom conversion websites and 5-star Google review generation systems",
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  return summary;
+}
+
+function resolveAuditMatchedOffer(
+  lead: {
+    website?: string;
+    cmsPlatform?: string;
+    techStack?: string[];
+    missingSignals?: string[];
+    painPoint?: string;
+    notes?: string;
+    softwareNeedScore?: number;
+    primaryOffer?: string;
+    analysis?: WebsiteAnalysis;
+    generatedSiteUrl?: string;
+    generatedReviewUrl?: string;
+  },
+  trainedOffer: TrainedOfferSummary
+): {
+  primaryOffer: string | null;
+  needsWebsite: boolean;
+  needsReview: boolean;
+  showGenerateWebsite: boolean;
+  showGenerateReview: boolean;
+} {
+  const rawWeb = (lead.website || "").trim();
+  const hasWebsite = Boolean(
+    rawWeb &&
+      !/^(none|n\/a|no website|-)$/i.test(rawWeb) &&
+      lead.cmsPlatform !== "No Website"
+  );
+  const techText = (lead.techStack || []).join(" ").toLowerCase();
+  const missingText = (lead.missingSignals || []).join(" ").toLowerCase();
+  const painText = (lead.painPoint || "").toLowerCase();
+  const cmsText = (lead.cmsPlatform || "").toLowerCase();
+  const alreadyHasReviews =
+    /customer reviews/i.test(techText) && !/no review|no 5-star review/i.test(missingText);
+
+  let needsWebsite = false;
+  let needsReview = false;
+  let primaryOffer: string | null = null;
+
+  if (lead.analysis) {
+    const a = lead.analysis;
+    const matchedText = (a.matchedOffer || "").toLowerCase();
+    const issuesText = (a.issues || []).map((i) => `${i.title} ${i.description}`).join(" ").toLowerCase();
+    const oppsText = (a.opportunities || []).map((o) => `${o.title} ${o.impact}`).join(" ").toLowerCase();
+
+    needsWebsite =
+      !hasWebsite ||
+      a.websiteScore < 72 ||
+      a.mobileScore < 68 ||
+      a.conversionScore < 66 ||
+      a.checks?.responsiveDesign === false ||
+      a.checks?.modernUI === false ||
+      a.checks?.contactForm === false ||
+      /website|web design|redesign|landing page|site creation|no dedicated.*website/i.test(matchedText) ||
+      (a.issues || []).some(
+        (i) => i.priority === "high" && /website|redesign|mobile|landing page|no dedicated|lead capture|conversion/i.test(`${i.title} ${i.description}`)
+      );
+
+    needsReview =
+      !alreadyHasReviews &&
+      (/review|reputation|5-star|trust|rating/i.test(matchedText) ||
+        a.checks?.trustElements === false ||
+        /review|reputation|5-star|rating|testimonial/i.test(issuesText) ||
+        /review|reputation|5-star/i.test(oppsText));
+
+    if (trainedOffer.hasWebsiteOffer && trainedOffer.hasReviewOffer && needsWebsite && needsReview) {
+      primaryOffer = "Website Creation & Review Service";
+    } else if (trainedOffer.hasWebsiteOffer && needsWebsite && !needsReview) {
+      primaryOffer = trainedOffer.websiteOfferName;
+    } else if (trainedOffer.hasReviewOffer && needsReview && !needsWebsite) {
+      primaryOffer = trainedOffer.reviewOfferName;
+    } else {
+      primaryOffer = a.matchedOffer || lead.primaryOffer || trainedOffer.primaryOfferName || null;
+    }
+  } else {
+    const hasModernBookingAndForm =
+      hasWebsite &&
+      /online booking/i.test(techText) &&
+      /contact form/i.test(techText) &&
+      !/wix|godaddy|weebly|squarespace|wordpress|unreachable|parked/i.test(cmsText);
+
+    needsWebsite =
+      !hasWebsite ||
+      !hasModernBookingAndForm ||
+      /no website|unreachable|parked|diy|wix|godaddy|weebly|squarespace|wordpress|no lead capture|no contact form|no online booking|no booking|no https|outdated|slow|poor mobile|redesign/i.test(
+        `${missingText} ${cmsText} ${painText}`
+      ) ||
+      (typeof lead.softwareNeedScore === "number" && lead.softwareNeedScore >= 6);
+
+    needsReview =
+      !alreadyHasReviews &&
+      (!hasWebsite ||
+        /no review|review funnel|review shield|reputation|5-star|low.*review|few.*review|no testimonial|unreachable/i.test(
+          `${missingText} ${painText}`
+        ));
+
+    if (trainedOffer.hasWebsiteOffer && trainedOffer.hasReviewOffer && needsWebsite && needsReview) {
+      primaryOffer = "Website Creation & Review Service";
+    } else if (trainedOffer.hasWebsiteOffer && needsWebsite) {
+      primaryOffer = trainedOffer.websiteOfferName;
+    } else if (trainedOffer.hasReviewOffer && needsReview) {
+      primaryOffer = trainedOffer.reviewOfferName;
+    } else {
+      const otherService = trainedOffer.servicesOffered.find(
+        (s) =>
+          !/website|web design|redesign|review|reputation|5-star/i.test(`${s.name} ${s.description}`) &&
+          ((/chat|receptionist/i.test(`${missingText} ${painText}`) && /ai|receptionist|chat/i.test(`${s.name} ${s.description}`)) ||
+            (/booking/i.test(`${missingText} ${painText}`) && /booking|appointment/i.test(`${s.name} ${s.description}`)) ||
+            (/pixel|ad|seo/i.test(`${missingText} ${painText}`) && /seo|ad|marketing|google/i.test(`${s.name} ${s.description}`)))
+      );
+      primaryOffer = otherService?.name || lead.primaryOffer || trainedOffer.primaryOfferName || null;
+    }
+  }
+
+  return {
+    primaryOffer,
+    needsWebsite,
+    needsReview,
+    showGenerateWebsite: Boolean(lead.generatedSiteUrl) || (trainedOffer.hasWebsiteOffer && needsWebsite),
+    showGenerateReview: Boolean(lead.generatedReviewUrl) || (trainedOffer.hasReviewOffer && needsReview),
+  };
+}
+
+async function generateInlineLeadAssets(lead: {
+  businessName: string;
+  ownerName?: string;
+  category?: string;
+  city?: string;
+  country?: string;
+  phone?: string;
+  email?: string;
+  website?: string;
+  painPoint?: string;
+}): Promise<{ siteId: string; websiteUrl: string; reviewUrl: string }> {
+  const origin = window.location.origin;
+  const res = await saasFetch<{ site?: { siteId?: string; id?: string | number } }>("/api/website-builder/generate", {
+    method: "POST",
+    body: JSON.stringify({
+      businessName: lead.businessName,
+      ownerName: lead.ownerName || "",
+      category: lead.category || "Local Business",
+      city: lead.city || "Local Area",
+      country: lead.country || "USA",
+      phone: lead.phone || "(916) 291-1047",
+      email: lead.email || "",
+      originalWebsite: lead.website || "",
+      existingWebsite: lead.website || "",
+      painPoint: lead.painPoint || "",
+      themeColor: "#1d4ed8",
+      designStyle: "editorial",
+      enableChatbot: true,
+      enableReviewShield: true,
+      googleReviewUrl: "",
+      whatsappNumber: (lead.phone || "").replace(/\D/g, ""),
+    }),
+  });
+  const siteId = String(res?.site?.siteId || res?.site?.id || "").trim();
+  if (!siteId) throw new Error("Failed to generate website preview");
+  try {
+    const cachePayload = JSON.stringify({ site: res.site });
+    sessionStorage.setItem(`vh_site_cache_${siteId}`, cachePayload);
+    localStorage.setItem(`vh_site_cache_${siteId}`, cachePayload);
+  } catch {}
+  return {
+    siteId,
+    websiteUrl: `${origin}/site/${siteId}`,
+    reviewUrl: `${origin}/review/${siteId}`,
+  };
+}
+
 interface Prospect {
   id: number;
   projectId?: string;
   businessName: string;
   ownerName: string;
+  ownerRole?: string;
   category: string;
   website: string;
   email: string;
@@ -52,6 +361,12 @@ interface Prospect {
   facebook: string;
   instagram: string;
   linkedin: string;
+  cmsPlatform?: string;
+  techStack?: string[];
+  missingSignals?: string[];
+  buyerIntentScore?: number;
+  intentTier?: "hot" | "warm" | "cold";
+  intentReasons?: string[];
   status: LeadStatus;
   priority: Priority;
   expectedValue: number;
@@ -74,11 +389,25 @@ interface Prospect {
   pitchType?: "ai_agent" | "website" | "both";
   reportId?: string;
   reportUrl?: string;
+  voicePitchScript?: string;
+  voicePitchWavDataUrl?: string;
+  voicePitchWavBase64?: string;
+  voicePitchVoiceName?: string;
+  lastMachineCallId?: string;
+  lastMachineCallProvider?: string;
+  lastMachineCallStatus?: string;
+  lastMachineCallTranscript?: string;
+  lastMachineCallRecordingUrl?: string;
+  primaryOffer?: string;
+  generatedSiteId?: string;
+  generatedSiteUrl?: string;
+  generatedReviewUrl?: string;
 }
 
 interface HuntedBusiness {
   businessName: string;
   ownerName: string;
+  ownerRole?: string;
   category: string;
   email: string;
   phone: string;
@@ -88,6 +417,14 @@ interface HuntedBusiness {
   instagram: string;
   facebook: string;
   linkedin: string;
+  cmsPlatform?: string;
+  techStack?: string[];
+  missingSignals?: string[];
+  emailType?: string;
+  executiveEmails?: string[];
+  buyerIntentScore?: number;
+  intentTier?: "hot" | "warm" | "cold";
+  intentReasons?: string[];
   softwareNeedScore: number;
   painPoint: string;
   estimatedValue: number;
@@ -95,11 +432,27 @@ interface HuntedBusiness {
   selected?: boolean;
   importing?: boolean;
   imported?: boolean;
+  enriching?: boolean;
+  analyzing?: boolean;
+  analysis?: WebsiteAnalysis;
+  reportId?: string;
+  reportUrl?: string;
   aiAgentType?: string;
   aiAgentScore?: number;
   aiAgentFitReason?: string;
   aiAgentTopPain?: string;
   pitchType?: string;
+  primaryOffer?: string;
+  generatedSiteId?: string;
+  generatedSiteUrl?: string;
+  generatedReviewUrl?: string;
+  generatingSite?: boolean;
+  generatingReview?: boolean;
+  generatingInlineEmail?: boolean;
+  sendingInlineEmail?: boolean;
+  inlineEmailSent?: boolean;
+  inlineOpen?: boolean;
+  generatedEmail?: { subject: string; body: string; emailVersions?: { version: string; subject: string; body: string }[]; selectedVersion?: string };
 }
 
 interface WebsiteAnalysis {
@@ -256,38 +609,20 @@ const PROVIDER_CONFIGS: Record<string, { label: string; icon: string; colorClass
 const INITIAL_PROSPECTS: Prospect[] = [];
 
 function getToken(): string {
-  const existing = localStorage.getItem("ds_api_token");
-  if (existing) return existing;
-  localStorage.setItem("ds_api_token", "admin123");
-  return "admin123";
+  return getSaasToken();
 }
 
 function loadProspects(): Prospect[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return INITIAL_PROSPECTS;
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return INITIAL_PROSPECTS;
-    const cleaned = parsed.filter(
-      (p: any) =>
-        p &&
-        !String(p.email || "").includes("example.com") &&
-        !String(p.website || "").includes("example.com")
-    );
-    if (cleaned.length !== parsed.length) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(cleaned));
-    }
-    return cleaned;
-  } catch {
-    return INITIAL_PROSPECTS;
-  }
+  return loadUserProspects<Prospect>();
 }
 
 function saveProspects(data: Prospect[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  saveUserProspects(data);
+  const tok = getToken();
+  if (!tok) return;
   fetch(`${apiBase()}/api/crm/prospects/sync`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${getToken()}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
     body: JSON.stringify({ prospects: data }),
   }).catch(() => {});
 }
@@ -297,7 +632,7 @@ function apiBase() {
 }
 
 function handleAuthFailure() {
-  localStorage.setItem("ds_api_token", "admin123");
+  // Do not overwrite user token with admin token
 }
 
 async function authFetch(path: string, init: RequestInit = {}) {
@@ -791,6 +1126,16 @@ function EmailSettingsPanel() {
 
       {showAddDialog && <AccountDialog onSave={onSave} onClose={() => setShowAddDialog(false)} />}
       {editingAccount && <AccountDialog account={editingAccount} onSave={onSave} onClose={() => setEditingAccount(undefined)} />}
+
+      {/* Interactive Step-by-Step App Password & Multi-SMTP Setup Guide + Bulk Multi-Gmail Pool Manager */}
+      <div className="pt-4 border-t border-border/40 space-y-6">
+        <SmtpAppPasswordGuide defaultProvider="gmail" />
+        <MultiSmtpManagerPanel
+          mode="user"
+          title="Advanced Multi-Gmail & Multi-SMTP Pool Manager (Bulk Add & Rotation)"
+          subtitle="Paste multiple Gmail App Passwords at once or add unlimited SMTP relays for automatic round-robin outreach & message delivery."
+        />
+      </div>
     </div>
   );
 }
@@ -807,34 +1152,47 @@ function AIHunterPanel({
   // `categories` supports selecting one or many business types at once.
   // Kept as an array from the start (default: a single category) so every
   // existing single-category flow below keeps working unchanged.
-  const [categories, setCategories] = useState<string[]>(() => {
+  const initialQuickHuntRef = useRef<{
+    category?: string;
+    city?: string;
+    country?: string;
+    count?: string;
+    extraContext?: string;
+    autoRun?: boolean;
+  } | null>(null);
+
+  if (initialQuickHuntRef.current === null) {
     try {
-      const q = JSON.parse(localStorage.getItem("vh_quick_hunt") || "null");
-      if (q?.category) return [q.category];
-    } catch {}
+      const parsed = JSON.parse(localStorage.getItem("vh_quick_hunt") || "null");
+      if (parsed && typeof parsed === "object") {
+        initialQuickHuntRef.current = parsed;
+        localStorage.removeItem("vh_quick_hunt");
+      } else {
+        initialQuickHuntRef.current = {};
+      }
+    } catch {
+      initialQuickHuntRef.current = {};
+    }
+  }
+
+  const [categories, setCategories] = useState<string[]>(() => {
+    if (initialQuickHuntRef.current?.category) return [initialQuickHuntRef.current.category];
     if (activeProject?.targetCategory) return [activeProject.targetCategory];
     return ["Restaurant"];
   });
   const [categorySearch, setCategorySearch] = useState("");
   const [city, setCity] = useState(() => {
-    try {
-      const q = JSON.parse(localStorage.getItem("vh_quick_hunt") || "null");
-      if (q?.city) return q.city;
-    } catch {}
+    if (initialQuickHuntRef.current?.city) return initialQuickHuntRef.current.city;
     return activeProject?.targetCity || "";
   });
   const [country, setCountry] = useState(() => {
-    try {
-      const q = JSON.parse(localStorage.getItem("vh_quick_hunt") || "null");
-      if (q?.country) {
-        localStorage.removeItem("vh_quick_hunt");
-        return q.country;
-      }
-    } catch {}
+    if (initialQuickHuntRef.current?.country) return initialQuickHuntRef.current.country;
     return activeProject?.targetCountry || "";
   });
-  const [count, setCount] = useState("50");
-  const [extraContext, setExtraContext] = useState(() => activeProject?.extraContext || "");
+  const [count, setCount] = useState(() => initialQuickHuntRef.current?.count || "50");
+  const [extraContext, setExtraContext] = useState(
+    () => initialQuickHuntRef.current?.extraContext || activeProject?.extraContext || ""
+  );
   const [autoGenerate, setAutoGenerate] = useState(true);
   const [hunting, setHunting] = useState(false);
   const [results, setResults] = useState<HuntedBusiness[]>(() =>
@@ -845,10 +1203,449 @@ function AIHunterPanel({
   const [selectAll, setSelectAll] = useState(true);
   const [bulkMode, setBulkMode] = useState(false);
   const [bulkCities, setBulkCities] = useState("");
+  const apolloCfg = useApolloConfig();
+  const trainedOffer = useTrainedOfferSummary();
+  const [apolloFilter, setApolloFilter] = useState<string>("all");
+  const [preSearchFilters, setPreSearchFilters] = useState<string[]>(["all"]);
+  const [preFilterDropdownOpen, setPreFilterDropdownOpen] = useState<boolean>(false);
+  const preFilterDropdownRef = useRef<HTMLDivElement | null>(null);
+  const [hunterSearchQuery, setHunterSearchQuery] = useState<string>("");
+  const [autoPilotChain, setAutoPilotChain] = useState<boolean>(false);
+  const [syncingToAutomation, setSyncingToAutomation] = useState<boolean>(false);
+  const [automationSyncNotice, setAutomationSyncNotice] = useState<string>("");
+  const [bulkEnriching, setBulkEnriching] = useState(false);
+  const [bulkAnalyzing, setBulkAnalyzing] = useState(false);
+  const [huntBatchProgress, setHuntBatchProgress] = useState<{ completed: number; total: number }>({
+    completed: 0,
+    total: 1,
+  });
+  const [enrichBatchProgress, setEnrichBatchProgress] = useState<{
+    current: number;
+    total: number;
+    label: string;
+  } | null>(null);
+  const [importBatchProgress, setImportBatchProgress] = useState<{
+    current: number;
+    total: number;
+    label: string;
+  } | null>(null);
+  const prevProjectIdRef = useRef<string | undefined>(activeProject?.id);
+
+  const preFilterOptions = [
+    { id: "all", label: "All Businesses" },
+    { id: "no_website", label: "No Website" },
+    { id: "bad_website", label: "Bad / Outdated Website" },
+    { id: "decision_maker", label: "Decision Maker" },
+    { id: "verified_email", label: "Verified Email" },
+    { id: "no_reviews", label: "Needs Review Service" },
+    { id: "no_booking_chat", label: "No Booking / Live Chat" },
+    { id: "hot_intent", label: "High Need (Score 7+)" },
+  ];
+
+  const togglePreSearchFilter = (id: string) => {
+    if (id === "all") {
+      setPreSearchFilters(["all"]);
+      return;
+    }
+    setPreSearchFilters((prev) => {
+      const withoutAll = prev.filter((x) => x !== "all");
+      const exists = withoutAll.includes(id);
+      const next = exists ? withoutAll.filter((x) => x !== id) : [...withoutAll, id];
+      return next.length === 0 ? ["all"] : next;
+    });
+  };
+
+  const matchesPreSearchFilter = (b: HuntedBusiness): boolean => {
+    const active = preSearchFilters.filter((f) => f && f !== "all");
+    if (active.length === 0) return true;
+
+    const rawWeb = (b.website || "").trim();
+    const hasNoWebsite =
+      !rawWeb || /^(none|n\/a|no website|-)$/i.test(rawWeb) || b.cmsPlatform === "No Website";
+    const cms = (b.cmsPlatform || "").toLowerCase();
+    const missing = (b.missingSignals || []).join(" ").toLowerCase();
+    const tech = (b.techStack || []).join(" ").toLowerCase();
+    const pain = (b.painPoint || "").toLowerCase();
+
+    const hasBadWebsite =
+      !hasNoWebsite &&
+      ((b.softwareNeedScore ?? 0) >= 4 ||
+        (b.analysis && b.analysis.websiteScore < 72) ||
+        /wix|squarespace|godaddy|weebly|wordpress|custom html|unreachable|parked/i.test(cms) ||
+        (Array.isArray(b.missingSignals) && b.missingSignals.length > 0) ||
+        /outdated|slow|no online booking|no contact form|unreachable|prime candidate|opportunity/i.test(pain));
+
+    const hasDecisionMaker = Boolean(
+      (b.ownerName && b.ownerName.trim()) ||
+        (b.linkedin && b.linkedin.trim()) ||
+        (Array.isArray(b.executiveEmails) && b.executiveEmails.length > 0) ||
+        b.emailType === "direct_executive"
+    );
+    const hasVerifiedEmail = Boolean(b.email && b.email.includes("@"));
+    const needsReview =
+      hasNoWebsite || /review/i.test(missing) || !/customer reviews/i.test(tech);
+    const missingBookingOrChat = hasNoWebsite || /booking|chat|receptionist/i.test(missing);
+    const isHotIntent =
+      (b.softwareNeedScore ?? 0) >= 6 || (b.buyerIntentScore ?? 0) >= 65;
+
+    return active.some((f) => {
+      if (f === "no_website") return hasNoWebsite;
+      if (f === "bad_website") return hasBadWebsite;
+      if (f === "decision_maker") return hasDecisionMaker;
+      if (f === "verified_email") return hasVerifiedEmail;
+      if (f === "no_reviews") return needsReview;
+      if (f === "no_booking_chat") return missingBookingOrChat;
+      if (f === "hot_intent") return isHotIntent;
+      return true;
+    });
+  };
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        preFilterDropdownRef.current &&
+        !preFilterDropdownRef.current.contains(e.target as Node)
+      ) {
+        setPreFilterDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const buildHuntedFallbackAnalysis = (b: HuntedBusiness): WebsiteAnalysis => {
+    const hasWeb = Boolean(b.website && !/^(none|n\/a|no website|-)$/i.test(b.website.trim()));
+    const cat = b.category || "local service";
+    const cityStr = b.city || "your area";
+    const preRes = resolveAuditMatchedOffer({ ...b, analysis: undefined }, trainedOffer);
+    const needsWeb = preRes.needsWebsite;
+    const needsRev = preRes.needsReview;
+    const matchedOffer = preRes.primaryOffer || trainedOffer.primaryOfferName || "Website Creation & Review Service";
+    return {
+      matchedOffer,
+      websiteScore: !hasWeb ? 14 : needsWeb ? 46 : 66,
+      leadScore: needsWeb ? 50 : 68,
+      conversionScore: !hasWeb ? 12 : needsWeb ? 38 : 64,
+      mobileScore: !hasWeb ? 18 : needsWeb ? 52 : 70,
+      seoScore: !hasWeb ? 15 : needsWeb ? 44 : 64,
+      growthPotential: 92,
+      checks: {
+        responsiveDesign: hasWeb && !needsWeb,
+        sslCertificate: hasWeb,
+        modernUI: hasWeb && !needsWeb,
+        whatsappButton: false,
+        contactForm: hasWeb && !needsWeb,
+        bookingSystem: false,
+        onlineOrdering: false,
+        paymentIntegration: false,
+        customerPortal: false,
+        membershipArea: false,
+        blog: false,
+        seoBasics: hasWeb,
+        analytics: hasWeb && !needsWeb,
+        socialMedia: true,
+        emailCapture: false,
+        liveChat: false,
+        aiChatbot: false,
+        callToAction: hasWeb && !needsWeb,
+        trustElements: hasWeb && !needsRev,
+      },
+      issues: [
+        ...(needsWeb
+          ? [
+              {
+                title: hasWeb ? "High-Friction Mobile Lead Capture" : "No Dedicated Conversion Website",
+                description: hasWeb
+                  ? `Visitors searching for ${cat.toLowerCase()} in ${cityStr} lack a fast 4-tap quote or online booking flow.`
+                  : `Prospective customers searching for ${b.businessName} in ${cityStr} have no dedicated website to book or request quotes.`,
+                priority: "high",
+              },
+            ]
+          : []),
+        ...(needsRev
+          ? [
+              {
+                title: "Missing Automated 5-Star Review Funnel",
+                description: "Happy clients are not systematically guided to post 5-star Google reviews.",
+                priority: needsWeb ? "medium" : "high",
+              },
+            ]
+          : []),
+      ],
+      opportunities: [
+        {
+          title: `Deploy ${matchedOffer}`,
+          impact: "+25–40% increase in mobile customer inquiries",
+          effort: "low",
+        },
+      ],
+      recommendedFeatures: [matchedOffer, "24/7 Spoken AI Receptionist & Booking"],
+      projectType: "Medium Web App",
+      estimatedValue: { min: 1500, max: 3500 },
+      deliveryWeeks: { min: 1, max: 2 },
+      summary: `${b.businessName} in ${cityStr} shows strong local demand, and our audit indicates ${matchedOffer} is the top priority to convert more visitors into booked clients.`,
+    };
+  };
+
+  const analyzeSingleHunted = async (idx: number, sourceList?: HuntedBusiness[]) => {
+    const list = sourceList || results;
+    const target = list[idx];
+    if (!target) return;
+    setResults(prev => prev.map((r, i) => i === idx ? { ...r, analyzing: true } : r));
+    try {
+      const data = await callCRM("analyze-website", {
+        website: target.website,
+        businessName: target.businessName,
+        category: target.category,
+        city: target.city,
+        painPoint: target.painPoint,
+        cmsPlatform: target.cmsPlatform,
+        missingSignals: target.missingSignals,
+      });
+      const fb = buildHuntedFallbackAnalysis(target);
+      const mergedAnalysis: WebsiteAnalysis = {
+        ...fb,
+        ...data,
+        checks: { ...fb.checks, ...(data?.checks || {}) },
+        issues: Array.isArray(data?.issues) && data.issues.length > 0 ? data.issues : fb.issues,
+        opportunities: Array.isArray(data?.opportunities) && data.opportunities.length > 0 ? data.opportunities : fb.opportunities,
+        recommendedFeatures: Array.isArray(data?.recommendedFeatures) && data.recommendedFeatures.length > 0 ? data.recommendedFeatures : fb.recommendedFeatures,
+        estimatedValue: data?.estimatedValue?.min ? data.estimatedValue : fb.estimatedValue,
+        deliveryWeeks: data?.deliveryWeeks?.min ? data.deliveryWeeks : fb.deliveryWeeks,
+      };
+      const resolved = resolveAuditMatchedOffer({ ...target, analysis: mergedAnalysis }, trainedOffer);
+      setResults(prev => prev.map((r, i) => i === idx ? {
+        ...r,
+        analyzing: false,
+        analysis: mergedAnalysis,
+        primaryOffer: resolved.primaryOffer || mergedAnalysis.matchedOffer || r.primaryOffer,
+        reportId: data?.reportId || r.reportId,
+        reportUrl: data?.reportUrl || r.reportUrl,
+      } : r));
+    } catch {
+      const fb = buildHuntedFallbackAnalysis(target);
+      const resolved = resolveAuditMatchedOffer({ ...target, analysis: fb }, trainedOffer);
+      setResults(prev => prev.map((r, i) => i === idx ? {
+        ...r,
+        analyzing: false,
+        analysis: fb,
+        primaryOffer: resolved.primaryOffer || fb.matchedOffer || r.primaryOffer,
+      } : r));
+    }
+  };
+
+  const analyzeAllVisibleHunted = async (customList?: HuntedBusiness[]) => {
+    const activeList = customList || results;
+    if (activeList.length === 0) return;
+    setBulkAnalyzing(true);
+    const total = activeList.length;
+    const CONCURRENCY = 4;
+    for (let i = 0; i < total; i += CONCURRENCY) {
+      const batchIndices = Array.from({ length: Math.min(CONCURRENCY, total - i) }, (_, k) => i + k);
+      const firstLabel = activeList[batchIndices[0]]?.businessName || "Lead";
+      setEnrichBatchProgress({
+        current: Math.min(total, i + batchIndices.length),
+        total,
+        label: `Auditing ${firstLabel}`,
+      });
+      await Promise.all(batchIndices.map(idx => analyzeSingleHunted(idx, activeList)));
+    }
+    setBulkAnalyzing(false);
+    setEnrichBatchProgress(null);
+    setProgress(`✓ Auto-Analyzer completed website & offer audits for ${total} leads`);
+  };
+
+  const enrichSingleHunted = async (idx: number) => {
+    const target = results[idx];
+    if (!target || !target.website) return;
+    setResults(prev => prev.map((r, i) => i === idx ? { ...r, enriching: true } : r));
+    try {
+      const data = await callCRM("apollo-enrich", {
+        website: target.website,
+        businessName: target.businessName,
+        category: target.category,
+        email: target.email,
+        phone: target.phone,
+      });
+      setResults(prev => prev.map((r, i) => i === idx ? {
+        ...r,
+        enriching: false,
+        ownerName: data.ownerName || r.ownerName,
+        ownerRole: data.ownerRole || r.ownerRole,
+        linkedin: data.linkedin || r.linkedin,
+        facebook: data.facebook || r.facebook,
+        instagram: data.instagram || r.instagram,
+        cmsPlatform: data.cmsPlatform || r.cmsPlatform,
+        techStack: Array.isArray(data.techStack) ? data.techStack : r.techStack,
+        missingSignals: Array.isArray(data.missingSignals) ? data.missingSignals : r.missingSignals,
+        buyerIntentScore: data.buyerIntentScore ?? r.buyerIntentScore,
+        intentTier: data.intentTier || r.intentTier,
+        intentReasons: Array.isArray(data.intentReasons) ? data.intentReasons : r.intentReasons,
+      } : r));
+    } catch {
+      setResults(prev => prev.map((r, i) => i === idx ? { ...r, enriching: false } : r));
+    }
+  };
+
+  const generateInlineEmailForHunted = async (
+    idx: number,
+    overrides?: { websiteUrl?: string; reviewUrl?: string }
+  ) => {
+    const b = results[idx];
+    if (!b) return;
+    const leadOfferRes = resolveAuditMatchedOffer(b, trainedOffer);
+    const effectiveLeadOffer = leadOfferRes.primaryOffer || b.primaryOffer || trainedOffer.primaryOfferName;
+    const demoWebsiteUrl = overrides?.websiteUrl ?? b.generatedSiteUrl ?? "";
+    const reviewServiceUrl = overrides?.reviewUrl ?? b.generatedReviewUrl ?? "";
+    setResults(prev => prev.map((r, i) => i === idx ? { ...r, generatingInlineEmail: true, inlineOpen: true } : r));
+    try {
+      const data = await callCRM("generate-email", {
+        businessName: b.businessName,
+        ownerName: b.ownerName,
+        ownerRole: b.ownerRole,
+        category: b.category,
+        website: b.website,
+        city: b.city,
+        cmsPlatform: b.cmsPlatform,
+        missingSignals: b.missingSignals,
+        issues: b.painPoint || "",
+        opportunities: trainedOffer.offerDetails,
+        agencyName: AGENCY_NAME,
+        primaryOffer: effectiveLeadOffer,
+        demoWebsiteUrl,
+        reviewServiceUrl,
+      });
+      const versions = Array.isArray(data?.versions) && data.versions.length > 0 ? data.versions : [];
+      const first = versions[0] || {
+        version: "A",
+        subject: data?.subject || `Quick idea for ${b.businessName} — ${effectiveLeadOffer}`,
+        body: data?.body || `Hi ${b.ownerName || `${b.businessName} Team`},\n\nI was looking at ${b.businessName}${b.city ? ` in ${b.city}` : ""} today and noticed an opportunity around ${effectiveLeadOffer} to help you capture more local clients.${demoWebsiteUrl ? `\n\n• Live Website Preview: ${demoWebsiteUrl}` : ""}${reviewServiceUrl ? `\n• 5-Star Review Page: ${reviewServiceUrl}` : ""}\n\nWould you be open to taking a quick look?\n\nBest regards,\n${AGENCY_NAME}`,
+      };
+      setResults(prev => prev.map((r, i) => i === idx ? {
+        ...r,
+        generatingInlineEmail: false,
+        inlineOpen: true,
+        generatedEmail: {
+          subject: first.subject,
+          body: first.body,
+          emailVersions: versions.length > 0 ? versions : [first],
+          selectedVersion: first.version || "A",
+        },
+      } : r));
+    } catch {
+      const fallbackBody = `Hi ${b.ownerName || `${b.businessName} Team`},\n\nI was looking at ${b.businessName}${b.city ? ` in ${b.city}` : ""} today and put together a tailored ${effectiveLeadOffer} breakdown to help turn more local searches into booked clients.${demoWebsiteUrl ? `\n\n• Live Website Preview: ${demoWebsiteUrl}` : ""}${reviewServiceUrl ? `\n• 5-Star Review Page: ${reviewServiceUrl}` : ""}\n\nWould you be open to a quick walkthrough this week?\n\nBest regards,\n${AGENCY_NAME}`;
+      setResults(prev => prev.map((r, i) => i === idx ? {
+        ...r,
+        generatingInlineEmail: false,
+        inlineOpen: true,
+        generatedEmail: {
+          subject: `Quick idea for ${b.businessName} — ${effectiveLeadOffer}`,
+          body: fallbackBody,
+        },
+      } : r));
+    }
+  };
+
+  const generateInlineWebsiteOrReviewForHunted = async (idx: number, mode: "website" | "review") => {
+    const b = results[idx];
+    if (!b) return;
+    setError("");
+    setResults(prev => prev.map((r, i) => i === idx ? {
+      ...r,
+      generatingSite: mode === "website" ? true : r.generatingSite,
+      generatingReview: mode === "review" ? true : r.generatingReview,
+      inlineOpen: true,
+    } : r));
+    try {
+      let siteId = b.generatedSiteId;
+      let websiteUrl = b.generatedSiteUrl;
+      let reviewUrl = b.generatedReviewUrl;
+      const isForceRegenerate =
+        (mode === "website" && Boolean(b.generatedSiteUrl)) ||
+        (mode === "review" && Boolean(b.generatedReviewUrl));
+      const hasValidSlug = Boolean(siteId && !/^\d+$/.test(String(siteId)));
+      if (!hasValidSlug || isForceRegenerate) {
+        const assets = await generateInlineLeadAssets(b);
+        siteId = assets.siteId;
+        websiteUrl = assets.websiteUrl;
+        reviewUrl = assets.reviewUrl;
+      } else {
+        const origin = window.location.origin;
+        websiteUrl = `${origin}/site/${siteId}`;
+        reviewUrl = `${origin}/review/${siteId}`;
+      }
+      setResults(prev => prev.map((r, i) => i === idx ? {
+        ...r,
+        generatingSite: false,
+        generatingReview: false,
+        generatedSiteId: siteId,
+        generatedSiteUrl: mode === "website" ? websiteUrl : (r.generatedSiteUrl || websiteUrl),
+        generatedReviewUrl: mode === "review" ? reviewUrl : (r.generatedReviewUrl || reviewUrl),
+      } : r));
+      await generateInlineEmailForHunted(idx, {
+        websiteUrl: mode === "website" ? websiteUrl : b.generatedSiteUrl,
+        reviewUrl: mode === "review" ? reviewUrl : b.generatedReviewUrl,
+      });
+    } catch (e: any) {
+      setError(e?.message || "Could not generate preview link");
+      setResults(prev => prev.map((r, i) => i === idx ? { ...r, generatingSite: false, generatingReview: false } : r));
+    }
+  };
+
+  const sendInlineEmailForHunted = async (idx: number) => {
+    const b = results[idx];
+    if (!b || !b.email || !b.generatedEmail) return;
+    setResults(prev => prev.map((r, i) => i === idx ? { ...r, sendingInlineEmail: true } : r));
+    try {
+      await callCRM("send-email", {
+        to: b.email,
+        subject: b.generatedEmail.subject,
+        body: b.generatedEmail.body,
+        prospectName: b.businessName,
+      });
+      setResults(prev => prev.map((r, i) => i === idx ? { ...r, sendingInlineEmail: false, inlineEmailSent: true } : r));
+    } catch (e: any) {
+      setError(e?.message || "Failed to send email");
+      setResults(prev => prev.map((r, i) => i === idx ? { ...r, sendingInlineEmail: false } : r));
+    }
+  };
+
+  const enrichAllVisibleWebsites = async () => {
+    const indices = results
+      .map((r, idx) => (r.website ? idx : -1))
+      .filter(idx => idx !== -1);
+    if (indices.length === 0) return;
+    setBulkEnriching(true);
+    setEnrichBatchProgress({
+      current: 1,
+      total: indices.length,
+      label: results[indices[0]]?.businessName || "Website",
+    });
+    setProgress(`⚡ Running live website deep scan across ${indices.length} domains…`);
+    const CONCURRENCY = 5;
+    for (let i = 0; i < indices.length; i += CONCURRENCY) {
+      const batch = indices.slice(i, i + CONCURRENCY);
+      const firstInBatch = results[batch[0]]?.businessName || "";
+      setEnrichBatchProgress({
+        current: Math.min(indices.length, i + batch.length),
+        total: indices.length,
+        label: firstInBatch,
+      });
+      await Promise.all(batch.map(idx => enrichSingleHunted(idx)));
+    }
+    setBulkEnriching(false);
+    setEnrichBatchProgress(null);
+    setProgress(`✓ Live Deep Scan completed for ${indices.length} websites`);
+  };
 
   // Sync AI Hunter state when user switches from one Project to another
   useEffect(() => {
     if (!activeProject?.id) return;
+    const isInitialMountWithQuickHunt =
+      prevProjectIdRef.current === activeProject.id &&
+      Boolean(initialQuickHuntRef.current?.category || initialQuickHuntRef.current?.city);
+    prevProjectIdRef.current = activeProject.id;
+
     const savedProjectResults = loadProjectHuntedResults<HuntedBusiness>(activeProject.id);
     setResults(savedProjectResults);
     setProgress(
@@ -857,17 +1654,19 @@ function AIHunterPanel({
         : ""
     );
     setError("");
-    if (activeProject.targetCategory) {
-      setCategories([activeProject.targetCategory]);
-    }
-    if (activeProject.targetCity) {
-      setCity(activeProject.targetCity);
-    }
-    if (activeProject.targetCountry) {
-      setCountry(activeProject.targetCountry);
-    }
-    if (activeProject.extraContext) {
-      setExtraContext(activeProject.extraContext);
+    if (!isInitialMountWithQuickHunt) {
+      if (activeProject.targetCategory) {
+        setCategories([activeProject.targetCategory]);
+      }
+      if (activeProject.targetCity) {
+        setCity(activeProject.targetCity);
+      }
+      if (activeProject.targetCountry) {
+        setCountry(activeProject.targetCountry);
+      }
+      if (activeProject.extraContext) {
+        setExtraContext(activeProject.extraContext);
+      }
     }
   }, [activeProject?.id]);
 
@@ -878,9 +1677,20 @@ function AIHunterPanel({
     }
   }, [results, activeProject?.id]);
 
+  const currentSaasUser = getCachedSaasUser();
+  const isOwnerOrAdmin = isUserAdmin(currentSaasUser);
+  const currentPlanId = isOwnerOrAdmin ? "enterprise" : (currentSaasUser?.planId || "free");
+  const isFreeTierUser = !isOwnerOrAdmin && currentPlanId === "free";
+  const isBulkOrAutopilotLocked = !isOwnerOrAdmin && (currentPlanId === "free" || currentPlanId === "starter");
+
   const hunt = async () => {
     if (categories.length === 0) { setError("Select at least one business category."); return; }
+    if (bulkMode && isBulkOrAutopilotLocked) {
+      setError("🔒 20-City Bulk Hunter is locked on the Free Explorer & Starter plans. Please upgrade to Growth or higher in Dashboard → Plans & Billing.");
+      return;
+    }
     const catLabel = categories.length > 1 ? `${categories.length} categories` : categories[0];
+    const effectiveCount = isFreeTierUser ? Math.min(25, Number(count) || 25) : Number(count);
 
     // Dedup helper shared by both modes below — a business can legitimately
     // show up under more than one category search, so we merge by name+city.
@@ -890,6 +1700,7 @@ function AIHunterPanel({
       const cityList = bulkCities.split(/[\n,]+/).map(c => c.trim()).filter(Boolean);
       if (cityList.length === 0) { setError("Enter at least one city in the list."); return; }
       setHunting(true); setError(""); setResults([]);
+      setHuntBatchProgress({ completed: 0, total: categories.length });
       setProgress(`🌍 Bulk hunting ${catLabel} across ${cityList.length} cities — this takes a few minutes…`);
       try {
         const seen = new Set<string>();
@@ -898,13 +1709,17 @@ function AIHunterPanel({
         const cityResultsAgg: Record<string, number> = {};
         // One bulk-hunt call per selected category — each call already covers
         // every city in cityList server-side, then we merge + dedupe here.
-        for (const cat of categories) {
+        for (let cIdx = 0; cIdx < categories.length; cIdx++) {
+          const cat = categories[cIdx];
+          setHuntBatchProgress({ completed: cIdx, total: categories.length });
+          setProgress(`🌍 Bulk hunting "${cat}" across ${cityList.length} cities (${cIdx + 1} of ${categories.length})…`);
           const resp = await callCRM("bulk-hunt", {
             category: cat,
             cities: cityList,
             country: country.trim(),
-            countPerCity: Number(count),
+            countPerCity: effectiveCount,
             extraContext,
+            preFilters: preSearchFilters,
           });
           const businesses: HuntedBusiness[] = Array.isArray(resp) ? resp : (resp.prospects ?? []);
           totalFiltered += resp.filtered ?? 0;
@@ -912,13 +1727,24 @@ function AIHunterPanel({
             const key = dedupKey(b);
             if (seen.has(key)) continue;
             seen.add(key);
-            merged.push({ ...b, selected: true, imported: false, importing: false });
+            const initialAnalysis = b.analysis || buildHuntedFallbackAnalysis(b);
+            const resolvedOffer = resolveAuditMatchedOffer({ ...b, analysis: initialAnalysis }, trainedOffer);
+            merged.push({
+              ...b,
+              analysis: initialAnalysis,
+              primaryOffer: b.primaryOffer || resolvedOffer.primaryOffer || initialAnalysis.matchedOffer,
+              selected: true,
+              imported: false,
+              importing: false,
+            });
           }
           if (resp.cityResults) {
             for (const [c, n] of Object.entries(resp.cityResults as Record<string, number>)) {
               cityResultsAgg[c] = (cityResultsAgg[c] ?? 0) + Number(n);
             }
           }
+          setResults([...merged]);
+          setHuntBatchProgress({ completed: cIdx + 1, total: categories.length });
         }
         merged.sort((a, b) => (b.softwareNeedScore ?? 0) - (a.softwareNeedScore ?? 0));
         setResults(merged);
@@ -929,14 +1755,24 @@ function AIHunterPanel({
       } finally { setHunting(false); }
     } else {
       if (!city.trim()) { setError("Please enter a city to hunt in."); return; }
-      setHunting(true); setError(""); setResults([]); setProgress(`🔍 AI is scanning for ${catLabel} businesses…`);
+      setHunting(true); setError(""); setResults([]);
+      setHuntBatchProgress({ completed: 0, total: categories.length });
+      setProgress(`🔍 AI is scanning for ${catLabel} businesses in ${city}…`);
       try {
         const seen = new Set<string>();
         const merged: HuntedBusiness[] = [];
         let totalFiltered = 0;
-        for (const cat of categories) {
+        for (let cIdx = 0; cIdx < categories.length; cIdx++) {
+          const cat = categories[cIdx];
+          setHuntBatchProgress({ completed: cIdx, total: categories.length });
+          setProgress(`🔍 Scanning ${cat} businesses in ${city} (${cIdx + 1} of ${categories.length})…`);
           const resp = await callCRM("hunt-businesses", {
-            category: cat, city: city.trim(), country: country.trim(), count: Number(count), extraContext,
+            category: cat,
+            city: city.trim(),
+            country: country.trim(),
+            count: effectiveCount,
+            extraContext,
+            preFilters: preSearchFilters,
           });
           const businesses: HuntedBusiness[] = Array.isArray(resp) ? resp : (resp.prospects ?? []);
           totalFiltered += resp.filtered ?? 0;
@@ -944,17 +1780,89 @@ function AIHunterPanel({
             const key = dedupKey(b);
             if (seen.has(key)) continue;
             seen.add(key);
-            merged.push({ ...b, selected: true, imported: false, importing: false });
+            const initialAnalysis = b.analysis || buildHuntedFallbackAnalysis(b);
+            const resolvedOffer = resolveAuditMatchedOffer({ ...b, analysis: initialAnalysis }, trainedOffer);
+            merged.push({
+              ...b,
+              analysis: initialAnalysis,
+              primaryOffer: b.primaryOffer || resolvedOffer.primaryOffer || initialAnalysis.matchedOffer,
+              selected: true,
+              imported: false,
+              importing: false,
+            });
           }
+          setResults([...merged]);
+          setHuntBatchProgress({ completed: cIdx + 1, total: categories.length });
         }
-        setResults(merged);
+        let finalHunted = merged;
+        if (autoPilotChain && merged.length > 0) {
+          // In Auto-Pilot Chain mode, automatically prioritize high-need leads (score >= 6 or verified email)
+          finalHunted = merged.map(b => ({
+            ...b,
+            selected: (b.softwareNeedScore ?? 0) >= 6 || Boolean(b.email),
+          }));
+          setResults(finalHunted);
+        } else {
+          setResults(finalHunted);
+        }
         const filterNote = totalFiltered > 0 ? ` (${totalFiltered} with dead domains removed)` : "";
-        setProgress(`✓ Found ${merged.length} ${catLabel} businesses in ${city}${filterNote}`);
+        setProgress(`✓ Found ${merged.length} ${catLabel} businesses in ${city}${filterNote}${isFreeTierUser ? " (Free Explorer cap: 25 leads/scan)" : ""}`);
       } catch (e: any) {
         setError(e.message); setProgress("");
       } finally { setHunting(false); }
     }
   };
+
+  // Sync current Hunter target settings directly to the 24/7 Autonomous Scheduler
+  const syncCampaignToAutomation = async () => {
+    if (isBulkOrAutopilotLocked) {
+      setError("🔒 24/7 Autonomous Autopilot is locked on the Free Explorer & Starter plans. Upgrade to Growth or higher in Billing to unlock 24/7 execution.");
+      return;
+    }
+    const targetCities = bulkMode
+      ? bulkCities
+          .split(/[\n,]+/)
+          .map(c => c.trim())
+          .filter(Boolean)
+          .join(", ")
+      : city.trim();
+    if (!targetCities) {
+      setError("Enter a city or bulk city list first to sync with 24/7 Automation.");
+      return;
+    }
+    setSyncingToAutomation(true);
+    setAutomationSyncNotice("");
+    try {
+      const r = await fetch(`${apiBase()}/api/automation/settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          huntCategory: categories.join(", ") || "Dentist",
+          huntCity: targetCities,
+          huntCountry: country.trim(),
+          huntCount: Math.min(100, Math.max(10, Number(count) || 50)),
+          huntExtraContext: extraContext.trim(),
+          autoScore: true,
+          autoEmail: true,
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      setAutomationSyncNotice(
+        `✓ Synced ${categories.join(", ")} in ${targetCities} to 24/7 Automation Queue! Open the Automation tab to toggle 24/7 mode.`
+      );
+    } catch (e: any) {
+      setError(e.message || "Failed to sync campaign to automation");
+    } finally {
+      setSyncingToAutomation(false);
+    }
+  };
+
+  useEffect(() => {
+    if (initialQuickHuntRef.current?.autoRun && city.trim()) {
+      initialQuickHuntRef.current.autoRun = false;
+      hunt();
+    }
+  }, []);
 
   const toggleSelect = (i: number) => setResults(prev => prev.map((b, idx) => idx === i ? { ...b, selected: !b.selected } : b));
 
@@ -969,16 +1877,24 @@ function AIHunterPanel({
     if (selected.length === 0) return;
 
     const toImport: Omit<Prospect, "id" | "addedAt">[] = [];
+    let processedCount = 0;
 
     for (let i = 0; i < results.length; i++) {
       const b = results[i];
       if (!b.selected || b.imported) continue;
 
+      processedCount++;
+      setImportBatchProgress({
+        current: processedCount,
+        total: selected.length,
+        label: b.businessName,
+      });
       setResults(prev => prev.map((r, idx) => idx === i ? { ...r, importing: true } : r));
 
       let prospect: Omit<Prospect, "id" | "addedAt"> = {
         businessName: b.businessName,
         ownerName: b.ownerName,
+        ownerRole: b.ownerRole,
         category: b.category,
         website: b.website,
         email: b.email,
@@ -988,6 +1904,12 @@ function AIHunterPanel({
         facebook: b.facebook,
         instagram: b.instagram,
         linkedin: b.linkedin,
+        cmsPlatform: b.cmsPlatform,
+        techStack: b.techStack,
+        missingSignals: b.missingSignals,
+        buyerIntentScore: b.buyerIntentScore,
+        intentTier: b.intentTier,
+        intentReasons: b.intentReasons,
         status: "new",
         priority: b.softwareNeedScore >= 8 ? "high" : b.softwareNeedScore >= 5 ? "medium" : "low",
         expectedValue: b.estimatedValue,
@@ -996,6 +1918,14 @@ function AIHunterPanel({
         notes: b.painPoint || b.notes || "",
         hunted: true,
         painPoint: b.painPoint,
+        primaryOffer: b.primaryOffer || resolveAuditMatchedOffer(b, trainedOffer).primaryOffer || undefined,
+        analysis: b.analysis,
+        reportId: b.reportId,
+        reportUrl: b.reportUrl,
+        generatedSiteId: b.generatedSiteId,
+        generatedSiteUrl: b.generatedSiteUrl,
+        generatedReviewUrl: b.generatedReviewUrl,
+        generatedEmail: b.generatedEmail,
       };
 
       if (autoGenerate) {
@@ -1004,14 +1934,30 @@ function AIHunterPanel({
             businessName: b.businessName, category: b.category,
             website: b.website, city: b.city, country: b.country,
             ownerName: b.ownerName, painPoint: b.painPoint, agencyName: AGENCY_NAME,
+            cmsPlatform: b.cmsPlatform, missingSignals: b.missingSignals,
           });
-          if (generated.analysis) prospect.analysis = generated.analysis;
+          if (generated.analysis) {
+            prospect.analysis = generated.analysis;
+            const resolvedAfterAudit = resolveAuditMatchedOffer(
+              { ...b, analysis: generated.analysis },
+              trainedOffer
+            );
+            prospect.primaryOffer =
+              resolvedAfterAudit.primaryOffer ||
+              generated.matchedOffer ||
+              generated.analysis.matchedOffer ||
+              prospect.primaryOffer;
+          }
           if (generated.email) prospect.generatedEmail = generated.email;
           if (generated.whatsapp) prospect.generatedWhatsApp = generated.whatsapp;
           if (generated.linkedin) prospect.generatedLinkedIn = generated.linkedin;
           // Store report link so it can be injected when the email is sent
           if (generated.reportId) prospect.reportId = generated.reportId;
           if (generated.reportUrl) prospect.reportUrl = generated.reportUrl;
+          // Also auto-generate natural spoken AI voice pitch script on import
+          const firstOwner = b.ownerName ? b.ownerName.split(" ")[0] : "";
+          const topGap = (b.missingSignals && b.missingSignals[0]) ? b.missingSignals[0].toLowerCase() : (b.painPoint || "missing an automated 24/7 booking and AI receptionist system");
+          prospect.voicePitchScript = `Hey ${firstOwner || `there at ${b.businessName}`}, I was just looking at ${b.businessName}${b.city ? ` in ${b.city}` : ""}${b.cmsPlatform ? ` built on ${b.cmsPlatform}` : ""}, and noticed your site currently has ${topGap}—which usually causes 30 to 40 percent of after-hours customers to call a competitor instead. I just recorded a custom Website Audit Report showing how to fix this in 48 hours and sent the link to your email. Take a quick 60-second look!`;
           if (generated.analysis?.estimatedValue) {
             prospect.expectedValue = Math.round((generated.analysis.estimatedValue.min + generated.analysis.estimatedValue.max) / 2);
           }
@@ -1022,13 +1968,19 @@ function AIHunterPanel({
             prospect.aiAgentTopPain  = generated.aiAgent.topPain;
           }
           if (generated.pitchType) prospect.pitchType = generated.pitchType;
-        } catch { /* continue without AI data */ }
+        } catch {
+          const fbAnalysis = b.analysis || buildHuntedFallbackAnalysis(b);
+          prospect.analysis = fbAnalysis;
+          const resolvedAfterAudit = resolveAuditMatchedOffer({ ...b, analysis: fbAnalysis }, trainedOffer);
+          prospect.primaryOffer = resolvedAfterAudit.primaryOffer || fbAnalysis.matchedOffer || prospect.primaryOffer;
+        }
       }
 
       toImport.push(prospect);
       setResults(prev => prev.map((r, idx) => idx === i ? { ...r, importing: false, imported: true } : r));
     }
 
+    setImportBatchProgress(null);
     onImport(toImport);
   };
 
@@ -1062,8 +2014,8 @@ function AIHunterPanel({
       </div>
 
       {/* Hunt config */}
-      <div className="rounded-xl border border-border/50 overflow-hidden">
-        <div className="p-3 bg-muted/20 border-b border-border/50 flex items-center justify-between">
+      <div className="rounded-xl border border-border/50">
+        <div className="p-3 bg-muted/20 border-b border-border/50 rounded-t-xl flex items-center justify-between">
           <h3 className="font-bold text-sm flex items-center gap-2"><Filter className="w-4 h-4" /> Hunt Settings</h3>
         </div>
         <div className="p-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1116,6 +2068,75 @@ function AIHunterPanel({
               onChange={e => setCount(String(Math.max(10, Math.min(10000, Number(e.target.value) || 10))))}
               placeholder="e.g. 100"
             />
+          </div>
+
+          {/* Classic Before-Search Multi-Select Filter Dropdown */}
+          <div className="relative" ref={preFilterDropdownRef}>
+            <label className="text-xs font-semibold text-muted-foreground mb-1 block">
+              Before-Search Filter <span className="text-muted-foreground/70 font-normal">(multi-select)</span>
+            </label>
+            <button
+              type="button"
+              onClick={() => setPreFilterDropdownOpen((o) => !o)}
+              className="w-full h-9 px-3 py-1.5 text-left text-xs sm:text-sm bg-white border border-input rounded-md flex items-center justify-between gap-2 hover:bg-slate-50 transition-colors cursor-pointer"
+            >
+              <span className="truncate font-medium text-slate-800">
+                {preSearchFilters.includes("all")
+                  ? "All Businesses"
+                  : preFilterOptions
+                      .filter((o) => preSearchFilters.includes(o.id))
+                      .map((o) => o.label)
+                      .join(", ")}
+              </span>
+              <ChevronRight
+                className={`w-4 h-4 text-muted-foreground shrink-0 transition-transform ${
+                  preFilterDropdownOpen ? "rotate-90" : ""
+                }`}
+              />
+            </button>
+
+            {preFilterDropdownOpen && (
+              <div className="absolute z-50 mt-1 w-full bg-white border border-slate-200 rounded-lg shadow-lg py-1.5 max-h-64 overflow-y-auto">
+                <div className="px-3 py-1 border-b border-slate-100 flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
+                    Select Lead Criteria
+                  </span>
+                  {!preSearchFilters.includes("all") && (
+                    <button
+                      type="button"
+                      onClick={() => setPreSearchFilters(["all"])}
+                      className="text-[11px] font-semibold text-purple-600 hover:underline cursor-pointer"
+                    >
+                      Reset to All
+                    </button>
+                  )}
+                </div>
+                {preFilterOptions.map((opt) => {
+                  const checked = preSearchFilters.includes(opt.id);
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => togglePreSearchFilter(opt.id)}
+                      className="w-full px-3 py-2 text-left text-xs hover:bg-slate-50 flex items-center gap-2.5 cursor-pointer transition-colors"
+                    >
+                      <div
+                        className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 ${
+                          checked
+                            ? "bg-slate-900 border-slate-900 text-white"
+                            : "border-slate-300 bg-white"
+                        }`}
+                      >
+                        {checked && <Check className="w-2.5 h-2.5" />}
+                      </div>
+                      <span className={`font-medium ${checked ? "text-slate-900 font-semibold" : "text-slate-700"}`}>
+                        {opt.label}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Bulk Mode toggle */}
@@ -1175,18 +2196,97 @@ function AIHunterPanel({
             </div>
             <Switch checked={autoGenerate} onCheckedChange={setAutoGenerate} />
           </div>
+          <div className="sm:col-span-2 flex items-center justify-between gap-3 p-3 bg-emerald-50 border border-emerald-200 rounded-xl">
+            <div>
+              <div className="text-sm font-bold text-emerald-950 flex items-center gap-2">
+                <Zap className="w-4 h-4 text-emerald-600" /> Smart Auto-Qualification Filter (Score 6+ or Verified Email)
+              </div>
+              <div className="text-xs text-emerald-800 mt-0.5">
+                Automatically pre-selects only high-need prospects with verified contact signals after scraping so you never waste AI credits on low-fit leads
+              </div>
+            </div>
+            <Switch checked={autoPilotChain} onCheckedChange={setAutoPilotChain} />
+          </div>
         </div>
-        <div className="px-4 pb-4">
-          {error && <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3">{error}</div>}
-          <Button onClick={hunt} disabled={hunting || categories.length === 0 || (!bulkMode && !city.trim()) || (bulkMode && !bulkCities.trim())} className="w-full gap-2 btn-premium text-white font-bold h-11">
-            {hunting
-              ? <><RefreshCw className="w-4 h-4 animate-spin" /> {bulkMode ? "Bulk hunting across cities…" : "Hunting businesses…"}</>
-              : bulkMode
-              ? <><Globe className="w-4 h-4" /> Start Bulk Hunt ({bulkCities.split(/[\n,]+/).filter(c => c.trim()).length} cities × {categories.length || 1} categor{categories.length === 1 ? "y" : "ies"} × {count})</>
-              : <><Radar className="w-4 h-4" /> Start AI Hunt ({categories.length || 1} categor{categories.length === 1 ? "y" : "ies"})</>}
-          </Button>
+        <div className="px-4 pb-4 space-y-2.5">
+          {error && <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</div>}
+          {automationSyncNotice && (
+            <div className="text-xs font-semibold text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+              {automationSyncNotice}
+            </div>
+          )}
+          <div className="flex flex-col sm:flex-row gap-2">
+            <Button onClick={hunt} disabled={hunting || categories.length === 0 || (!bulkMode && !city.trim()) || (bulkMode && !bulkCities.trim())} className="flex-1 gap-2 btn-premium text-white font-bold h-11">
+              {hunting
+                ? <><RefreshCw className="w-4 h-4 animate-spin" /> {bulkMode ? "Bulk hunting across cities…" : "Hunting businesses…"}</>
+                : bulkMode
+                ? <><Globe className="w-4 h-4" /> Start Bulk Hunt ({bulkCities.split(/[\n,]+/).filter(c => c.trim()).length} cities × {categories.length || 1} categor{categories.length === 1 ? "y" : "ies"} × {count})</>
+                : <><Radar className="w-4 h-4" /> Start AI Hunt ({categories.length || 1} categor{categories.length === 1 ? "y" : "ies"})</>}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={syncingToAutomation}
+              onClick={syncCampaignToAutomation}
+              className="h-11 px-4 text-xs font-bold border-slate-300 text-slate-800 hover:bg-slate-100 gap-1.5 shrink-0"
+              title="Push these categories and cities into the 24/7 Autonomous Scheduler"
+            >
+              {syncingToAutomation ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Clock className="w-3.5 h-3.5 text-indigo-600" />}
+              <span>Push to 24/7 Automation Queue</span>
+            </Button>
+          </div>
         </div>
       </div>
+
+      {/* Live Visual Scraping Progress & Skeleton Rows while Hunting */}
+      {hunting && (
+        <LeadScrapingProgressSkeleton
+          categories={categories}
+          cityLabel={
+            bulkMode
+              ? `${bulkCities.split(/[\n,]+/).filter(c => c.trim()).length} cities`
+              : city || "Target City"
+          }
+          targetCount={
+            bulkMode
+              ? bulkCities.split(/[\n,]+/).filter(c => c.trim()).length * Number(count)
+              : count
+          }
+          bulkMode={bulkMode}
+          completedSteps={huntBatchProgress.completed}
+          totalSteps={huntBatchProgress.total}
+          statusText={progress}
+        />
+      )}
+
+      {/* Batch Deep-Scan or Auto-Report Generation Progress Banner */}
+      {enrichBatchProgress && (
+        <BatchOperationProgressBanner
+          title="Live Website & Tech-Stack Deep Scan"
+          subtitle="Extracting CMS platform, conversion pixels, live chat signals, and decision-makers"
+          current={enrichBatchProgress.current}
+          total={enrichBatchProgress.total}
+          currentItemLabel={enrichBatchProgress.label}
+        />
+      )}
+
+      {importBatchProgress && (
+        <BatchOperationProgressBanner
+          title={
+            autoGenerate
+              ? "Importing Leads & Generating Website Audit Reports"
+              : "Importing Selected Leads to Workspace Project"
+          }
+          subtitle={
+            autoGenerate
+              ? "Building shareable /report/:id diagnostic, Cold Email variants, WhatsApp & Voice Script"
+              : "Saving verified contact records into project pipeline"
+          }
+          current={importBatchProgress.current}
+          total={importBatchProgress.total}
+          currentItemLabel={importBatchProgress.label}
+        />
+      )}
 
       {/* Progress */}
       {progress && !hunting && (
@@ -1211,33 +2311,178 @@ function AIHunterPanel({
           />
 
           <div className="rounded-xl border border-border/50 overflow-hidden">
-          <div className="p-3 bg-muted/20 border-b border-border/50 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-3">
-              <button onClick={toggleAll} className="flex items-center gap-2 text-sm font-semibold">
-                <div className={`w-4 h-4 rounded border-2 flex items-center justify-center transition-colors ${selectAll ? "bg-primary border-primary" : "border-gray-300"}`}>
-                  {selectAll && <Check className="w-2.5 h-2.5 text-white" />}
-                </div>
-                Select All
-              </button>
-              <span className="text-xs text-muted-foreground">
-                {selectedCount} selected {activeProject ? `· Saving to "${activeProject.name}"` : ""}
-              </span>
+          {apolloCfg.enabled && (
+            <div className="px-3 py-2.5 bg-slate-950 text-white border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[11px] font-extrabold uppercase tracking-wider text-amber-400 mr-1 flex items-center gap-1">
+                  <Sparkles className="w-3.5 h-3.5" /> Filter:
+                </span>
+                {[
+                  { id: "all", label: `All (${results.length})` },
+                  { id: "email", label: `✉ Verified Email (${results.filter(r => r.email).length})` },
+                  ...(apolloCfg.intentScoring ? [{ id: "hot", label: `🔥 Hot Intent 75+ (${results.filter(r => (r.buyerIntentScore ?? 0) >= 75).length})` }] : []),
+                  ...(apolloCfg.decisionMaker ? [{ id: "owner", label: `👤 Decision-Maker (${results.filter(r => r.ownerName || r.linkedin).length})` }] : []),
+                  ...(apolloCfg.techStack ? [
+                    { id: "no_chat", label: `⚠️ No Live Chat (${results.filter(r => (r.missingSignals || []).some(s => s.toLowerCase().includes("chat"))).length})` },
+                    { id: "no_booking", label: `📅 No Booking (${results.filter(r => (r.missingSignals || []).some(s => s.toLowerCase().includes("booking"))).length})` },
+                    { id: "no_pixels", label: `🎯 No Ad Pixels (${results.filter(r => (r.missingSignals || []).some(s => s.toLowerCase().includes("pixel"))).length})` },
+                    { id: "diy_cms", label: `🛠️ Wix/Squarespace/WP (${results.filter(r => r.cmsPlatform && r.cmsPlatform !== "Custom / HTML5" && r.cmsPlatform !== "No Website").length})` },
+                  ] : []),
+                ].map(f => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setApolloFilter(f.id)}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                      apolloFilter === f.id
+                        ? "bg-amber-400 text-slate-950 shadow-sm"
+                        : "bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-800"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {apolloCfg.techStack && results.some(r => r.website) && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={bulkEnriching}
+                    onClick={enrichAllVisibleWebsites}
+                    className="h-7 text-[11px] font-bold bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-500 gap-1"
+                  >
+                    {bulkEnriching ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+                    {bulkEnriching ? "Deep Scanning…" : "⚡ Deep Scan Websites"}
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={bulkAnalyzing}
+                  onClick={() => analyzeAllVisibleHunted()}
+                  className="h-7 text-[11px] font-bold bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500 gap-1"
+                >
+                  {bulkAnalyzing ? <RefreshCw className="w-3 h-3 animate-spin" /> : <BarChart3 className="w-3 h-3" />}
+                  {bulkAnalyzing ? "Auditing Leads…" : "🤖 Auto-Analyze All"}
+                </Button>
+              </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                onClick={importSelected}
-                disabled={selectedCount === 0}
-                className="gap-2 font-semibold h-8 text-xs sm:text-sm"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Import {selectedCount > 0 ? selectedCount : ""} to Project {autoGenerate ? "+ Auto-Generate" : ""}
-              </Button>
+          )}
+          <div className="p-3 bg-muted/20 border-b border-border/50 space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-3 flex-wrap">
+                <button onClick={toggleAll} className="flex items-center gap-2 text-sm font-semibold">
+                  <div className={`w-4 h-4 rounded border-2 flex items-center justify-center transition-colors ${selectAll ? "bg-primary border-primary" : "border-gray-300"}`}>
+                    {selectAll && <Check className="w-2.5 h-2.5 text-white" />}
+                  </div>
+                  Select All
+                </button>
+                <span className="text-xs text-muted-foreground">
+                  {selectedCount} selected {activeProject ? `· Saving to "${activeProject.name}"` : ""}
+                </span>
+                {/* 1-Click Smart Qualification Selection Presets */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setResults(prev =>
+                        prev.map(b => ({ ...b, selected: (b.softwareNeedScore ?? 0) >= 7 }))
+                      )
+                    }
+                    className="px-2 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 cursor-pointer"
+                  >
+                    Select High-Need 7+ ({results.filter(b => (b.softwareNeedScore ?? 0) >= 7).length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setResults(prev => prev.map(b => ({ ...b, selected: Boolean(b.email) })))
+                    }
+                    className="px-2 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 cursor-pointer"
+                  >
+                    Select Verified Email ({results.filter(b => Boolean(b.email)).length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setResults(prev =>
+                        prev.map(b => ({
+                          ...b,
+                          selected:
+                            (b.missingSignals && b.missingSignals.length > 0) ||
+                            (b.softwareNeedScore ?? 0) >= 8,
+                        }))
+                      )
+                    }
+                    className="px-2 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-50 text-[11px] font-semibold text-slate-700 cursor-pointer"
+                  >
+                    Select Missing Chat/Booking
+                  </button>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  onClick={importSelected}
+                  disabled={selectedCount === 0}
+                  className="gap-2 font-semibold h-8 text-xs sm:text-sm"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Import {selectedCount > 0 ? selectedCount : ""} to Project {autoGenerate ? "+ Auto-Generate" : ""}
+                </Button>
+              </div>
+            </div>
+
+            {/* Search bar inside Scraped Hunter Results */}
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-muted-foreground absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <Input
+                value={hunterSearchQuery}
+                onChange={e => setHunterSearchQuery(e.target.value)}
+                placeholder="Filter scraped leads by business name, domain, email, or city…"
+                className="pl-8 h-8 text-xs bg-white"
+              />
             </div>
           </div>
 
-          <div className="divide-y divide-border/30 max-h-[600px] overflow-y-auto">
-            {results.map((b, i) => (
-              <div key={i} className={`p-4 flex items-start gap-3 transition-colors ${b.imported ? "bg-green-50/60" : b.selected ? "" : "opacity-60"}`}>
+          <div className="divide-y divide-border/30 sm:max-h-[680px] sm:overflow-y-auto">
+            {(() => {
+              const hasStrictPreMatch = results.some(b => matchesPreSearchFilter(b));
+              return (
+                <>
+                  {!hasStrictPreMatch && preSearchFilters.some(f => f !== "all") && (
+                    <div className="px-3 py-2 bg-amber-50 border-b border-amber-200 flex items-center justify-between gap-2 text-xs text-amber-900">
+                      <span>
+                        Showing all {results.length} scraped leads from this scan (click <strong>Hunt</strong> to scan specifically for your selected filter, or reset filter).
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setPreSearchFilters(["all"])}
+                        className="px-2 py-0.5 rounded bg-amber-200/80 hover:bg-amber-300 text-amber-950 font-semibold whitespace-nowrap cursor-pointer"
+                      >
+                        Reset to All
+                      </button>
+                    </div>
+                  )}
+                  {results.map((b, i) => {
+                    if (hasStrictPreMatch && !matchesPreSearchFilter(b)) return null;
+              if (hunterSearchQuery.trim()) {
+                const q = hunterSearchQuery.trim().toLowerCase();
+                const matchText = `${b.businessName || ""} ${b.website || ""} ${b.email || ""} ${b.city || ""} ${b.painPoint || ""}`.toLowerCase();
+                if (!matchText.includes(q)) return null;
+              }
+              if (apolloCfg.enabled && apolloFilter !== "all") {
+                if (apolloFilter === "email" && !b.email) return null;
+                if (apolloFilter === "hot" && (b.buyerIntentScore ?? 0) < 75) return null;
+                if (apolloFilter === "owner" && !b.ownerName && !b.linkedin) return null;
+                if (apolloFilter === "no_chat" && !(b.missingSignals || []).some(s => s.toLowerCase().includes("chat"))) return null;
+                if (apolloFilter === "no_booking" && !(b.missingSignals || []).some(s => s.toLowerCase().includes("booking"))) return null;
+                if (apolloFilter === "no_pixels" && !(b.missingSignals || []).some(s => s.toLowerCase().includes("pixel"))) return null;
+                if (apolloFilter === "diy_cms" && (!b.cmsPlatform || b.cmsPlatform === "Custom / HTML5" || b.cmsPlatform === "No Website")) return null;
+              }
+              const linkedinSearchUrl = b.linkedin || `https://www.linkedin.com/search/results/all/?keywords=${encodeURIComponent(`${b.ownerName || ""} ${b.businessName} ${b.city || ""}`.trim())}`;
+              return (
+              <div key={i} className={`p-3 sm:p-4 flex items-start gap-2.5 sm:gap-3 transition-colors overflow-hidden ${b.imported ? "bg-green-50/60" : b.selected ? "" : "opacity-60"}`}>
                 {b.imported ? (
                   <div className="w-5 h-5 rounded-full bg-green-600 flex items-center justify-center flex-shrink-0 mt-0.5">
                     <Check className="w-3 h-3 text-white" />
@@ -1254,16 +2499,50 @@ function AIHunterPanel({
                 )}
 
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <div className="font-bold text-sm">{b.businessName}</div>
-                      <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2 flex-wrap">
-                        {b.ownerName && <span>{b.ownerName}</span>}
-                        {b.email && <span className="text-primary">{b.email}</span>}
-                        {b.phone && <span>{b.phone}</span>}
+                  <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-1.5 sm:gap-2">
+                    <div className="min-w-0">
+                      <div className="font-bold text-sm flex items-center gap-1.5 sm:gap-2 flex-wrap">
+                        <span className="break-words">{b.businessName}</span>
+                        {apolloCfg.enabled && apolloCfg.decisionMaker && b.ownerName && (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                            👤 {b.ownerName}{b.ownerRole ? ` · ${b.ownerRole}` : ""}
+                          </span>
+                        )}
+                        {apolloCfg.enabled && apolloCfg.decisionMaker && (
+                          <a
+                            href={linkedinSearchUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={e => e.stopPropagation()}
+                            className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 border border-sky-200 hover:bg-sky-100"
+                            title={b.linkedin ? "Direct LinkedIn Profile" : "1-Click LinkedIn Decision-Maker X-Ray"}
+                          >
+                            <Linkedin className="w-2.5 h-2.5" />
+                            {b.linkedin ? "LinkedIn Verified" : "Find Owner on LinkedIn"}
+                          </a>
+                        )}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-x-2 gap-y-0.5 flex-wrap">
+                        {b.email && <span className="text-primary font-semibold break-all">✉ {b.email}</span>}
+                        {b.phone && <span>📞 {b.phone}</span>}
+                        {b.city && <span>📍 {b.city}{b.country ? `, ${b.country}` : ""}</span>}
                       </div>
                     </div>
-                    <div className="flex items-center gap-2 flex-shrink-0">
+                    <div className="flex items-center gap-1.5 flex-shrink-0 flex-wrap sm:justify-end">
+                      {apolloCfg.enabled && apolloCfg.intentScoring && typeof b.buyerIntentScore === "number" && (
+                        <div
+                          title={(b.intentReasons || []).join(" • ")}
+                          className={`text-xs font-extrabold px-2.5 py-0.5 rounded-full border ${
+                            b.buyerIntentScore >= 75
+                              ? "bg-orange-100 text-orange-800 border-orange-300"
+                              : b.buyerIntentScore >= 55
+                              ? "bg-amber-50 text-amber-800 border-amber-200"
+                              : "bg-slate-100 text-slate-700 border-slate-200"
+                          }`}
+                        >
+                          {b.buyerIntentScore >= 75 ? "🔥" : "⚡"} {b.buyerIntentScore}/100 Intent
+                        </div>
+                      )}
                       <div className={`text-xs font-bold px-2 py-0.5 rounded-full ${b.softwareNeedScore >= 8 ? "bg-red-100 text-red-700" : b.softwareNeedScore >= 5 ? "bg-yellow-100 text-yellow-700" : "bg-green-100 text-green-700"}`}>
                         {b.softwareNeedScore}/10 need
                       </div>
@@ -1272,14 +2551,208 @@ function AIHunterPanel({
                       )}
                     </div>
                   </div>
-                  {b.painPoint && <p className="text-xs text-muted-foreground mt-1.5 italic">"{b.painPoint}"</p>}
+                  {b.painPoint && <p className="text-xs text-muted-foreground mt-1.5 italic break-words">"{b.painPoint}"</p>}
+                  {/* Apollo+ Tech Stack & Missing Revenue Signals Row */}
+                  {apolloCfg.enabled && apolloCfg.techStack && (b.cmsPlatform || (b.techStack && b.techStack.length > 0) || (b.missingSignals && b.missingSignals.length > 0)) && (
+                    <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                      {b.cmsPlatform && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-900 text-white">
+                          🖥️ CMS: {b.cmsPlatform}
+                        </span>
+                      )}
+                      {(b.techStack || []).slice(0, 4).map((t, idx) => (
+                        <span key={idx} className="text-[10px] font-semibold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
+                          {t}
+                        </span>
+                      ))}
+                      {(b.missingSignals || []).slice(0, 3).map((m, idx) => (
+                        <span key={idx} className="text-[10px] font-bold px-2 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200">
+                          ⚠️ {m}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                   <div className="flex items-center gap-2 mt-1.5 flex-wrap">
-                    {b.website && <span className="text-xs text-primary flex items-center gap-0.5"><Globe className="w-3 h-3" />{b.website}</span>}
+                    {b.website && (
+                      <a href={b.website} target="_blank" rel="noopener noreferrer" className="text-xs text-primary hover:underline inline-flex items-center gap-0.5 break-all max-w-full">
+                        <Globe className="w-3 h-3 shrink-0" /><span>{b.website}</span>
+                      </a>
+                    )}
+                    {apolloCfg.enabled && apolloCfg.techStack && b.website && (
+                      <button
+                        type="button"
+                        disabled={b.enriching}
+                        onClick={() => enrichSingleHunted(i)}
+                        className="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100 cursor-pointer flex items-center gap-1"
+                      >
+                        {b.enriching ? <RefreshCw className="w-2.5 h-2.5 animate-spin" /> : <Zap className="w-2.5 h-2.5" />}
+                        {b.enriching ? "Scanning…" : "⚡ Live Scan Tech & Owner"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={b.analyzing}
+                      onClick={() => analyzeSingleHunted(i)}
+                      className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 cursor-pointer flex items-center gap-1"
+                    >
+                      {b.analyzing ? <RefreshCw className="w-2.5 h-2.5 animate-spin" /> : <BarChart3 className="w-2.5 h-2.5" />}
+                      {b.analyzing ? "Auditing…" : b.analysis ? `✓ Audited (${b.analysis.websiteScore}/100)` : "🔍 Run Audit"}
+                    </button>
                     {b.imported && <span className="text-xs font-bold text-green-700">✓ Imported {autoGenerate ? "+ AI Generated" : ""}</span>}
                   </div>
+
+                  {/* Primary Offer + Inline Website / Review / Generate Cold Email Bar (mobile-friendly) */}
+                  {(() => {
+                    const offerRes = resolveAuditMatchedOffer(b, trainedOffer);
+                    return (
+                      <div className="mt-2.5 pt-2.5 border-t border-slate-200/80 flex flex-col gap-2">
+                        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                          {offerRes.primaryOffer ? (
+                            <div className="inline-flex items-center gap-1.5 text-xs text-slate-700 bg-slate-100 border border-slate-200 rounded-md px-2.5 py-1 w-fit max-w-full">
+                              <span className="font-semibold text-slate-900 shrink-0">Primary Offer:</span>
+                              <span className="truncate">{offerRes.primaryOffer}</span>
+                            </div>
+                          ) : (
+                            <div className="text-xs text-muted-foreground">
+                              Run Live Scan or Audit to match best offer
+                            </div>
+                          )}
+                          <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto">
+                            {offerRes.showGenerateWebsite && (
+                              <button
+                                type="button"
+                                disabled={b.generatingSite}
+                                onClick={() => generateInlineWebsiteOrReviewForHunted(i, "website")}
+                                className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-medium bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 inline-flex items-center gap-1 cursor-pointer transition-colors"
+                              >
+                                {b.generatingSite ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : <Globe className="w-3 h-3 text-slate-600 shrink-0" />}
+                                <span>{b.generatedSiteUrl ? "Regenerate Website" : "Generate Website"}</span>
+                              </button>
+                            )}
+                            {offerRes.showGenerateReview && (
+                              <button
+                                type="button"
+                                disabled={b.generatingReview}
+                                onClick={() => generateInlineWebsiteOrReviewForHunted(i, "review")}
+                                className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-medium bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 inline-flex items-center gap-1 cursor-pointer transition-colors"
+                              >
+                                {b.generatingReview ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : <Star className="w-3 h-3 text-amber-500 shrink-0" />}
+                                <span>{b.generatedReviewUrl ? "Regenerate Review" : "Generate Review"}</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              disabled={b.generatingInlineEmail}
+                              onClick={() => {
+                                if (b.generatedEmail && b.inlineOpen) {
+                                  setResults(prev => prev.map((r, idx) => idx === i ? { ...r, inlineOpen: false } : r));
+                                } else if (b.generatedEmail && !b.inlineOpen) {
+                                  setResults(prev => prev.map((r, idx) => idx === i ? { ...r, inlineOpen: true } : r));
+                                } else {
+                                  generateInlineEmailForHunted(i);
+                                }
+                              }}
+                              className="w-full sm:w-auto justify-center px-3 py-2 sm:py-1 rounded-md text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-white inline-flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm"
+                            >
+                              {b.generatingInlineEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" /> : <Mail className="w-3.5 h-3.5 shrink-0" />}
+                              <span>{b.generatedEmail ? (b.inlineOpen ? "Hide Cold Email" : "View Cold Email") : "Generate Cold Email"}</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {(b.generatedSiteUrl || b.generatedReviewUrl) && (
+                          <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-1.5 sm:gap-3 text-xs bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+                            {b.generatedSiteUrl && (
+                              <div className="inline-flex items-center gap-1.5 flex-wrap">
+                                <span className="font-semibold text-slate-700">Website Preview:</span>
+                                <a href={b.generatedSiteUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-0.5 font-medium break-all">
+                                  {b.generatedSiteUrl} <ExternalLink className="w-3 h-3 shrink-0" />
+                                </a>
+                              </div>
+                            )}
+                            {b.generatedReviewUrl && (
+                              <div className="inline-flex items-center gap-1.5 flex-wrap">
+                                <span className="font-semibold text-slate-700">Review Page:</span>
+                                <a href={b.generatedReviewUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-0.5 font-medium break-all">
+                                  {b.generatedReviewUrl} <ExternalLink className="w-3 h-3 shrink-0" />
+                                </a>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {b.inlineOpen && b.generatedEmail && (
+                          <div className="p-3 rounded-lg border border-slate-200 bg-white space-y-2.5 mt-1">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                              <span className="text-xs font-semibold text-slate-800 flex items-center gap-1.5 flex-wrap">
+                                <Mail className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+                                <span>Personalized Cold Email{offerRes.primaryOffer ? ` (${offerRes.primaryOffer})` : ""}</span>
+                                {b.inlineEmailSent && <span className="text-green-600 font-semibold">· ✓ Sent</span>}
+                              </span>
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <CopyButton text={`Subject: ${b.generatedEmail.subject}\n\n${b.generatedEmail.body}`} />
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => generateInlineEmailForHunted(i)}
+                                  disabled={b.generatingInlineEmail}
+                                  className="h-7 text-xs gap-1"
+                                >
+                                  <RefreshCw className={`w-3 h-3 ${b.generatingInlineEmail ? "animate-spin" : ""}`} />
+                                  Regenerate
+                                </Button>
+                                {b.email && (
+                                  <Button
+                                    size="sm"
+                                    onClick={() => sendInlineEmailForHunted(i)}
+                                    disabled={b.sendingInlineEmail}
+                                    className="h-7 text-xs gap-1 bg-slate-900 hover:bg-slate-800 text-white"
+                                  >
+                                    <Send className="w-3 h-3" />
+                                    {b.sendingInlineEmail ? "Sending…" : "Send Email"}
+                                  </Button>
+                                )}
+                              </div>
+                            </div>
+                            <Input
+                              value={b.generatedEmail.subject}
+                              onChange={(e) =>
+                                setResults(prev =>
+                                  prev.map((r, idx) =>
+                                    idx === i && r.generatedEmail
+                                      ? { ...r, generatedEmail: { ...r.generatedEmail, subject: e.target.value } }
+                                      : r
+                                  )
+                                )
+                              }
+                              className="h-8 text-xs font-semibold"
+                            />
+                            <Textarea
+                              value={b.generatedEmail.body}
+                              onChange={(e) =>
+                                setResults(prev =>
+                                  prev.map((r, idx) =>
+                                    idx === i && r.generatedEmail
+                                      ? { ...r, generatedEmail: { ...r.generatedEmail, body: e.target.value } }
+                                      : r
+                                  )
+                                )
+                              }
+                              rows={5}
+                              className="text-xs"
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
-            ))}
+              );
+            })}
+                </>
+              );
+            })()}
           </div>
           </div>
         </div>
@@ -1473,25 +2946,154 @@ function AddProspectDialog({ onAdd, editData, onClose }: {
 function AnalysisPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (p: Prospect) => void }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const trainedOffer = useTrainedOfferSummary();
+
+  const buildClientFallbackAnalysis = (): WebsiteAnalysis => {
+    const hasWeb = Boolean(prospect.website && !/^(none|n\/a|no website|-)$/i.test(prospect.website.trim()));
+    const cat = prospect.category || "local service";
+    const city = prospect.city || "your area";
+    const preSignalRes = resolveAuditMatchedOffer({ ...prospect, analysis: undefined }, trainedOffer);
+    const needsWeb = preSignalRes.needsWebsite;
+    const needsRev = preSignalRes.needsReview;
+    const matchedOffer = preSignalRes.primaryOffer || "24/7 AI Receptionist & Automated Booking";
+
+    const issues: { title: string; description: string; priority: string }[] = [];
+    if (needsWeb) {
+      issues.push({
+        title: hasWeb ? "High-Friction Mobile Lead Capture" : "No Dedicated Conversion Website",
+        description: hasWeb
+          ? `Mobile visitors searching for ${cat.toLowerCase()} in ${city} face static contact forms without instant quote or booking confirmation.`
+          : `Prospective customers searching for ${prospect.businessName} in ${city} have no dedicated website or instant booking funnel.`,
+        priority: "high",
+      });
+    }
+    if (needsRev) {
+      issues.push({
+        title: "Missing Automated 5-Star Review Funnel",
+        description: "Satisfied customers are not automatically routed to leave 5-star Google reviews while private feedback is intercepted.",
+        priority: needsWeb ? "medium" : "high",
+      });
+    }
+    issues.push({
+      title: "No 24/7 Automated AI Receptionist or Instant Reply",
+      description: "After-hours and peak-hour customer inquiries go unanswered without an automated chat and voice receptionist.",
+      priority: !needsWeb && !needsRev ? "high" : "medium",
+    });
+
+    return {
+      matchedOffer,
+      websiteScore: !hasWeb ? 14 : needsWeb ? 46 : 74,
+      leadScore: needsWeb ? 52 : 76,
+      conversionScore: !hasWeb ? 12 : needsWeb ? 38 : 68,
+      mobileScore: !hasWeb ? 18 : needsWeb ? 54 : 76,
+      seoScore: !hasWeb ? 15 : needsWeb ? 44 : 68,
+      growthPotential: 92,
+      checks: {
+        responsiveDesign: hasWeb && !needsWeb,
+        sslCertificate: hasWeb,
+        modernUI: hasWeb && !needsWeb,
+        whatsappButton: false,
+        contactForm: hasWeb && !needsWeb,
+        bookingSystem: false,
+        onlineOrdering: false,
+        paymentIntegration: false,
+        customerPortal: false,
+        membershipArea: false,
+        blog: false,
+        seoBasics: hasWeb,
+        analytics: hasWeb && !needsWeb,
+        socialMedia: true,
+        emailCapture: false,
+        liveChat: false,
+        aiChatbot: false,
+        callToAction: hasWeb && !needsWeb,
+        trustElements: hasWeb && !needsRev,
+      },
+      issues,
+      opportunities: [
+        {
+          title: `Deploy ${matchedOffer}`,
+          impact: "+25–40% increase in mobile customer inquiries",
+          effort: "low",
+        },
+        {
+          title: needsRev ? "Activate 5-Star Review Shield" : "Automate 24/7 AI Receptionist & Booking",
+          impact: "Captures missed calls & protects 5-star local reputation",
+          effort: "low",
+        },
+      ],
+      recommendedFeatures: [
+        matchedOffer,
+        ...(needsWeb ? ["4-Tap Mobile Quote & Booking Funnel"] : []),
+        ...(needsRev ? ["5-Star Review Shield & QR Gatekeeper"] : []),
+        "24/7 Spoken AI Receptionist Chatbot",
+      ],
+      projectType: "Medium Web App",
+      estimatedValue: { min: 1500, max: 3500 },
+      deliveryWeeks: { min: 1, max: 2 },
+      summary: `${prospect.businessName} has strong local demand in ${city} as a ${cat} provider, and our audit indicates ${matchedOffer} is the top priority to convert more local traffic into booked appointments.`,
+    };
+  };
 
   const analyze = async () => {
     setLoading(true); setError("");
     try {
       const data = await callCRM("analyze-website", {
-        website: prospect.website, businessName: prospect.businessName, category: prospect.category,
+        website: prospect.website,
+        businessName: prospect.businessName,
+        category: prospect.category,
+        city: prospect.city,
+        painPoint: prospect.painPoint,
+        cmsPlatform: prospect.cmsPlatform,
+        missingSignals: prospect.missingSignals,
       });
+      const fb = buildClientFallbackAnalysis();
+      const merged: WebsiteAnalysis = {
+        ...fb,
+        ...data,
+        checks: { ...fb.checks, ...(data?.checks || {}) },
+        issues: Array.isArray(data?.issues) && data.issues.length > 0 ? data.issues : fb.issues,
+        opportunities: Array.isArray(data?.opportunities) && data.opportunities.length > 0 ? data.opportunities : fb.opportunities,
+        recommendedFeatures: Array.isArray(data?.recommendedFeatures) && data.recommendedFeatures.length > 0 ? data.recommendedFeatures : fb.recommendedFeatures,
+        estimatedValue: data?.estimatedValue?.min ? data.estimatedValue : fb.estimatedValue,
+        deliveryWeeks: data?.deliveryWeeks?.min ? data.deliveryWeeks : fb.deliveryWeeks,
+      };
+      const resolved = resolveAuditMatchedOffer({ ...prospect, analysis: merged }, trainedOffer);
       onUpdate({
         ...prospect,
-        analysis: data,
-        reportId: data.reportId || prospect.reportId,
-        reportUrl: data.reportUrl || prospect.reportUrl,
+        analysis: merged,
+        primaryOffer: resolved.primaryOffer || merged.matchedOffer || prospect.primaryOffer,
+        reportId: data?.reportId || prospect.reportId,
+        reportUrl: data?.reportUrl || prospect.reportUrl,
       });
-    } catch (e: any) { setError(e.message); }
-    finally { setLoading(false); }
+    } catch {
+      const fb = buildClientFallbackAnalysis();
+      const resolved = resolveAuditMatchedOffer({ ...prospect, analysis: fb }, trainedOffer);
+      onUpdate({
+        ...prospect,
+        analysis: fb,
+        primaryOffer: resolved.primaryOffer || fb.matchedOffer || prospect.primaryOffer,
+      });
+    } finally { setLoading(false); }
   };
 
+  const autoAnalyzedIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!prospect.analysis && !loading && autoAnalyzedIdRef.current !== prospect.id) {
+      autoAnalyzedIdRef.current = prospect.id;
+      void analyze();
+    }
+  }, [prospect.id]);
+
   const a = prospect.analysis;
-  if (loading) return <LoadingSpinner text="AI is analyzing the business…" />;
+  if (loading) {
+    return (
+      <WebsiteAuditReportSkeleton
+        businessName={prospect.businessName}
+        website={prospect.website}
+      />
+    );
+  }
 
   if (!a) return (
     <div className="text-center py-12">
@@ -1518,14 +3120,14 @@ function AnalysisPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
           {(a.matchedOffer || a.projectType) && (
             <div className="mt-2.5 inline-flex items-center gap-2 px-3 py-1 rounded-lg bg-blue-50 border border-blue-200 text-blue-800 text-xs font-semibold">
               <Sparkles className="w-3.5 h-3.5 text-blue-600" />
-              <span>Best-Fit Offer from Your Trained AI Catalog: <strong>{a.matchedOffer || a.projectType}</strong></span>
+              <span>Recommended Offer: <strong>{a.matchedOffer || a.projectType}</strong></span>
             </div>
           )}
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
           {prospect.reportId && (
             <a href={`/report/${prospect.reportId}`}>
-              <Button size="sm" variant="outline" className="gap-1.5 border-purple-200 text-purple-700 hover:bg-purple-50">
+              <Button size="sm" variant="outline" className="gap-1.5 border-blue-200 text-blue-700 hover:bg-blue-50">
                 <ExternalLink className="w-3.5 h-3.5" /> View Client Audit Report
               </Button>
             </a>
@@ -1599,7 +3201,7 @@ function AnalysisPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
           <h4 className="text-sm font-bold">Feature Checklist</h4>
         </div>
         <div className="p-4 grid grid-cols-2 md:grid-cols-3 gap-2">
-          {Object.entries(a.checks).map(([k, v]) => (
+          {Object.entries(a.checks || {}).map(([k, v]) => (
             <div key={k} className={`flex items-center gap-2 text-xs px-3 py-2 rounded-lg ${v ? "bg-green-50 text-green-800" : "bg-red-50 text-red-700"}`}>
               {v ? <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" /> : <X className="w-3.5 h-3.5 flex-shrink-0" />}
               {CHECK_LABELS[k] || k}
@@ -1608,13 +3210,13 @@ function AnalysisPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         </div>
       </div>
 
-      {a.issues.length > 0 && (
+      {(a.issues || []).length > 0 && (
         <div className="rounded-xl border border-border/50 overflow-hidden">
           <div className="p-3 bg-muted/20 border-b border-border/50">
-            <h4 className="text-sm font-bold">Issues Found ({a.issues.length})</h4>
+            <h4 className="text-sm font-bold">Issues Found ({(a.issues || []).length})</h4>
           </div>
           <div className="divide-y divide-border/30">
-            {a.issues.map((issue, i) => (
+            {(a.issues || []).map((issue, i) => (
               <div key={i} className="p-3 flex items-start gap-3">
                 <span className={`text-xs font-bold px-2 py-0.5 rounded-full flex-shrink-0 mt-0.5 ${
                   issue.priority === "high" ? "bg-red-100 text-red-700" :
@@ -1630,13 +3232,13 @@ function AnalysisPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         </div>
       )}
 
-      {a.opportunities.length > 0 && (
+      {(a.opportunities || []).length > 0 && (
         <div className="rounded-xl border border-border/50 overflow-hidden">
           <div className="p-3 bg-muted/20 border-b border-border/50">
             <h4 className="text-sm font-bold">Revenue Opportunities</h4>
           </div>
           <div className="divide-y divide-border/30">
-            {a.opportunities.map((op, i) => (
+            {(a.opportunities || []).map((op, i) => (
               <div key={i} className="p-3 flex items-start gap-3">
                 <Zap className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
                 <div>
@@ -1653,20 +3255,20 @@ function AnalysisPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         </div>
       )}
 
-      <div className="bg-gradient-to-r from-purple-50 to-indigo-50 border border-purple-200 rounded-xl p-4">
-        <h4 className="font-bold text-sm text-purple-900 mb-3">Project Estimate</h4>
+      <div className="bg-[#FAF9F5] border border-[#E4E2DD] rounded-xl p-4">
+        <h4 className="font-bold text-sm text-[#0B0F17] mb-3">Project Estimate</h4>
         <div className="grid grid-cols-3 gap-3 text-center">
           <div>
             <div className="text-xs text-muted-foreground">Type</div>
-            <div className="font-bold text-sm mt-1">{a.projectType}</div>
+            <div className="font-bold text-sm mt-1">{a.projectType || "Medium Web App"}</div>
           </div>
           <div>
             <div className="text-xs text-muted-foreground">Est. Value</div>
-            <div className="font-bold text-sm mt-1 text-purple-700">${a.estimatedValue.min.toLocaleString()} – ${a.estimatedValue.max.toLocaleString()}</div>
+            <div className="font-mono-num font-bold text-sm mt-1 text-[#1D4ED8]">${(a.estimatedValue?.min ?? 1500).toLocaleString()} – ${(a.estimatedValue?.max ?? 3500).toLocaleString()}</div>
           </div>
           <div>
             <div className="text-xs text-muted-foreground">Delivery</div>
-            <div className="font-bold text-sm mt-1">{a.deliveryWeeks.min}–{a.deliveryWeeks.max} weeks</div>
+            <div className="font-mono-num font-bold text-sm mt-1">{a.deliveryWeeks?.min ?? 1}–{a.deliveryWeeks?.max ?? 2} weeks</div>
           </div>
         </div>
       </div>
@@ -1684,10 +3286,15 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
   const [sendingEmail, setSendingEmail] = useState(false);
   const [sendingTrained, setSendingTrained] = useState(false);
   const [sendingProposal, setSendingProposal] = useState(false);
+  const [generatingSiteInline, setGeneratingSiteInline] = useState(false);
+  const [generatingReviewInline, setGeneratingReviewInline] = useState(false);
   const [followupDay, setFollowupDay] = useState("3");
   const [followup, setFollowup] = useState<{ subject: string; body: string } | null>(null);
   const [error, setError] = useState("");
   const [sendStatus, setSendStatus] = useState<{ type: "success" | "error"; msg: string } | null>(null);
+  const trainedOffer = useTrainedOfferSummary();
+  const auditOfferRes = resolveAuditMatchedOffer(prospect, trainedOffer);
+  const effectivePrimaryOffer = auditOfferRes.primaryOffer || prospect.analysis?.matchedOffer || trainedOffer.primaryOfferName;
 
   const sendProposalEmail = async () => {
     if (!prospect.email || !prospect.proposal) return;
@@ -1704,29 +3311,134 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
   const issues = prospect.analysis?.issues.slice(0, 3).map(i => i.title).join(", ") || "";
   const opportunities = prospect.analysis?.opportunities.slice(0, 2).map(o => o.title).join(", ") || "";
 
-  const genEmail = async () => {
-    setLoadingEmail(true); setError("");
+  const buildLocalFallbackEmails = () => {
+    const biz = prospect.businessName || "your business";
+    const firstOwner = prospect.ownerName ? prospect.ownerName.split(" ")[0] : "";
+    const greeting = firstOwner ? `Hi ${firstOwner},` : `Hi ${biz} Team,`;
+    const cat = (prospect.category || "local").toLowerCase();
+    const cityPart = prospect.city ? ` in ${prospect.city}` : "";
+    const reportLine = prospect.reportUrl
+      ? `\n\nI also put together a custom Website & Conversion Audit for ${biz} here:\n${prospect.reportUrl}`
+      : "";
+    const signOff = `\n\nBest regards,\n${AGENCY_NAME}`;
+
+    return [
+      {
+        version: "A",
+        subject: `Quick growth idea for ${biz}`,
+        body: `${greeting}\n\nWhile reviewing ${cat} businesses${cityPart}, I noticed ${biz} has a strong local reputation, but mobile visitors don't currently have a fast 1-click booking or instant quote flow.\n\nWe help ${cat} businesses turn missed website visitors into booked clients automatically.${reportLine}\n\nWould you be open to a quick 5-minute walkthrough this week?${signOff}`,
+      },
+      {
+        version: "B",
+        subject: `Capturing more ${prospect.city || "local"} clients for ${biz}`,
+        body: `${greeting}\n\nI was looking at ${biz}${cityPart} today and saw a clear opportunity to convert more of your search traffic into booked appointments without adding extra phone work for your team.${reportLine}\n\nWould you be open to seeing a quick preview of how this would work for ${biz}?${signOff}`,
+      },
+      {
+        version: "C",
+        subject: `${biz} — website & conversion upgrade`,
+        body: `${greeting}\n\nMost ${cat} businesses${cityPart} lose 30–40% of after-hours inquiries when visitors have to wait for a callback.\n\nWe built a streamlined conversion & booking blueprint tailored for ${biz}.${reportLine}\n\nCan I send over a 60-second overview?${signOff}`,
+      },
+    ];
+  };
+
+  const genEmailWithOverrides = async (overrides?: {
+    websiteUrl?: string;
+    reviewUrl?: string;
+    siteId?: string;
+  }) => {
+    setLoadingEmail(true); setError(""); setSendStatus(null);
+    const demoWebsiteUrl = overrides?.websiteUrl ?? prospect.generatedSiteUrl ?? "";
+    const reviewServiceUrl = overrides?.reviewUrl ?? prospect.generatedReviewUrl ?? "";
+    const nextSiteId = overrides?.siteId ?? prospect.generatedSiteId;
     try {
       const data = await callCRM("generate-email", {
         businessName: prospect.businessName, ownerName: prospect.ownerName,
+        ownerRole: prospect.ownerRole,
         category: prospect.category, website: prospect.website,
+        city: prospect.city,
+        cmsPlatform: prospect.cmsPlatform,
+        missingSignals: prospect.missingSignals,
         issues, opportunities, agencyName: AGENCY_NAME,
         reportUrl: prospect.reportUrl || "",
+        primaryOffer: effectivePrimaryOffer,
+        demoWebsiteUrl,
+        reviewServiceUrl,
       });
-      // If API returned versions (A/B/C), store them; default to version A
-      const versions: { version: string; subject: string; body: string }[] = data.versions || [];
-      const primary = versions[0] ?? { version: "A", subject: data.subject, body: data.body };
+      const fallbackVersions = buildLocalFallbackEmails();
+      const versions: { version: string; subject: string; body: string }[] =
+        Array.isArray(data?.versions) && data.versions.length > 0
+          ? data.versions
+          : fallbackVersions;
+      const primary = versions[0] ?? fallbackVersions[0];
       onUpdate({
         ...prospect,
+        primaryOffer: effectivePrimaryOffer,
+        generatedSiteId: nextSiteId,
+        generatedSiteUrl: demoWebsiteUrl || prospect.generatedSiteUrl,
+        generatedReviewUrl: reviewServiceUrl || prospect.generatedReviewUrl,
         generatedEmail: {
-          subject: primary.subject,
-          body: primary.body,
-          emailVersions: versions.length > 0 ? versions : undefined,
+          subject: primary.subject || fallbackVersions[0].subject,
+          body: primary.body || fallbackVersions[0].body,
+          emailVersions: versions,
           selectedVersion: primary.version || "A",
         },
       });
-    } catch (e: any) { setError(e.message); }
-    finally { setLoadingEmail(false); }
+    } catch {
+      const fallbackVersions = buildLocalFallbackEmails();
+      const primary = fallbackVersions[0];
+      onUpdate({
+        ...prospect,
+        primaryOffer: effectivePrimaryOffer,
+        generatedSiteId: nextSiteId,
+        generatedSiteUrl: demoWebsiteUrl || prospect.generatedSiteUrl,
+        generatedReviewUrl: reviewServiceUrl || prospect.generatedReviewUrl,
+        generatedEmail: {
+          subject: primary.subject,
+          body: primary.body,
+          emailVersions: fallbackVersions,
+          selectedVersion: "A",
+        },
+      });
+    } finally { setLoadingEmail(false); }
+  };
+
+  const genEmail = () => genEmailWithOverrides();
+
+  const handleGenerateInlineAsset = async (mode: "website" | "review") => {
+    setError("");
+    if (mode === "website") setGeneratingSiteInline(true);
+    else setGeneratingReviewInline(true);
+    try {
+      let siteId = prospect.generatedSiteId;
+      let websiteUrl = prospect.generatedSiteUrl;
+      let reviewUrl = prospect.generatedReviewUrl;
+      const isForceRegenerate =
+        (mode === "website" && Boolean(prospect.generatedSiteUrl)) ||
+        (mode === "review" && Boolean(prospect.generatedReviewUrl));
+      const hasValidSlug = Boolean(siteId && !/^\d+$/.test(String(siteId)));
+      if (!hasValidSlug || isForceRegenerate) {
+        const assets = await generateInlineLeadAssets(prospect);
+        siteId = assets.siteId;
+        websiteUrl = assets.websiteUrl;
+        reviewUrl = assets.reviewUrl;
+      } else {
+        const origin = window.location.origin;
+        websiteUrl = `${origin}/site/${siteId}`;
+        reviewUrl = `${origin}/review/${siteId}`;
+      }
+      const nextWebsiteUrl = mode === "website" ? websiteUrl : (prospect.generatedSiteUrl || websiteUrl);
+      const nextReviewUrl = mode === "review" ? reviewUrl : (prospect.generatedReviewUrl || reviewUrl);
+      await genEmailWithOverrides({
+        siteId,
+        websiteUrl: nextWebsiteUrl,
+        reviewUrl: nextReviewUrl,
+      });
+    } catch (e: any) {
+      setError(e?.message || "Could not generate preview link");
+    } finally {
+      setGeneratingSiteInline(false);
+      setGeneratingReviewInline(false);
+    }
   };
 
   const sendEmail = async () => {
@@ -1747,45 +3459,6 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
     } finally { setSendingEmail(false); }
   };
 
-  const sendTrainedOutreachNow = async () => {
-    setSendingTrained(true);
-    setError("");
-    setSendStatus(null);
-    try {
-      const resp = await callCRM("send-trained-outreach", {
-        businessName: prospect.businessName,
-        ownerName: prospect.ownerName,
-        category: prospect.category,
-        website: prospect.website,
-        email: prospect.email,
-        city: prospect.city,
-        country: prospect.country,
-        painPoint: prospect.painPoint,
-        issues,
-        opportunities,
-        reportUrl: prospect.reportUrl || "",
-      });
-
-      const nextProspect: Prospect = {
-        ...prospect,
-        generatedEmail: resp.generatedEmail || prospect.generatedEmail,
-        reportId: resp.reportId || prospect.reportId,
-        reportUrl: resp.reportUrl || prospect.reportUrl,
-        status: resp.sent ? "contacted" : prospect.status,
-        emailSentAt: resp.emailSentAt || prospect.emailSentAt,
-      };
-      onUpdate(nextProspect);
-      setSendStatus({
-        type: resp.sent ? "success" : "error",
-        msg: resp.message || (resp.sent ? `Trained AI email sent to ${prospect.email}` : `Generated personalized email (connect SMTP inbox to send live)`),
-      });
-    } catch (e: any) {
-      setSendStatus({ type: "error", msg: e.message });
-    } finally {
-      setSendingTrained(false);
-    }
-  };
-
   const genWA = async () => {
     setLoadingWA(true); setError("");
     try {
@@ -1794,8 +3467,13 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         opportunities, agencyName: AGENCY_NAME,
       });
       onUpdate({ ...prospect, generatedWhatsApp: data.message });
-    } catch (e: any) { setError(e.message); }
-    finally { setLoadingWA(false); }
+    } catch {
+      const firstOwner = prospect.ownerName ? prospect.ownerName.split(" ")[0] : "there";
+      onUpdate({
+        ...prospect,
+        generatedWhatsApp: `Hi ${firstOwner}! 👋 I was checking out ${prospect.businessName}${prospect.city ? ` in ${prospect.city}` : ""} and put together a quick conversion & booking audit to help capture more local clients automatically. Mind if I share the link here?`,
+      });
+    } finally { setLoadingWA(false); }
   };
 
   const genLI = async () => {
@@ -1806,8 +3484,13 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         category: prospect.category, agencyName: AGENCY_NAME,
       });
       onUpdate({ ...prospect, generatedLinkedIn: data.message });
-    } catch (e: any) { setError(e.message); }
-    finally { setLoadingLI(false); }
+    } catch {
+      const firstOwner = prospect.ownerName ? prospect.ownerName.split(" ")[0] : "there";
+      onUpdate({
+        ...prospect,
+        generatedLinkedIn: `Hi ${firstOwner}, impressed by ${prospect.businessName}'s work${prospect.city ? ` in ${prospect.city}` : ""}. Would love to connect and share a quick growth idea for your ${prospect.category || "business"}!`,
+      });
+    } finally { setLoadingLI(false); }
   };
 
   const genFollowup = async () => {
@@ -1819,8 +3502,13 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         previousContext: `Sent cold email about custom software for their ${prospect.category} business`,
       });
       setFollowup(data);
-    } catch (e: any) { setError(e.message); }
-    finally { setLoadingFollowup(false); }
+    } catch {
+      const firstOwner = prospect.ownerName ? prospect.ownerName.split(" ")[0] : `${prospect.businessName} Team`;
+      setFollowup({
+        subject: `Following up — quick idea for ${prospect.businessName}`,
+        body: `Hi ${firstOwner},\n\nJust floating this back to the top of your inbox in case it got buried. Would you be open to a quick 5-minute look at the conversion blueprint we put together for ${prospect.businessName}?\n\nBest,\n${AGENCY_NAME}`,
+      });
+    } finally { setLoadingFollowup(false); }
   };
 
   return (
@@ -1856,40 +3544,87 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         );
       })()}
 
-      {/* Email */}
+      {/* Cold Email — Clean & Portable to match WhatsApp / LinkedIn / Follow-up */}
       <div className="rounded-xl border border-border/50 overflow-hidden">
-        <div className="p-4 border-b border-border/50 bg-muted/20 flex items-center justify-between">
-          <h4 className="font-bold text-sm flex items-center gap-2">
-            <Mail className="w-4 h-4 text-primary" /> Cold Email
-            {prospect.emailSentAt && <span className="text-xs text-green-600 font-normal">✓ Sent {new Date(prospect.emailSentAt).toLocaleDateString()}</span>}
-          </h4>
-          <div className="flex flex-wrap gap-2">
+        <div className="p-3.5 sm:p-4 border-b border-border/50 bg-muted/20 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div className="flex items-center gap-2 flex-wrap min-w-0">
+            <h4 className="font-bold text-sm flex items-center gap-2">
+              <Mail className="w-4 h-4 text-primary shrink-0" /> Personalized Cold Email
+              {prospect.emailSentAt && <span className="text-xs text-green-600 font-normal">✓ Sent {new Date(prospect.emailSentAt).toLocaleDateString()}</span>}
+            </h4>
+            {auditOfferRes.primaryOffer && (
+              <span className="inline-flex items-center gap-1 text-xs bg-slate-100 text-slate-800 border border-slate-200 rounded-md px-2 py-0.5 font-medium max-w-full">
+                <span className="shrink-0">Primary Offer:</span> <strong className="font-semibold truncate">{auditOfferRes.primaryOffer}</strong>
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5 w-full sm:w-auto flex-wrap">
+            {auditOfferRes.showGenerateWebsite && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => handleGenerateInlineAsset("website")}
+                disabled={generatingSiteInline || loadingEmail}
+                className="flex-1 sm:flex-initial h-8 sm:h-7 text-xs gap-1"
+              >
+                {generatingSiteInline ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Globe className="w-3 h-3" />}
+                {prospect.generatedSiteUrl ? "Regenerate Website" : "Generate Website"}
+              </Button>
+            )}
+            {auditOfferRes.showGenerateReview && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => handleGenerateInlineAsset("review")}
+                disabled={generatingReviewInline || loadingEmail}
+                className="flex-1 sm:flex-initial h-8 sm:h-7 text-xs gap-1"
+              >
+                {generatingReviewInline ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Star className="w-3 h-3 text-amber-500" />}
+                {prospect.generatedReviewUrl ? "Regenerate Review" : "Generate Review"}
+              </Button>
+            )}
             {prospect.generatedEmail && <CopyButton text={`Subject: ${prospect.generatedEmail.subject}\n\n${prospect.generatedEmail.body}`} />}
-            <Button size="sm" variant="outline" onClick={genEmail} disabled={loadingEmail || sendingTrained} className="h-7 text-xs gap-1">
-              {loadingEmail ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-              {prospect.generatedEmail ? "Regenerate" : "Generate"}
-            </Button>
             <Button
               size="sm"
-              onClick={sendTrainedOutreachNow}
-              disabled={sendingTrained || loadingEmail}
-              className="h-7 text-xs gap-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold"
+              onClick={genEmail}
+              disabled={loadingEmail}
+              className="w-full sm:w-auto h-8 sm:h-7 text-xs gap-1.5 bg-slate-900 hover:bg-slate-800 text-white font-semibold"
             >
-              {sendingTrained ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-              {sendingTrained ? "Training & Sending…" : "Trigger Trained AI Send"}
+              {loadingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Mail className="w-3.5 h-3.5" />}
+              {prospect.generatedEmail ? "Regenerate Cold Email" : "Generate Cold Email"}
             </Button>
             {prospect.generatedEmail && prospect.email && (
               <Button size="sm" onClick={sendEmail} disabled={sendingEmail}
-                className="h-7 text-xs gap-1 bg-primary hover:bg-primary/90 text-white font-semibold">
+                className="w-full sm:w-auto h-8 sm:h-7 text-xs gap-1 bg-primary hover:bg-primary/90 text-white font-semibold">
                 {sendingEmail ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
                 {sendingEmail ? "Sending…" : "Send Now"}
               </Button>
             )}
           </div>
         </div>
+        {(prospect.generatedSiteUrl || prospect.generatedReviewUrl) && (
+          <div className="px-4 py-2 border-b border-border/50 bg-slate-50 flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-1.5 sm:gap-4 text-xs">
+            {prospect.generatedSiteUrl && (
+              <div className="inline-flex items-center gap-1.5 flex-wrap">
+                <span className="font-semibold text-slate-700">Generated Website:</span>
+                <a href={prospect.generatedSiteUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-1 font-medium break-all">
+                  {prospect.generatedSiteUrl} <ExternalLink className="w-3 h-3 shrink-0" />
+                </a>
+              </div>
+            )}
+            {prospect.generatedReviewUrl && (
+              <div className="inline-flex items-center gap-1.5 flex-wrap">
+                <span className="font-semibold text-slate-700">Generated Review Service:</span>
+                <a href={prospect.generatedReviewUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-1 font-medium break-all">
+                  {prospect.generatedReviewUrl} <ExternalLink className="w-3 h-3 shrink-0" />
+                </a>
+              </div>
+            )}
+          </div>
+        )}
         {/* A/B/C version tabs — shown when multiple versions are available */}
         {!loadingEmail && prospect.generatedEmail?.emailVersions && prospect.generatedEmail.emailVersions.length > 1 && (
-          <div className="flex items-center gap-1.5 px-4 py-2 border-b border-border/50 bg-muted/10">
+          <div className="flex items-center gap-1.5 px-4 py-2 border-b border-border/50 bg-muted/10 flex-wrap">
             <span className="text-xs text-muted-foreground mr-1">Variant:</span>
             {prospect.generatedEmail.emailVersions.map(v => (
               <button
@@ -1912,13 +3647,13 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
                 {v.version}
               </button>
             ))}
-            <span className="ml-auto text-xs text-muted-foreground">Pick the best variant before sending</span>
+            <span className="ml-auto text-xs text-muted-foreground hidden sm:inline">Pick the best variant before sending</span>
           </div>
         )}
-        {loadingEmail ? <LoadingSpinner text="Crafting personalized email…" /> : prospect.generatedEmail ? (
+        {loadingEmail ? <OutreachCopySkeleton label={`Crafting personalized cold email for ${prospect.businessName}…`} /> : prospect.generatedEmail ? (
           <div className="p-4 space-y-3">
             {prospect.email && (
-              <div className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
+              <div className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2 break-all">
                 Sending to: <span className="font-semibold text-foreground">{prospect.email}</span>
               </div>
             )}
@@ -1930,14 +3665,28 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
             </div>
             <Textarea value={prospect.generatedEmail.body}
               onChange={e => onUpdate({ ...prospect, generatedEmail: { ...prospect.generatedEmail!, body: e.target.value } })}
-              rows={10} className="text-sm font-mono" />
+              rows={7} className="text-sm" />
             {!prospect.email && (
               <div className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
                 No email address for this prospect — add one to enable sending.
               </div>
             )}
           </div>
-        ) : <div className="p-6 text-center text-sm text-muted-foreground">Click Generate to create a personalized email for {prospect.businessName}</div>}
+        ) : (
+          <div className="p-6 text-center space-y-3">
+            <p className="text-sm text-muted-foreground">
+              Generate a personalized cold email for <strong>{prospect.businessName}</strong>
+            </p>
+            <Button
+              onClick={genEmail}
+              disabled={loadingEmail}
+              className="gap-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold w-full sm:w-auto"
+            >
+              <Mail className="w-4 h-4" />
+              Generate Cold Email
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* WhatsApp */}
@@ -1963,7 +3712,7 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
             )}
           </div>
         </div>
-        {loadingWA ? <LoadingSpinner text="Writing WhatsApp message…" /> : prospect.generatedWhatsApp ? (
+        {loadingWA ? <OutreachCopySkeleton label="Writing high-response WhatsApp outreach message…" /> : prospect.generatedWhatsApp ? (
           <div className="p-4">
             <Textarea value={prospect.generatedWhatsApp}
               onChange={e => onUpdate({ ...prospect, generatedWhatsApp: e.target.value })} rows={5} className="text-sm" />
@@ -1983,7 +3732,7 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
             </Button>
           </div>
         </div>
-        {loadingLI ? <LoadingSpinner text="Writing LinkedIn message…" /> : prospect.generatedLinkedIn ? (
+        {loadingLI ? <OutreachCopySkeleton label="Writing LinkedIn decision-maker connection note…" /> : prospect.generatedLinkedIn ? (
           <div className="p-4">
             <Textarea value={prospect.generatedLinkedIn}
               onChange={e => onUpdate({ ...prospect, generatedLinkedIn: e.target.value })} rows={3} className="text-sm" />
@@ -2013,7 +3762,7 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
             {followup && <CopyButton text={`Subject: ${followup.subject}\n\n${followup.body}`} />}
           </div>
         </div>
-        {loadingFollowup ? <LoadingSpinner text="Writing follow-up…" /> : followup ? (
+        {loadingFollowup ? <OutreachCopySkeleton label={`Writing Day ${followupDay} follow-up sequence…`} /> : followup ? (
           <div className="p-4 space-y-3">
             <div className="bg-muted/30 rounded-lg p-3">
               <div className="text-xs font-bold text-muted-foreground mb-1">SUBJECT</div>
@@ -2022,6 +3771,700 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
             <Textarea value={followup.body} onChange={e => setFollowup({ ...followup, body: e.target.value })} rows={6} className="text-sm" />
           </div>
         ) : <div className="p-6 text-center text-sm text-muted-foreground">Generate follow-ups for Day 3, 7, 14, or 30</div>}
+      </div>
+    </div>
+  );
+}
+
+// ─── AI Studio Voice-Note Pitch & Outbound AI Machine Phone Caller Cockpit ──
+
+const STUDIO_VOICES = [
+  {
+    id: "Kore",
+    shortName: "👩🏼 Sarah (US Female)",
+    label: "Sarah (Kore) — Warm US Female Executive · Upbeat",
+    lang: "en-US",
+    gender: "female",
+    pitch: 1.2,
+    rate: 1.04,
+  },
+  {
+    id: "Charon",
+    shortName: "🧔🏻‍♂️ Marcus (Deep Male)",
+    label: "Marcus (Charon) — Deep Baritone Male Consultant · Authoritative",
+    lang: "en-US",
+    gender: "male",
+    pitch: 0.68,
+    rate: 0.88,
+  },
+  {
+    id: "Puck",
+    shortName: "👨🏻‍💻 Ryan (Fast Founder)",
+    label: "Ryan (Puck) — Fast Silicon Valley Male Founder · Energetic",
+    lang: "en-US",
+    gender: "male",
+    pitch: 1.05,
+    rate: 1.15,
+  },
+  {
+    id: "Zephyr",
+    shortName: "🇬🇧 Victoria (UK Female)",
+    label: "Victoria (Zephyr) — Crisp British UK Female Agency Director",
+    lang: "en-GB",
+    gender: "female",
+    pitch: 1.14,
+    rate: 0.98,
+  },
+  {
+    id: "Fenrir",
+    shortName: "🦅 Viktor (Bold Closer)",
+    label: "Viktor (Fenrir) — Bold Wall Street Male Closer · Direct",
+    lang: "en-US",
+    gender: "male",
+    pitch: 0.78,
+    rate: 1.08,
+  },
+  {
+    id: "Orus",
+    shortName: "🌍 Tunde (Global Male)",
+    label: "Tunde (Orus) — Warm Global / Nigerian Male Executive Advisor",
+    lang: "en-NG",
+    gender: "male",
+    pitch: 0.85,
+    rate: 0.94,
+  },
+];
+
+function AIVoiceAndMachineCallerCockpit({
+  prospect,
+  onUpdate,
+  enableVoiceNote,
+  enableMachineCaller,
+}: {
+  prospect: Prospect;
+  onUpdate: (p: Prospect) => void;
+  enableVoiceNote: boolean;
+  enableMachineCaller: boolean;
+}) {
+  const [selectedVoice, setSelectedVoice] = useState<string>(prospect.voicePitchVoiceName || "Kore");
+  const [generatingVoice, setGeneratingVoice] = useState(false);
+  const [speakingBrowser, setSpeakingBrowser] = useState(false);
+  const [sendingVoiceEmail, setSendingVoiceEmail] = useState(false);
+  const [placingCall, setPlacingCall] = useState(false);
+  const [checkingCall, setCheckingCall] = useState(false);
+  const [dialPhone, setDialPhone] = useState(prospect.phone || "");
+  const [showKeyManager, setShowKeyManager] = useState(false);
+  const [callerConfig, setCallerConfig] = useState<any>(null);
+  const [newKeyProvider, setNewKeyProvider] = useState<"retell" | "bland" | "vapi">("bland");
+  const [newKeyLabel, setNewKeyLabel] = useState("");
+  const [newKeyValue, setNewKeyValue] = useState("");
+  const [newKeyFromNumber, setNewKeyFromNumber] = useState("");
+  const [savingKey, setSavingKey] = useState(false);
+  const [feedback, setFeedback] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    setDialPhone(prospect.phone || "");
+  }, [prospect.phone]);
+
+  const loadCallerConfig = useCallback(async () => {
+    try {
+      const r = await authFetch("/api/crm/voice-caller/config");
+      if (r.ok) {
+        const d = await r.json();
+        setCallerConfig(d.config || null);
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    if (enableMachineCaller) loadCallerConfig();
+  }, [enableMachineCaller, loadCallerConfig]);
+
+  const stopSpeaking = useCallback(() => {
+    if (activeAudioRef.current) {
+      try {
+        activeAudioRef.current.pause();
+        activeAudioRef.current.currentTime = 0;
+      } catch {}
+      activeAudioRef.current = null;
+    }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    setSpeakingBrowser(false);
+  }, []);
+
+  const playWavUrl = useCallback(
+    (wavUrl: string) => {
+      stopSpeaking();
+      const audio = new Audio(wavUrl);
+      activeAudioRef.current = audio;
+      setSpeakingBrowser(true);
+      audio.onended = () => {
+        setSpeakingBrowser(false);
+        activeAudioRef.current = null;
+      };
+      audio.onerror = () => {
+        setSpeakingBrowser(false);
+        activeAudioRef.current = null;
+      };
+      audio.play().catch(() => {
+        setSpeakingBrowser(false);
+        activeAudioRef.current = null;
+      });
+    },
+    [stopSpeaking]
+  );
+
+  const speakBrowserFallback = useCallback(
+    (textToSpeak: string, voiceId: string) => {
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+      stopSpeaking();
+      const utter = new SpeechSynthesisUtterance(textToSpeak);
+      const voices = window.speechSynthesis.getVoices();
+      const voiceMeta = STUDIO_VOICES.find((v) => v.id === voiceId) || STUDIO_VOICES[0];
+
+      const isFemale = voiceMeta.gender === "female";
+      const femaleKeywords = ["Female", "Samantha", "Victoria", "Karen", "Zira", "Aria", "Jenny", "Google UK English Female", "Moira", "Tessa"];
+      const maleKeywords = ["Male", "Daniel", "Alex", "David", "Guy", "Christopher", "Google UK English Male", "Aaron", "Fred", "Arthur"];
+      const targetKeywords = isFemale ? femaleKeywords : maleKeywords;
+
+      const matchedVoice =
+        voices.find(
+          (v) =>
+            v.lang.toLowerCase().startsWith(voiceMeta.lang.toLowerCase()) &&
+            targetKeywords.some((kw) => v.name.toLowerCase().includes(kw.toLowerCase()))
+        ) ||
+        voices.find((v) => targetKeywords.some((kw) => v.name.toLowerCase().includes(kw.toLowerCase()))) ||
+        voices.find((v) => v.lang.toLowerCase().startsWith(voiceMeta.lang.toLowerCase())) ||
+        voices[STUDIO_VOICES.findIndex((v) => v.id === voiceId) % Math.max(1, voices.length)];
+
+      if (matchedVoice) utter.voice = matchedVoice;
+      utter.pitch = voiceMeta.pitch;
+      utter.rate = voiceMeta.rate;
+      setSpeakingBrowser(true);
+      utter.onend = () => setSpeakingBrowser(false);
+      utter.onerror = () => setSpeakingBrowser(false);
+      window.speechSynthesis.speak(utter);
+    },
+    [stopSpeaking]
+  );
+
+  const generateStudioVoicePitch = async (
+    overrideVoiceName?: string,
+    autoPlayAfter = true,
+    regenerateScriptForVoice = false
+  ) => {
+    const targetVoice = overrideVoiceName || selectedVoice;
+    stopSpeaking();
+    setGeneratingVoice(true);
+    setFeedback(null);
+    try {
+      const data = await callCRM("generate-voice-pitch", {
+        businessName: prospect.businessName,
+        ownerName: prospect.ownerName,
+        ownerRole: prospect.ownerRole,
+        category: prospect.category,
+        city: prospect.city,
+        website: prospect.website,
+        cmsPlatform: prospect.cmsPlatform,
+        missingSignals: prospect.missingSignals,
+        painPoint: prospect.painPoint,
+        reportUrl: prospect.reportUrl || "",
+        agencyName: AGENCY_NAME,
+        voiceName: targetVoice,
+        customScript: regenerateScriptForVoice ? "" : prospect.voicePitchScript || "",
+        regenerateScriptForVoice,
+      });
+      onUpdate({
+        ...prospect,
+        voicePitchScript: data.script,
+        voicePitchVoiceName: targetVoice,
+        voicePitchWavBase64: data.wavBase64 || undefined,
+        voicePitchWavDataUrl: data.wavDataUrl || undefined,
+      });
+      setFeedback({
+        type: "ok",
+        text: data.wavDataUrl
+          ? `✓ Studio Voice Ready: ${data.voiceLabel || targetVoice} (${data.engine})`
+          : `✓ Voice Script Ready (${data.voiceLabel || targetVoice}) — playing neural voice!`,
+      });
+      if (autoPlayAfter) {
+        if (data.wavDataUrl) {
+          playWavUrl(data.wavDataUrl);
+        } else if (data.script) {
+          speakBrowserFallback(data.script, targetVoice);
+        }
+      }
+    } catch (e: any) {
+      setFeedback({ type: "err", text: e.message || "Failed to generate voice pitch" });
+    } finally {
+      setGeneratingVoice(false);
+    }
+  };
+
+  const handleVoicePersonaChange = (nextVoice: string) => {
+    setSelectedVoice(nextVoice);
+    // Automatically synthesize & preview the newly selected persona so every voice sounds distinct immediately
+    generateStudioVoicePitch(nextVoice, true, true);
+  };
+
+  const speakWithNeuralVoice = async () => {
+    // If we already have a Studio WAV generated for THIS exact selectedVoice, play it immediately
+    if (prospect.voicePitchWavDataUrl && prospect.voicePitchVoiceName === selectedVoice) {
+      playWavUrl(prospect.voicePitchWavDataUrl);
+      return;
+    }
+    // Otherwise synthesize the real Studio WAV for selectedVoice on the server and play it
+    await generateStudioVoicePitch(selectedVoice, true, false);
+  };
+
+  const sendVoiceEmailToLead = async () => {
+    if (!prospect.email) {
+      setFeedback({ type: "err", text: "Add an email address for this prospect first." });
+      return;
+    }
+    setSendingVoiceEmail(true);
+    setFeedback(null);
+    try {
+      const resp = await callCRM("send-voice-email", {
+        to: prospect.email,
+        businessName: prospect.businessName,
+        ownerName: prospect.ownerName,
+        script: prospect.voicePitchScript,
+        wavBase64: prospect.voicePitchWavBase64,
+        reportUrl: prospect.reportUrl,
+      });
+      onUpdate({
+        ...prospect,
+        status: "contacted",
+        emailSentAt: new Date().toISOString(),
+      });
+      setFeedback({
+        type: "ok",
+        text: `✓ AI Voice-Note (.wav) + Audit Link emailed to ${prospect.email} via ${resp.sentVia || "SMTP Pool"}!`,
+      });
+    } catch (e: any) {
+      setFeedback({ type: "err", text: e.message || "Failed to send voice email" });
+    } finally {
+      setSendingVoiceEmail(false);
+    }
+  };
+
+  const triggerOutboundMachineCall = async () => {
+    if (!dialPhone.trim()) {
+      setFeedback({ type: "err", text: "Enter the business's phone number to launch an AI Machine Call." });
+      return;
+    }
+    setPlacingCall(true);
+    setFeedback(null);
+    try {
+      const resp = await callCRM("voice-caller/call", {
+        phone: dialPhone.trim(),
+        businessName: prospect.businessName,
+        ownerName: prospect.ownerName,
+        ownerRole: prospect.ownerRole,
+        category: prospect.category,
+        city: prospect.city,
+        website: prospect.website,
+        cmsPlatform: prospect.cmsPlatform,
+        missingSignals: prospect.missingSignals,
+        painPoint: prospect.painPoint,
+        reportUrl: prospect.reportUrl || "",
+        customScript: prospect.voicePitchScript || "",
+      });
+      onUpdate({
+        ...prospect,
+        phone: dialPhone.trim(),
+        status: "contacted",
+        lastMachineCallId: resp.callId,
+        lastMachineCallProvider: resp.provider,
+        lastMachineCallStatus: resp.status || "ringing",
+      });
+      setFeedback({
+        type: "ok",
+        text: `📞 AI Machine Caller (${resp.provider.toUpperCase()}) is now ringing ${resp.calledNumber}! The AI voice agent will pitch ${prospect.businessName} automatically.`,
+      });
+      loadCallerConfig();
+    } catch (e: any) {
+      setFeedback({ type: "err", text: e.message || "Failed to launch AI machine call" });
+    } finally {
+      setPlacingCall(false);
+    }
+  };
+
+  const checkLiveCallStatus = async () => {
+    if (!prospect.lastMachineCallId) return;
+    setCheckingCall(true);
+    try {
+      const r = await authFetch(`/api/crm/voice-caller/status/${encodeURIComponent(prospect.lastMachineCallId)}`);
+      const d = await r.json();
+      if (r.ok) {
+        onUpdate({
+          ...prospect,
+          lastMachineCallStatus: d.status || prospect.lastMachineCallStatus,
+          lastMachineCallTranscript: d.transcript || prospect.lastMachineCallTranscript,
+          lastMachineCallRecordingUrl: d.recordingUrl || prospect.lastMachineCallRecordingUrl,
+        });
+        setFeedback({
+          type: "ok",
+          text: `Call Status: ${(d.status || "in-progress").toUpperCase()}${d.durationSeconds ? ` · Duration: ${d.durationSeconds}s` : ""}`,
+        });
+      }
+    } catch (e: any) {
+      setFeedback({ type: "err", text: e.message });
+    } finally {
+      setCheckingCall(false);
+    }
+  };
+
+  const handleAddCallerKey = async () => {
+    if (!newKeyValue.trim()) return;
+    setSavingKey(true);
+    try {
+      const r = await authFetch("/api/crm/voice-caller/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newKey: {
+            provider: newKeyProvider,
+            label: newKeyLabel.trim() || `${newKeyProvider.toUpperCase()} Key`,
+            apiKey: newKeyValue.trim(),
+            fromNumber: newKeyFromNumber.trim(),
+          },
+        }),
+      });
+      const d = await r.json();
+      if (d.config) setCallerConfig(d.config);
+      setNewKeyValue("");
+      setNewKeyLabel("");
+      setFeedback({ type: "ok", text: `✓ Added ${newKeyProvider.toUpperCase()} API key to AI Machine Caller rotation pool!` });
+    } catch (e: any) {
+      setFeedback({ type: "err", text: e.message });
+    } finally {
+      setSavingKey(false);
+    }
+  };
+
+  const handleRemoveCallerKey = async (id: string) => {
+    const r = await authFetch("/api/crm/voice-caller/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ removeKeyId: id }),
+    });
+    const d = await r.json();
+    if (d.config) setCallerConfig(d.config);
+  };
+
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-950 text-white overflow-hidden shadow-xl">
+      <div className="p-4 border-b border-slate-800 bg-gradient-to-r from-slate-950 via-indigo-950/70 to-slate-950 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h4 className="font-extrabold text-sm flex items-center gap-2 text-white">
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+            🎙️ AI Human Voice-Note Studio ($0 Free) &amp; 🤖 Outbound AI Machine Phone Caller
+          </h4>
+          <p className="text-xs text-slate-300 mt-0.5">
+            Let realistic AI human voices pitch <strong>{prospect.businessName}</strong> for you—zero Nigerian SIM airtime required.
+          </p>
+        </div>
+        {enableMachineCaller && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setShowKeyManager((v) => !v)}
+            className="h-7 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-amber-300 border-slate-700 gap-1"
+          >
+            <Settings className="w-3.5 h-3.5" />
+            {showKeyManager ? "Hide Caller Key Pool" : `⚙️ AI Caller Pool (${callerConfig?.keys?.length || 0} Keys)`}
+          </Button>
+        )}
+      </div>
+
+      {feedback && (
+        <div
+          className={`mx-4 mt-3 px-3 py-2 rounded-lg text-xs font-semibold border ${
+            feedback.type === "ok"
+              ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+              : "bg-rose-500/15 text-rose-300 border-rose-500/30"
+          }`}
+        >
+          {feedback.text}
+        </div>
+      )}
+
+      {/* Expandable Free-Credit Key Pool Manager (Bland AI / Retell AI / Vapi) */}
+      {enableMachineCaller && showKeyManager && (
+        <div className="m-4 p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-3">
+          <div className="flex items-start justify-between gap-2 flex-wrap">
+            <div>
+              <div className="text-xs font-extrabold uppercase tracking-wider text-amber-400">
+                Free-Credit Outbound AI Phone Caller Key Pool (Multi-Account Rotation)
+              </div>
+              <p className="text-xs text-slate-300 mt-0.5">
+                Get free outbound AI phone calling credits from{" "}
+                <a href="https://www.retellai.com" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline font-semibold">Retell.ai ($10 free)</a>,{" "}
+                <a href="https://www.bland.ai" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline font-semibold">Bland.ai (Free Sandbox)</a>, or{" "}
+                <a href="https://vapi.ai" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline font-semibold">Vapi.ai ($5 free)</a>. Paste unlimited keys below—the engine rotates across them automatically!
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+            <select
+              value={newKeyProvider}
+              onChange={(e) => setNewKeyProvider(e.target.value as any)}
+              className="px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-xs font-bold text-white"
+            >
+              <option value="bland">Bland.ai (No From-# Needed)</option>
+              <option value="retell">Retell.ai ($10 Free Credits)</option>
+              <option value="vapi">Vapi.ai ($5 Free Credits)</option>
+            </select>
+            <Input
+              value={newKeyLabel}
+              onChange={(e) => setNewKeyLabel(e.target.value)}
+              placeholder="Account label (optional)"
+              className="bg-slate-950 border-slate-700 text-white text-xs h-9"
+            />
+            <Input
+              value={newKeyValue}
+              onChange={(e) => setNewKeyValue(e.target.value)}
+              placeholder="Paste API Key (sk-... or org_...)"
+              className="bg-slate-950 border-slate-700 text-white text-xs h-9"
+            />
+            <div className="flex gap-1.5">
+              {newKeyProvider !== "bland" && (
+                <Input
+                  value={newKeyFromNumber}
+                  onChange={(e) => setNewKeyFromNumber(e.target.value)}
+                  placeholder="From # (+1...)"
+                  className="bg-slate-950 border-slate-700 text-white text-xs h-9"
+                />
+              )}
+              <Button
+                size="sm"
+                onClick={handleAddCallerKey}
+                disabled={savingKey || !newKeyValue.trim()}
+                className="h-9 bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-xs shrink-0"
+              >
+                + Add Key
+              </Button>
+            </div>
+          </div>
+
+          {callerConfig?.keys && callerConfig.keys.length > 0 && (
+            <div className="space-y-1.5 pt-2">
+              {callerConfig.keys.map((k: any) => (
+                <div key={k.id} className="flex items-center justify-between px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-xs">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                    <span className="font-bold uppercase text-amber-300">{k.provider}</span>
+                    <span className="text-slate-200">{k.label}</span>
+                    <span className="font-mono text-slate-400">{k.apiKeyMasked}</span>
+                    <span className="text-slate-400">· {k.callsMade || 0} calls placed</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveCallerKey(k.id)}
+                    className="text-rose-400 hover:text-rose-300 text-xs font-bold cursor-pointer"
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="p-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Column 1: 100% Free Forever Studio AI Voice-Note Pitch */}
+        {enableVoiceNote && (
+          <div className="rounded-xl bg-slate-900 border border-slate-800 p-4 space-y-3 flex flex-col justify-between">
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <span className="text-xs font-extrabold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                  🎙️ 1. Studio AI Voice-Note Pitch ($0 Free Forever)
+                </span>
+                <select
+                  value={selectedVoice}
+                  onChange={(e) => handleVoicePersonaChange(e.target.value)}
+                  disabled={generatingVoice}
+                  className="px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-700 text-xs font-semibold text-slate-200 cursor-pointer"
+                >
+                  {STUDIO_VOICES.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {STUDIO_VOICES.map((v) => {
+                  const isSelected = selectedVoice === v.id;
+                  return (
+                    <button
+                      key={v.id}
+                      type="button"
+                      disabled={generatingVoice}
+                      onClick={() => handleVoicePersonaChange(v.id)}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all cursor-pointer ${
+                        isSelected
+                          ? "bg-emerald-500 text-slate-950 border-emerald-400 shadow-sm"
+                          : "bg-slate-950 text-slate-300 border-slate-800 hover:border-emerald-500/50 hover:text-white"
+                      }`}
+                    >
+                      {v.shortName}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <Textarea
+                value={
+                  prospect.voicePitchScript ||
+                  `Hey ${prospect.ownerName ? prospect.ownerName.split(" ")[0] : `there at ${prospect.businessName}`}, Sarah here! I was just looking at ${prospect.businessName}${prospect.city ? ` in ${prospect.city}` : ""}${prospect.cmsPlatform ? ` built on ${prospect.cmsPlatform}` : ""}, and noticed your website currently has ${(prospect.missingSignals && prospect.missingSignals[0]) ? prospect.missingSignals[0].toLowerCase() : "no 24/7 AI live chat or instant booking widget"}—which usually causes 30 to 40 percent of after-hours customers to call a competitor instead. I just recorded a custom Website Audit Report showing how to fix this in 48 hours and sent the link to your email. Take a quick 60-second look!`
+                }
+                onChange={(e) => onUpdate({ ...prospect, voicePitchScript: e.target.value })}
+                rows={4}
+                className="bg-slate-950 border-slate-800 text-slate-100 text-xs leading-relaxed"
+              />
+
+              {prospect.voicePitchWavDataUrl && (
+                <div className="p-2.5 rounded-lg bg-slate-950 border border-emerald-500/30 space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px] text-emerald-300 font-bold">
+                    <span>
+                      🎧 Studio Human Voice Recording ({STUDIO_VOICES.find((v) => v.id === (prospect.voicePitchVoiceName || selectedVoice))?.shortName || selectedVoice})
+                    </span>
+                    <a
+                      href={prospect.voicePitchWavDataUrl}
+                      download={`Voice-Pitch-${(prospect.voicePitchVoiceName || selectedVoice)}-${prospect.businessName.replace(/[^a-zA-Z0-9]/g, "-")}.wav`}
+                      className="text-amber-300 hover:underline"
+                    >
+                      📥 Download .WAV for WhatsApp
+                    </a>
+                  </div>
+                  <audio key={prospect.voicePitchVoiceName || selectedVoice} controls src={prospect.voicePitchWavDataUrl} className="w-full h-8" />
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 pt-2">
+              <Button
+                size="sm"
+                onClick={() => generateStudioVoicePitch(selectedVoice, true, false)}
+                disabled={generatingVoice}
+                className="h-8 text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white gap-1.5"
+              >
+                {generatingVoice ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                {generatingVoice ? "Synthesizing Studio Voice…" : "🎙️ Generate Studio AI Voice (.WAV)"}
+              </Button>
+
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={speakingBrowser ? stopSpeaking : speakWithNeuralVoice}
+                className="h-8 text-xs font-bold bg-slate-800 hover:bg-slate-700 text-white border-slate-700 gap-1.5"
+              >
+                {speakingBrowser ? <StopCircle className="w-3.5 h-3.5 text-rose-400" /> : <PlayCircle className="w-3.5 h-3.5 text-amber-400" />}
+                {speakingBrowser ? "Stop Voice" : "🔊 Speak Out Loud Now"}
+              </Button>
+
+              {prospect.email && (
+                <Button
+                  size="sm"
+                  onClick={sendVoiceEmailToLead}
+                  disabled={sendingVoiceEmail}
+                  className="h-8 text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white gap-1.5"
+                >
+                  {sendingVoiceEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                  {sendingVoiceEmail ? "Emailing Voice Note…" : "✉ Email Voice Note to Lead"}
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Column 2: Outbound AI Machine Phone Caller (Rings Their Actual Business Phone) */}
+        {enableMachineCaller && (
+          <div className="rounded-xl bg-slate-900 border border-slate-800 p-4 space-y-3 flex flex-col justify-between">
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-extrabold uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                  🤖 2. Outbound AI Machine Phone Caller (Hands-Free)
+                </span>
+                {prospect.lastMachineCallStatus && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-amber-400/20 text-amber-300 border border-amber-400/30">
+                    Status: {prospect.lastMachineCallStatus}
+                  </span>
+                )}
+              </div>
+
+              <p className="text-xs text-slate-300 leading-relaxed">
+                Dials <strong>{prospect.businessName}</strong> from the cloud using your connected AI Caller Pool (Bland / Retell / Vapi). When they pick up, the <strong>AI Voice Machine</strong> speaks the script on the left, answers questions about your audit report, and saves the call transcript here.
+              </p>
+
+              <div>
+                <label className="text-[11px] font-bold text-slate-400 mb-1 block">
+                  Business Phone Number to Ring (E.164 or Local Format)
+                </label>
+                <div className="flex gap-2">
+                  <Input
+                    value={dialPhone}
+                    onChange={(e) => setDialPhone(e.target.value)}
+                    placeholder="+1 (512) 555-0199"
+                    className="bg-slate-950 border-slate-700 text-white text-xs h-9 font-mono"
+                  />
+                  <Button
+                    size="sm"
+                    onClick={triggerOutboundMachineCall}
+                    disabled={placingCall}
+                    className="h-9 px-4 bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-xs gap-1.5 shrink-0"
+                  >
+                    {placingCall ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Phone className="w-3.5 h-3.5" />}
+                    {placingCall ? "Dialing…" : "🤖 Launch AI Machine Call"}
+                  </Button>
+                </div>
+              </div>
+
+              {prospect.lastMachineCallTranscript && (
+                <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1 max-h-32 overflow-y-auto">
+                  <div className="text-[10px] font-bold uppercase text-amber-400">Live AI Machine Call Transcript</div>
+                  <p className="text-xs text-slate-200 whitespace-pre-wrap">{prospect.lastMachineCallTranscript}</p>
+                </div>
+              )}
+
+              {prospect.lastMachineCallRecordingUrl && (
+                <div className="p-2 rounded-lg bg-slate-950 border border-slate-800">
+                  <div className="text-[10px] font-bold uppercase text-emerald-400 mb-1">Call Recording</div>
+                  <audio controls src={prospect.lastMachineCallRecordingUrl} className="w-full h-8" />
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/80">
+              <div className="text-[11px] text-slate-400">
+                {callerConfig?.keys?.length > 0
+                  ? `✓ ${callerConfig.keys.length} AI Caller Key(s) active in rotation pool`
+                  : "💡 Click '⚙️ AI Caller Pool' above to paste a free Retell/Bland/Vapi key"}
+              </div>
+              {prospect.lastMachineCallId && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={checkLiveCallStatus}
+                  disabled={checkingCall}
+                  className="h-7 text-[11px] font-bold bg-slate-800 hover:bg-slate-700 text-white border-slate-700 gap-1"
+                >
+                  <RefreshCw className={`w-3 h-3 ${checkingCall ? "animate-spin" : ""}`} />
+                  Refresh Call Transcript
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2051,24 +4494,66 @@ function ProposalPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
 
   const generate = async () => {
     setLoading(true); setError("");
+    const a = prospect.analysis;
+    const fallbackProposal: ProposalData = {
+      sections: {
+        executiveSummary: `${AGENCY_NAME} has prepared this turnkey digital conversion and automation proposal for ${prospect.businessName} to capture more high-intent ${prospect.category || "local"} customers and automate 24/7 lead response.`,
+        situation: prospect.website
+          ? `${prospect.businessName} currently operates ${prospect.website}, which lacks an interactive mobile booking funnel and 24/7 automated receptionist.`
+          : `${prospect.businessName} currently lacks a dedicated high-converting website and automated 24/7 booking funnel.`,
+        problems: [
+          "Prospective mobile customers face friction when trying to request pricing or book an appointment.",
+          "After-hours and peak-hour inquiries go unanswered without an automated 24/7 AI receptionist.",
+          "Satisfied customers are not systematically routed into a 5-Star Google Review Shield.",
+        ],
+        solution: `${AGENCY_NAME} will deploy a custom 4-Tap Conversion Website, 24/7 Spoken AI Receptionist, and 5-Star Review Shield tailored for ${prospect.businessName}.`,
+        features: [
+          { name: "4-Tap Instant Quote & Booking Funnel", desc: "Converts mobile visitors into qualified leads in under 15 seconds without long forms." },
+          { name: "24/7 Spoken AI Receptionist", desc: "Greets visitors with a natural studio voice, answers FAQs, and captures phone numbers." },
+          { name: "5-Star Review Shield", desc: "Routes 4–5 star ratings to Google Maps while privately intercepting 1–3 star feedback." },
+        ],
+        benefits: [
+          "25–40% lift in mobile lead conversion",
+          "Zero missed after-hours inquiries",
+          "Faster response times and higher booked-job volume",
+          "Protected 5-star Google Maps reputation",
+          "Full ownership and easy 1-click admin customization",
+        ],
+        timeline: [
+          { week: customDuration.trim() ? customDuration.trim() : "Days 1–3", task: "Custom brand design, local copy, and 4-tap funnel configuration" },
+          { week: "Days 4–7", task: "24/7 AI receptionist training, domain connection, and live launch" },
+        ],
+        investment: customPrice.trim() || (a?.estimatedValue?.min ? `$${a.estimatedValue.min.toLocaleString()} – $${a.estimatedValue.max.toLocaleString()}` : "$1,500 Turnkey Setup"),
+        whyUs: [
+          `Specialized in high-converting ${prospect.category || "local service"} digital systems`,
+          "Rapid 5-to-7 day turnkey deployment with zero downtime",
+          "Proven 4-tap mobile funnel architecture",
+        ],
+        nextSteps: [
+          "Approve this proposal and select your preferred launch date",
+          "We configure your custom site, AI receptionist, and domain",
+          "Go live and start capturing new customer inquiries immediately",
+        ],
+      },
+    };
     try {
-      const a = prospect.analysis;
       const data = await callCRM("generate-proposal", {
         businessName: prospect.businessName, category: prospect.category,
         website: prospect.website, agencyName: AGENCY_NAME,
-        issues: a?.issues.map(i => i.title).join(", ") || "",
-        features: a?.recommendedFeatures.join(", ") || "",
-        estimatedValue: a ? `${a.estimatedValue.min.toLocaleString()} – ${a.estimatedValue.max.toLocaleString()}` : "",
+        issues: (a?.issues || []).map(i => i.title).join(", ") || "",
+        features: (a?.recommendedFeatures || []).join(", ") || "",
+        estimatedValue: a?.estimatedValue?.min ? `${a.estimatedValue.min.toLocaleString()} – ${a.estimatedValue.max.toLocaleString()}` : "",
         customPrice: customPrice.trim() || undefined,
         customDuration: customDuration.trim() || undefined,
       });
-      onUpdate({ ...prospect, proposal: data });
-    } catch (e: any) { setError(e.message); }
-    finally { setLoading(false); }
+      onUpdate({ ...prospect, proposal: data?.sections ? data : fallbackProposal });
+    } catch {
+      onUpdate({ ...prospect, proposal: fallbackProposal });
+    } finally { setLoading(false); }
   };
 
   const p = prospect.proposal?.sections;
-  if (loading) return <LoadingSpinner text="AI is generating your proposal…" />;
+  if (loading) return <ProposalGenerationSkeleton businessName={prospect.businessName} />;
 
   if (!p) return (
     <div className="text-center py-12">
@@ -2164,30 +4649,82 @@ function ProspectDetail({ prospect, onUpdate, onDelete, onBack }: {
   onBack: () => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const [deepScanning, setDeepScanning] = useState(false);
+  const [detailTab, setDetailTab] = useState("analysis");
+  const apolloCfg = useApolloConfig();
+  const trainedOffer = useTrainedOfferSummary();
   const cfg = STATUS_CONFIG[prospect.status];
+  const offerRes = resolveAuditMatchedOffer(prospect, trainedOffer);
+
+  const runLiveApolloScan = async () => {
+    setDeepScanning(true);
+    try {
+      const data = await callCRM("apollo-enrich", {
+        website: prospect.website,
+        businessName: prospect.businessName,
+        category: prospect.category,
+        email: prospect.email,
+        phone: prospect.phone,
+      });
+      onUpdate({
+        ...prospect,
+        ownerName: data.ownerName || prospect.ownerName,
+        ownerRole: data.ownerRole || prospect.ownerRole,
+        linkedin: data.linkedin || prospect.linkedin,
+        facebook: data.facebook || prospect.facebook,
+        instagram: data.instagram || prospect.instagram,
+        cmsPlatform: data.cmsPlatform || prospect.cmsPlatform,
+        techStack: Array.isArray(data.techStack) ? data.techStack : prospect.techStack,
+        missingSignals: Array.isArray(data.missingSignals) ? data.missingSignals : prospect.missingSignals,
+        buyerIntentScore: data.buyerIntentScore ?? prospect.buyerIntentScore,
+        intentTier: data.intentTier || prospect.intentTier,
+        intentReasons: Array.isArray(data.intentReasons) ? data.intentReasons : prospect.intentReasons,
+      });
+    } catch {}
+    finally { setDeepScanning(false); }
+  };
+
+  const linkedinXrayUrl = prospect.linkedin || `https://www.linkedin.com/search/results/all/?keywords=${encodeURIComponent(`${prospect.ownerName || ""} ${prospect.businessName} ${prospect.city || ""}`.trim())}`;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-3">
-        <Button variant="ghost" size="sm" onClick={onBack} className="gap-1">
-          <ChevronRight className="w-4 h-4 rotate-180" /> Back
-        </Button>
-        <div className="flex-1">
-          <h2 className="font-extrabold text-xl flex items-center gap-2">
-            {prospect.businessName}
-            {prospect.hunted && <span className="text-xs font-semibold text-purple-600 bg-purple-100 px-2 py-0.5 rounded-full flex items-center gap-1"><Radar className="w-3 h-3" /> AI Hunted</span>}
-          </h2>
-          <div className="flex items-center gap-2 mt-1">
-            <Badge className={`${cfg.bg} ${cfg.color} ${cfg.border} border text-xs`}>{cfg.label}</Badge>
-            {prospect.category && <span className="text-xs text-muted-foreground">{prospect.category}</span>}
-            {prospect.city && <span className="text-xs text-muted-foreground">{prospect.city}{prospect.country ? `, ${prospect.country}` : ""}</span>}
-            {prospect.priority === "high" && <span className="text-xs font-bold text-red-600">🔴 High Priority</span>}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-2 sm:gap-3 min-w-0 flex-1">
+          <Button variant="ghost" size="sm" onClick={onBack} className="gap-1 shrink-0 px-2 sm:px-3">
+            <ChevronRight className="w-4 h-4 rotate-180" /> Back
+          </Button>
+          <div className="min-w-0 flex-1">
+            <h2 className="font-extrabold text-lg sm:text-xl flex items-center gap-2 flex-wrap break-words">
+              <span>{prospect.businessName}</span>
+              {prospect.hunted && <span className="text-xs font-semibold text-purple-600 bg-purple-100 px-2 py-0.5 rounded-full inline-flex items-center gap-1"><Radar className="w-3 h-3" /> AI Hunted</span>}
+            </h2>
+            <div className="flex items-center gap-2 mt-1 flex-wrap">
+              <Badge className={`${cfg.bg} ${cfg.color} ${cfg.border} border text-xs`}>{cfg.label}</Badge>
+              {offerRes.primaryOffer && (
+                <span className="text-xs bg-slate-100 text-slate-800 border border-slate-200 rounded-md px-2 py-0.5 font-medium">
+                  Primary Offer: <strong className="font-semibold">{offerRes.primaryOffer}</strong>
+                </span>
+              )}
+              {prospect.category && <span className="text-xs text-muted-foreground">{prospect.category}</span>}
+              {prospect.city && <span className="text-xs text-muted-foreground">{prospect.city}{prospect.country ? `, ${prospect.country}` : ""}</span>}
+              {prospect.priority === "high" && <span className="text-xs font-bold text-red-600">🔴 High Priority</span>}
+            </div>
           </div>
         </div>
-        <Button size="sm" variant="outline" onClick={() => setEditing(true)}>Edit</Button>
-        <Button size="sm" variant="ghost" className="text-destructive/70 hover:text-destructive" onClick={onDelete}>
-          <Trash2 className="w-4 h-4" />
-        </Button>
+        <div className="flex items-center gap-1.5 shrink-0 w-full sm:w-auto justify-end">
+          <Button
+            size="sm"
+            onClick={() => setDetailTab("outreach")}
+            className="flex-1 sm:flex-initial gap-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold"
+          >
+            <Mail className="w-3.5 h-3.5" />
+            {prospect.generatedEmail ? "View Cold Email" : "Generate Cold Email"}
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => setEditing(true)}>Edit</Button>
+          <Button size="sm" variant="ghost" className="text-destructive/70 hover:text-destructive" onClick={onDelete}>
+            <Trash2 className="w-4 h-4" />
+          </Button>
+        </div>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -2205,6 +4742,111 @@ function ProspectDetail({ prospect, onUpdate, onDelete, onBack }: {
           </div>
         ) : null)}
       </div>
+
+      {/* Apollo+ Live B2B Intelligence & Deep Enrichment Card */}
+      {apolloCfg.enabled && (
+        <div className="rounded-2xl border border-slate-800 bg-slate-950 text-white p-4 space-y-3 shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="px-2.5 py-0.5 rounded-full bg-amber-400/20 border border-amber-400/40 text-amber-300 text-[11px] font-extrabold uppercase tracking-wider flex items-center gap-1">
+                <Sparkles className="w-3 h-3" /> Live Lead Intelligence
+              </span>
+              {apolloCfg.intentScoring && typeof prospect.buyerIntentScore === "number" && (
+                <span className={`px-2.5 py-0.5 rounded-full text-xs font-extrabold ${
+                  prospect.buyerIntentScore >= 75
+                    ? "bg-orange-500 text-white"
+                    : prospect.buyerIntentScore >= 55
+                    ? "bg-amber-400 text-slate-950"
+                    : "bg-slate-800 text-slate-300"
+                }`}>
+                  🔥 {prospect.buyerIntentScore}/100 Buyer Intent ({(prospect.intentTier || "warm").toUpperCase()})
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {apolloCfg.decisionMaker && (
+                <a
+                  href={linkedinXrayUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold transition-colors"
+                >
+                  <Linkedin className="w-3.5 h-3.5" />
+                  {prospect.linkedin ? "Open Verified LinkedIn" : "LinkedIn Owner X-Ray"}
+                </a>
+              )}
+              <Button
+                size="sm"
+                onClick={runLiveApolloScan}
+                disabled={deepScanning}
+                className="h-8 text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white gap-1.5"
+              >
+                {deepScanning ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                {deepScanning ? "Scanning Live HTML…" : "⚡ Run Live Deep Scan"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
+            {apolloCfg.decisionMaker && (
+              <div className="rounded-xl bg-slate-900 border border-slate-800 p-3">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">Decision-Maker & Socials</div>
+                <div className="text-sm font-bold text-white">
+                  {prospect.ownerName || "Owner / Managing Director"}
+                </div>
+                <div className="text-xs text-amber-300 font-semibold mt-0.5">
+                  {prospect.ownerRole || "Executive Decision-Maker"}
+                </div>
+                <div className="flex items-center gap-2 mt-2 flex-wrap">
+                  {prospect.facebook && (
+                    <a href={prospect.facebook} target="_blank" rel="noopener noreferrer" className="text-[11px] text-blue-400 hover:underline">Facebook ↗</a>
+                  )}
+                  {prospect.instagram && (
+                    <a href={prospect.instagram} target="_blank" rel="noopener noreferrer" className="text-[11px] text-pink-400 hover:underline">Instagram ↗</a>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {apolloCfg.techStack && (
+              <div className="rounded-xl bg-slate-900 border border-slate-800 p-3">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">Detected CMS & Tech Stack</div>
+                <div className="text-sm font-bold text-white mb-1.5">
+                  🖥️ {prospect.cmsPlatform || (prospect.website ? "Click Deep Scan to Detect" : "No Website")}
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {(prospect.techStack && prospect.techStack.length > 0) ? (
+                    prospect.techStack.map((t, idx) => (
+                      <span key={idx} className="text-[10px] font-semibold px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/30">
+                        {t}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-xs text-slate-400">No active marketing/chat scripts detected</span>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {apolloCfg.techStack && (
+              <div className="rounded-xl bg-slate-900 border border-slate-800 p-3">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-rose-400 mb-1">Missing Revenue Signals (Pitch Angles)</div>
+                <div className="flex flex-wrap gap-1.5 mt-1">
+                  {(prospect.missingSignals && prospect.missingSignals.length > 0) ? (
+                    prospect.missingSignals.map((m, idx) => (
+                      <span key={idx} className="text-[11px] font-bold px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                        ⚠️ {m}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-xs text-slate-400">Run Deep Scan to uncover missing chat, booking, or ad pixels</span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         <div>
@@ -2239,12 +4881,14 @@ function ProspectDetail({ prospect, onUpdate, onDelete, onBack }: {
         </div>
       )}
 
-      <Tabs defaultValue="analysis">
-        <TabsList className="w-full">
-          <TabsTrigger value="analysis" className="flex-1">AI Analysis</TabsTrigger>
-          <TabsTrigger value="outreach" className="flex-1">Outreach</TabsTrigger>
-          <TabsTrigger value="proposal" className="flex-1">Proposal</TabsTrigger>
-          <TabsTrigger value="tracking" className="flex-1 gap-1"><Eye className="w-3.5 h-3.5" />Tracking</TabsTrigger>
+      <Tabs value={detailTab} onValueChange={setDetailTab}>
+        <TabsList className="w-full flex flex-wrap h-auto gap-1 p-1">
+          <TabsTrigger value="analysis" className="flex-1 text-xs sm:text-sm">AI Analysis</TabsTrigger>
+          <TabsTrigger value="outreach" className="flex-1 text-xs sm:text-sm gap-1">
+            <Mail className="w-3.5 h-3.5" /> Outreach
+          </TabsTrigger>
+          <TabsTrigger value="proposal" className="flex-1 text-xs sm:text-sm">Proposal</TabsTrigger>
+          <TabsTrigger value="tracking" className="flex-1 text-xs sm:text-sm gap-1"><Eye className="w-3.5 h-3.5" />Tracking</TabsTrigger>
         </TabsList>
         <TabsContent value="analysis" className="mt-4"><AnalysisPanel prospect={prospect} onUpdate={onUpdate} /></TabsContent>
         <TabsContent value="outreach" className="mt-4"><OutreachPanel prospect={prospect} onUpdate={onUpdate} /></TabsContent>
@@ -2400,12 +5044,13 @@ const AGENT_META: Record<string, { label: string; icon: string; color: string }>
   social:       { label: "Social Bot",      icon: "📱", color: "bg-pink-50 text-pink-700 border-pink-200" },
 };
 
-type SortKey = "ai-score" | "value" | "added";
+type SortKey = "ai-score" | "apollo-intent" | "value" | "added";
 
 function ProspectList({
   prospects,
   onSelect,
   onDelete,
+  onUpdate,
   projects,
   activeProjectName,
 }: {
@@ -2419,8 +5064,145 @@ function ProspectList({
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
+  const [apolloQuickFilter, setApolloQuickFilter] = useState("all");
   const [sortBy, setSortBy] = useState<SortKey>("ai-score");
   const [trackingStats, setTrackingStats] = useState<Record<string, TrackingStats>>({});
+  const [openEmailIds, setOpenEmailIds] = useState<Record<number, boolean>>({});
+  const [loadingEmailIds, setLoadingEmailIds] = useState<Record<number, boolean>>({});
+  const [loadingSiteIds, setLoadingSiteIds] = useState<Record<number, boolean>>({});
+  const [loadingReviewIds, setLoadingReviewIds] = useState<Record<number, boolean>>({});
+  const [sendingEmailIds, setSendingEmailIds] = useState<Record<number, boolean>>({});
+  const apolloCfg = useApolloConfig();
+  const trainedOffer = useTrainedOfferSummary();
+
+  const generateInlineEmailForProspect = async (
+    p: Prospect,
+    overrides?: { websiteUrl?: string; reviewUrl?: string; siteId?: string }
+  ) => {
+    if (!onUpdate) {
+      onSelect(p);
+      return;
+    }
+    const offerRes = resolveAuditMatchedOffer(p, trainedOffer);
+    const effectiveLeadOffer = offerRes.primaryOffer || p.primaryOffer || trainedOffer.primaryOfferName;
+    const demoWebsiteUrl = overrides?.websiteUrl ?? p.generatedSiteUrl ?? "";
+    const reviewServiceUrl = overrides?.reviewUrl ?? p.generatedReviewUrl ?? "";
+    const nextSiteId = overrides?.siteId ?? p.generatedSiteId;
+
+    setLoadingEmailIds(prev => ({ ...prev, [p.id]: true }));
+    setOpenEmailIds(prev => ({ ...prev, [p.id]: true }));
+    try {
+      const data = await callCRM("generate-email", {
+        businessName: p.businessName,
+        ownerName: p.ownerName,
+        ownerRole: p.ownerRole,
+        category: p.category,
+        website: p.website,
+        city: p.city,
+        cmsPlatform: p.cmsPlatform,
+        missingSignals: p.missingSignals,
+        issues: p.painPoint || "",
+        opportunities: trainedOffer.offerDetails,
+        agencyName: AGENCY_NAME,
+        reportUrl: p.reportUrl || "",
+        primaryOffer: effectiveLeadOffer,
+        demoWebsiteUrl,
+        reviewServiceUrl,
+      });
+      const versions = Array.isArray(data?.versions) && data.versions.length > 0 ? data.versions : [];
+      const first = versions[0] || {
+        version: "A",
+        subject: data?.subject || `Quick idea for ${p.businessName} — ${effectiveLeadOffer}`,
+        body: data?.body || `Hi ${p.ownerName || `${p.businessName} Team`},\n\nI was looking at ${p.businessName}${p.city ? ` in ${p.city}` : ""} today and noticed an opportunity around ${effectiveLeadOffer} to help you capture more local clients.${demoWebsiteUrl ? `\n\n• Live Website Preview: ${demoWebsiteUrl}` : ""}${reviewServiceUrl ? `\n• 5-Star Review Page: ${reviewServiceUrl}` : ""}\n\nWould you be open to taking a quick look?\n\nBest regards,\n${AGENCY_NAME}`,
+      };
+      onUpdate({
+        ...p,
+        primaryOffer: effectiveLeadOffer,
+        generatedSiteId: nextSiteId,
+        generatedSiteUrl: demoWebsiteUrl || p.generatedSiteUrl,
+        generatedReviewUrl: reviewServiceUrl || p.generatedReviewUrl,
+        generatedEmail: {
+          subject: first.subject,
+          body: first.body,
+          emailVersions: versions.length > 0 ? versions : [first],
+          selectedVersion: first.version || "A",
+        },
+      });
+    } catch {
+      const fallbackBody = `Hi ${p.ownerName || `${p.businessName} Team`},\n\nI was looking at ${p.businessName}${p.city ? ` in ${p.city}` : ""} today and put together a tailored ${effectiveLeadOffer} breakdown to help turn more local searches into booked clients.${demoWebsiteUrl ? `\n\n• Live Website Preview: ${demoWebsiteUrl}` : ""}${reviewServiceUrl ? `\n• 5-Star Review Page: ${reviewServiceUrl}` : ""}\n\nWould you be open to a quick walkthrough this week?\n\nBest regards,\n${AGENCY_NAME}`;
+      onUpdate({
+        ...p,
+        primaryOffer: effectiveLeadOffer,
+        generatedSiteId: nextSiteId,
+        generatedSiteUrl: demoWebsiteUrl || p.generatedSiteUrl,
+        generatedReviewUrl: reviewServiceUrl || p.generatedReviewUrl,
+        generatedEmail: {
+          subject: `Quick idea for ${p.businessName} — ${effectiveLeadOffer}`,
+          body: fallbackBody,
+        },
+      });
+    } finally {
+      setLoadingEmailIds(prev => ({ ...prev, [p.id]: false }));
+    }
+  };
+
+  const generateInlineAssetForProspect = async (p: Prospect, mode: "website" | "review") => {
+    if (!onUpdate) {
+      onSelect(p);
+      return;
+    }
+    if (mode === "website") setLoadingSiteIds(prev => ({ ...prev, [p.id]: true }));
+    else setLoadingReviewIds(prev => ({ ...prev, [p.id]: true }));
+    setOpenEmailIds(prev => ({ ...prev, [p.id]: true }));
+    try {
+      let siteId = p.generatedSiteId;
+      let websiteUrl = p.generatedSiteUrl;
+      let reviewUrl = p.generatedReviewUrl;
+      const isForceRegenerate =
+        (mode === "website" && Boolean(p.generatedSiteUrl)) ||
+        (mode === "review" && Boolean(p.generatedReviewUrl));
+      const hasValidSlug = Boolean(siteId && !/^\d+$/.test(String(siteId)));
+      if (!hasValidSlug || isForceRegenerate) {
+        const assets = await generateInlineLeadAssets(p);
+        siteId = assets.siteId;
+        websiteUrl = assets.websiteUrl;
+        reviewUrl = assets.reviewUrl;
+      } else {
+        const origin = window.location.origin;
+        websiteUrl = `${origin}/site/${siteId}`;
+        reviewUrl = `${origin}/review/${siteId}`;
+      }
+      await generateInlineEmailForProspect(p, {
+        siteId,
+        websiteUrl: mode === "website" ? websiteUrl : (p.generatedSiteUrl || websiteUrl),
+        reviewUrl: mode === "review" ? reviewUrl : (p.generatedReviewUrl || reviewUrl),
+      });
+    } catch {
+      // ignore
+    } finally {
+      setLoadingSiteIds(prev => ({ ...prev, [p.id]: false }));
+      setLoadingReviewIds(prev => ({ ...prev, [p.id]: false }));
+    }
+  };
+
+  const sendInlineEmailForProspect = async (p: Prospect) => {
+    if (!p.email || !p.generatedEmail || !onUpdate) return;
+    setSendingEmailIds(prev => ({ ...prev, [p.id]: true }));
+    try {
+      await callCRM("send-email", {
+        to: p.email,
+        subject: p.generatedEmail.subject,
+        body: p.generatedEmail.body,
+        prospectName: p.businessName,
+        reportUrl: p.reportUrl || undefined,
+      });
+      onUpdate({ ...p, status: "contacted", emailSentAt: new Date().toISOString() });
+    } catch {
+      // ignore
+    } finally {
+      setSendingEmailIds(prev => ({ ...prev, [p.id]: false }));
+    }
+  };
 
   useEffect(() => {
     const emailedEmails = prospects.filter(p => p.emailSentAt && p.email).map(p => p.email);
@@ -2434,12 +5216,21 @@ function ProspectList({
   const filtered = prospects
     .filter(p => {
       const q = search.toLowerCase();
-      const matchSearch = !q || p.businessName.toLowerCase().includes(q) || p.email.toLowerCase().includes(q) || p.city.toLowerCase().includes(q) || p.category.toLowerCase().includes(q);
+      const matchSearch = !q || p.businessName.toLowerCase().includes(q) || p.email.toLowerCase().includes(q) || p.city.toLowerCase().includes(q) || p.category.toLowerCase().includes(q) || (p.ownerName || "").toLowerCase().includes(q) || (p.cmsPlatform || "").toLowerCase().includes(q);
       const matchStatus = statusFilter === "all" || p.status === statusFilter;
       const matchCat = categoryFilter === "all" || p.category === categoryFilter;
-      return matchSearch && matchStatus && matchCat;
+      if (!matchSearch || !matchStatus || !matchCat) return false;
+      if (apolloCfg.enabled && apolloQuickFilter !== "all") {
+        if (apolloQuickFilter === "hot_intent" && (p.buyerIntentScore ?? 0) < 75) return false;
+        if (apolloQuickFilter === "warm_signal" && !(p.email && (trackingStats[p.email]?.opens > 0 || trackingStats[p.email]?.clicks > 0))) return false;
+        if (apolloQuickFilter === "has_owner" && !p.ownerName && !p.linkedin) return false;
+        if (apolloQuickFilter === "missing_chat" && !(p.missingSignals || []).some(s => s.toLowerCase().includes("chat") || s.toLowerCase().includes("booking"))) return false;
+        if (apolloQuickFilter === "has_cms" && !p.cmsPlatform) return false;
+      }
+      return true;
     })
     .sort((a, b) => {
+      if (sortBy === "apollo-intent") return (b.buyerIntentScore ?? aiOpportunityScore(b)) - (a.buyerIntentScore ?? aiOpportunityScore(a));
       if (sortBy === "ai-score") return aiOpportunityScore(b) - aiOpportunityScore(a);
       if (sortBy === "value") return (b.expectedValue ?? 0) - (a.expectedValue ?? 0);
       // "added" — newest first
@@ -2462,10 +5253,42 @@ function ProspectList({
         />
       )}
 
+      {/* Apollo+ Quick Filter Bar in Prospects Tab */}
+      {apolloCfg.enabled && prospects.length > 0 && (
+        <div className="px-3 py-2.5 rounded-xl bg-slate-950 text-white border border-slate-800 flex flex-wrap items-center gap-1.5">
+          <span className="text-[11px] font-extrabold uppercase tracking-wider text-amber-400 mr-1 flex items-center gap-1">
+            <Sparkles className="w-3.5 h-3.5" /> Segments:
+          </span>
+          {[
+            { id: "all", label: `All Prospects (${prospects.length})` },
+            ...(apolloCfg.intentScoring ? [{ id: "hot_intent", label: `🔥 Hot Buyer Intent (${prospects.filter(p => (p.buyerIntentScore ?? 0) >= 75).length})` }] : []),
+            ...(apolloCfg.warmSignals ? [{ id: "warm_signal", label: `👀 Warm Signal: Opened/Clicked (${prospects.filter(p => p.email && (trackingStats[p.email]?.opens > 0 || trackingStats[p.email]?.clicks > 0)).length})` }] : []),
+            ...(apolloCfg.decisionMaker ? [{ id: "has_owner", label: `👤 Decision-Maker Identified (${prospects.filter(p => p.ownerName || p.linkedin).length})` }] : []),
+            ...(apolloCfg.techStack ? [
+              { id: "missing_chat", label: `⚠️ Missing Chat / Booking (${prospects.filter(p => (p.missingSignals || []).some(s => s.toLowerCase().includes("chat") || s.toLowerCase().includes("booking"))).length})` },
+              { id: "has_cms", label: `🖥️ Tech Stack Detected (${prospects.filter(p => p.cmsPlatform).length})` },
+            ] : []),
+          ].map(seg => (
+            <button
+              key={seg.id}
+              type="button"
+              onClick={() => setApolloQuickFilter(seg.id)}
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                apolloQuickFilter === seg.id
+                  ? "bg-amber-400 text-slate-950"
+                  : "bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-800"
+              }`}
+            >
+              {seg.label}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="flex gap-2 flex-wrap">
         <div className="relative flex-1 min-w-48">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input className="pl-9" placeholder="Search business, email, city…" value={search} onChange={e => setSearch(e.target.value)} />
+          <Input className="pl-9" placeholder="Search business, owner, CMS, email, city…" value={search} onChange={e => setSearch(e.target.value)} />
         </div>
         <Select value={statusFilter} onValueChange={setStatusFilter}>
           <SelectTrigger className="w-36"><SelectValue placeholder="All statuses" /></SelectTrigger>
@@ -2482,12 +5305,15 @@ function ProspectList({
           </SelectContent>
         </Select>
         <Select value={sortBy} onValueChange={v => setSortBy(v as SortKey)}>
-          <SelectTrigger className="w-40">
+          <SelectTrigger className="w-44">
             <Sparkles className="w-3.5 h-3.5 mr-1.5 text-purple-500" />
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="ai-score">AI Score ↓</SelectItem>
+            {apolloCfg.enabled && apolloCfg.intentScoring && (
+              <SelectItem value="apollo-intent">🔥 Buyer Intent ↓</SelectItem>
+            )}
             <SelectItem value="value">Deal Value ↓</SelectItem>
             <SelectItem value="added">Date Added ↓</SelectItem>
           </SelectContent>
@@ -2503,63 +5329,235 @@ function ProspectList({
         <div className="divide-y divide-border/40 rounded-xl border border-border/50 overflow-hidden bg-white">
           {filtered.map(p => {
             const cfg = STATUS_CONFIG[p.status];
+            const hasWarmClick = Boolean(p.email && trackingStats[p.email]?.clicks > 0);
+            const hasWarmOpen = Boolean(p.email && trackingStats[p.email]?.opens > 0);
+            const offerRes = resolveAuditMatchedOffer(p, trainedOffer);
+            const isEmailOpen = Boolean(openEmailIds[p.id]);
+            const isGeneratingEmail = Boolean(loadingEmailIds[p.id]);
+            const isGeneratingSite = Boolean(loadingSiteIds[p.id]);
+            const isGeneratingReview = Boolean(loadingReviewIds[p.id]);
+            const isSendingEmail = Boolean(sendingEmailIds[p.id]);
             return (
               <div
                 key={p.id}
-                onClick={() => onSelect(p)}
-                className="p-3.5 sm:p-4 flex items-center gap-3 hover:bg-muted/20 transition-colors group cursor-pointer"
+                className="p-3.5 sm:p-4 hover:bg-muted/10 transition-colors group overflow-hidden"
               >
-                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-primary/10 text-primary font-bold text-xs sm:text-sm flex items-center justify-center flex-shrink-0">
-                  {p.businessName.slice(0, 2).toUpperCase()}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-bold text-sm text-slate-900">{p.businessName}</span>
-                    <Badge className={`${cfg.bg} ${cfg.color} ${cfg.border} border text-xs h-5`}>{cfg.label}</Badge>
-                    {p.priority === "high" && <span className="text-xs text-red-600 font-bold">🔴</span>}
-                    {p.hunted && <span className="text-xs text-purple-600 font-bold flex items-center gap-0.5"><Radar className="w-3 h-3" /></span>}
-                    {p.aiAgentType && AGENT_META[p.aiAgentType] && (
-                      <span className={`text-xs font-semibold border rounded-full px-2 py-0.5 inline-flex items-center gap-1 whitespace-nowrap ${AGENT_META[p.aiAgentType].color}`}>
-                        <span>{AGENT_META[p.aiAgentType].icon}</span>
-                        <span>{AGENT_META[p.aiAgentType].label}</span>
-                      </span>
-                    )}
-                    {p.analysis && (
-                      <span className="text-xs text-purple-600 font-bold inline-flex items-center gap-0.5">
-                        <Sparkles className="w-3 h-3" />
-                        {Math.round(aiOpportunityScore(p))}
-                      </span>
-                    )}
-                    {p.emailSentAt && <span className="text-xs text-green-600 font-bold">✓ Emailed</span>}
-                    {p.email && trackingStats[p.email]?.opens > 0 && (
-                      <span className="text-xs font-bold text-blue-600 inline-flex items-center gap-0.5">
-                        <Eye className="w-3 h-3" /> Opened {trackingStats[p.email].opens}×
-                      </span>
-                    )}
-                    {p.email && trackingStats[p.email]?.clicks > 0 && (
-                      <span className="text-xs font-bold text-orange-600">🔗 Clicked</span>
-                    )}
+                <div
+                  onClick={() => onSelect(p)}
+                  className="flex items-start gap-3 cursor-pointer"
+                >
+                  <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-primary/10 text-primary font-bold text-xs sm:text-sm flex items-center justify-center flex-shrink-0 mt-0.5">
+                    {p.businessName.slice(0, 2).toUpperCase()}
                   </div>
-                  <div className="flex items-center gap-x-3 gap-y-1 mt-1 text-xs text-muted-foreground flex-wrap">
-                    {p.category && <span>{p.category}</span>}
-                    {p.city && <span>{p.city}{p.country ? `, ${p.country}` : ""}</span>}
-                    {p.email && <span className="truncate max-w-[220px] sm:max-w-none">{p.email}</span>}
-                    {p.expectedValue > 0 && <span className="text-purple-700 font-semibold">${p.expectedValue.toLocaleString()}</span>}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-sm text-slate-900 break-words">{p.businessName}</span>
+                      <Badge className={`${cfg.bg} ${cfg.color} ${cfg.border} border text-xs h-5`}>{cfg.label}</Badge>
+                      {offerRes.primaryOffer && (
+                        <span className="text-[11px] bg-slate-100 text-slate-800 border border-slate-200 rounded px-2 py-0.5 font-medium">
+                          Primary Offer: {offerRes.primaryOffer}
+                        </span>
+                      )}
+                      {p.priority === "high" && <span className="text-xs text-red-600 font-bold">🔴</span>}
+                      {p.hunted && <span className="text-xs text-purple-600 font-bold flex items-center gap-0.5"><Radar className="w-3 h-3" /></span>}
+                      {apolloCfg.enabled && apolloCfg.intentScoring && typeof p.buyerIntentScore === "number" && (
+                        <span className={`text-[11px] font-extrabold px-2 py-0.5 rounded-full border ${
+                          p.buyerIntentScore >= 75
+                            ? "bg-orange-100 text-orange-800 border-orange-300"
+                            : "bg-amber-50 text-amber-800 border-amber-200"
+                        }`}>
+                          🔥 {p.buyerIntentScore}/100 Intent
+                        </span>
+                      )}
+                      {apolloCfg.enabled && apolloCfg.decisionMaker && p.ownerName && (
+                        <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                          👤 {p.ownerName}{p.ownerRole ? ` (${p.ownerRole})` : ""}
+                        </span>
+                      )}
+                      {apolloCfg.enabled && apolloCfg.techStack && p.cmsPlatform && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-900 text-white">
+                          🖥️ {p.cmsPlatform}
+                        </span>
+                      )}
+                      {p.aiAgentType && AGENT_META[p.aiAgentType] && (
+                        <span className={`text-xs font-semibold border rounded-full px-2 py-0.5 inline-flex items-center gap-1 whitespace-nowrap ${AGENT_META[p.aiAgentType].color}`}>
+                          <span>{AGENT_META[p.aiAgentType].icon}</span>
+                          <span>{AGENT_META[p.aiAgentType].label}</span>
+                        </span>
+                      )}
+                      {p.analysis && (
+                        <span className="text-xs text-purple-600 font-bold inline-flex items-center gap-0.5">
+                          <Sparkles className="w-3 h-3" />
+                          {Math.round(aiOpportunityScore(p))}
+                        </span>
+                      )}
+                      {p.emailSentAt && <span className="text-xs text-green-600 font-bold">✓ Emailed</span>}
+                      {apolloCfg.enabled && apolloCfg.warmSignals && hasWarmClick && (
+                        <span className="text-xs font-extrabold text-white bg-rose-600 px-2 py-0.5 rounded-full animate-pulse">
+                          🔥 Warm Signal: Clicked Audit Link ({trackingStats[p.email].clicks}×)
+                        </span>
+                      )}
+                      {hasWarmOpen && (
+                        <span className="text-xs font-bold text-blue-600 inline-flex items-center gap-0.5">
+                          <Eye className="w-3 h-3" /> Opened {trackingStats[p.email].opens}×
+                        </span>
+                      )}
+                      {!apolloCfg.warmSignals && hasWarmClick && (
+                        <span className="text-xs font-bold text-orange-600">🔗 Clicked</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-x-3 gap-y-1 mt-1 text-xs text-muted-foreground flex-wrap">
+                      {p.category && <span>{p.category}</span>}
+                      {p.city && <span>{p.city}{p.country ? `, ${p.country}` : ""}</span>}
+                      {p.email && <span className="break-all">{p.email}</span>}
+                      {p.expectedValue > 0 && <span className="text-purple-700 font-semibold">${p.expectedValue.toLocaleString()}</span>}
+                      {apolloCfg.enabled && apolloCfg.techStack && p.missingSignals && p.missingSignals.length > 0 && (
+                        <span className="text-[11px] text-rose-600 font-semibold">
+                          ⚠️ {p.missingSignals.slice(0, 2).join(" · ")}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="sm:opacity-0 sm:group-hover:opacity-100 text-destructive/70 h-8 w-8 p-0 flex-shrink-0"
+                      onClick={e => {
+                        e.stopPropagation();
+                        onDelete(p.id);
+                      }}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </Button>
+                    <ChevronRight className="w-4 h-4 text-muted-foreground/60" />
                   </div>
                 </div>
-                <div className="flex items-center gap-1 flex-shrink-0">
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="sm:opacity-0 sm:group-hover:opacity-100 text-destructive/70 h-8 w-8 p-0 flex-shrink-0"
-                    onClick={e => {
-                      e.stopPropagation();
-                      onDelete(p.id);
-                    }}
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </Button>
-                  <ChevronRight className="w-4 h-4 text-muted-foreground/60" />
+
+                {/* Mobile-Friendly Action Bar right on each Prospect Card */}
+                <div
+                  className="mt-2.5 pt-2.5 border-t border-slate-200/80 flex flex-col gap-2"
+                  onClick={e => e.stopPropagation()}
+                >
+                  <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto sm:justify-end">
+                    {offerRes.showGenerateWebsite && (
+                      <button
+                        type="button"
+                        disabled={isGeneratingSite}
+                        onClick={() => generateInlineAssetForProspect(p, "website")}
+                        className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-medium bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 inline-flex items-center gap-1 cursor-pointer transition-colors"
+                      >
+                        {isGeneratingSite ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : <Globe className="w-3 h-3 text-slate-600 shrink-0" />}
+                        <span>{p.generatedSiteUrl ? "Regenerate Website" : "Generate Website"}</span>
+                      </button>
+                    )}
+                    {offerRes.showGenerateReview && (
+                      <button
+                        type="button"
+                        disabled={isGeneratingReview}
+                        onClick={() => generateInlineAssetForProspect(p, "review")}
+                        className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-medium bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 inline-flex items-center gap-1 cursor-pointer transition-colors"
+                      >
+                        {isGeneratingReview ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : <Star className="w-3 h-3 text-amber-500 shrink-0" />}
+                        <span>{p.generatedReviewUrl ? "Regenerate Review" : "Generate Review"}</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={isGeneratingEmail}
+                      onClick={() => {
+                        if (p.generatedEmail && isEmailOpen) {
+                          setOpenEmailIds(prev => ({ ...prev, [p.id]: false }));
+                        } else if (p.generatedEmail && !isEmailOpen) {
+                          setOpenEmailIds(prev => ({ ...prev, [p.id]: true }));
+                        } else {
+                          generateInlineEmailForProspect(p);
+                        }
+                      }}
+                      className="w-full sm:w-auto justify-center px-3 py-2 sm:py-1 rounded-md text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-white inline-flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm"
+                    >
+                      {isGeneratingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" /> : <Mail className="w-3.5 h-3.5 shrink-0" />}
+                      <span>{p.generatedEmail ? (isEmailOpen ? "Hide Cold Email" : "View Cold Email") : "Generate Cold Email"}</span>
+                    </button>
+                  </div>
+
+                  {(p.generatedSiteUrl || p.generatedReviewUrl) && (
+                    <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-1.5 sm:gap-3 text-xs bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+                      {p.generatedSiteUrl && (
+                        <div className="inline-flex items-center gap-1.5 flex-wrap">
+                          <span className="font-semibold text-slate-700">Website Preview:</span>
+                          <a href={p.generatedSiteUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-0.5 font-medium break-all">
+                            {p.generatedSiteUrl} <ExternalLink className="w-3 h-3 shrink-0" />
+                          </a>
+                        </div>
+                      )}
+                      {p.generatedReviewUrl && (
+                        <div className="inline-flex items-center gap-1.5 flex-wrap">
+                          <span className="font-semibold text-slate-700">Review Page:</span>
+                          <a href={p.generatedReviewUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-0.5 font-medium break-all">
+                            {p.generatedReviewUrl} <ExternalLink className="w-3 h-3 shrink-0" />
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {isEmailOpen && p.generatedEmail && (
+                    <div className="p-3 rounded-lg border border-slate-200 bg-white space-y-2.5 mt-1">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-800 flex items-center gap-1.5 flex-wrap">
+                          <Mail className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+                          <span>Personalized Cold Email{offerRes.primaryOffer ? ` (${offerRes.primaryOffer})` : ""}</span>
+                          {p.emailSentAt && <span className="text-green-600 font-semibold">· ✓ Sent</span>}
+                        </span>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <CopyButton text={`Subject: ${p.generatedEmail.subject}\n\n${p.generatedEmail.body}`} />
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => generateInlineEmailForProspect(p)}
+                            disabled={isGeneratingEmail}
+                            className="h-7 text-xs gap-1"
+                          >
+                            <RefreshCw className={`w-3 h-3 ${isGeneratingEmail ? "animate-spin" : ""}`} />
+                            Regenerate
+                          </Button>
+                          {p.email && (
+                            <Button
+                              size="sm"
+                              onClick={() => sendInlineEmailForProspect(p)}
+                              disabled={isSendingEmail}
+                              className="h-7 text-xs gap-1 bg-slate-900 hover:bg-slate-800 text-white"
+                            >
+                              <Send className="w-3 h-3" />
+                              {isSendingEmail ? "Sending…" : "Send Email"}
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                      <Input
+                        value={p.generatedEmail.subject}
+                        onChange={(e) =>
+                          onUpdate?.({
+                            ...p,
+                            generatedEmail: { ...p.generatedEmail!, subject: e.target.value },
+                          })
+                        }
+                        className="h-8 text-xs font-semibold"
+                      />
+                      <Textarea
+                        value={p.generatedEmail.body}
+                        onChange={(e) =>
+                          onUpdate?.({
+                            ...p,
+                            generatedEmail: { ...p.generatedEmail!, body: e.target.value },
+                          })
+                        }
+                        rows={5}
+                        className="text-xs"
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
             );
@@ -2771,42 +5769,127 @@ function AutomationPanel() {
 
       {/* Hunt Settings */}
       <div className="rounded-xl border border-border/50 overflow-hidden">
-        <div className="p-3 bg-muted/20 border-b border-border/50 flex items-center gap-2">
-          <Radar className="w-4 h-4 text-primary" />
-          <h4 className="font-bold text-sm">Hunt Settings</h4>
-          <span className="text-xs text-muted-foreground ml-1">— who to find</span>
+        <div className="p-3 bg-muted/20 border-b border-border/50 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Radar className="w-4 h-4 text-primary" />
+            <h4 className="font-bold text-sm">Autonomous Hunt & Multi-City Rotation Queue</h4>
+            <span className="text-xs text-muted-foreground ml-1">— rotates automatically on every run</span>
+          </div>
+          {status?.stats?.activeTargetCity && (
+            <span className="text-xs font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 px-2.5 py-0.5 rounded-md">
+              Last Rotated: {status.stats.activeTargetCategory || settings.huntCategory} in {status.stats.activeTargetCity}
+              {status.stats.nextTargetCity ? ` → Next: ${status.stats.nextTargetCity}` : ""}
+            </span>
+          )}
         </div>
-        <div className="p-4 grid grid-cols-2 gap-4">
-          <div>
-            <label className="text-xs font-semibold text-muted-foreground mb-1 block">Business Category</label>
-            <Select value={settings.huntCategory} onValueChange={v => save({ huntCategory: v })}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent className="max-h-72 overflow-y-auto">{CATEGORIES.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
-            </Select>
-          </div>
-          <div>
-            <label className="text-xs font-semibold text-muted-foreground mb-1 block">Businesses per Run</label>
-            <Input type="number" min={5} max={100} value={settings.huntCount}
-              onChange={e => setSettings(s => s ? { ...s, huntCount: Number(e.target.value) } : s)}
-              onBlur={() => save({ huntCount: settings.huntCount })} />
-          </div>
-          <div>
-            <label className="text-xs font-semibold text-muted-foreground mb-1 block">City</label>
-            <Input value={settings.huntCity} placeholder="e.g. Lagos, London, Dubai"
-              onChange={e => setSettings(s => s ? { ...s, huntCity: e.target.value } : s)}
-              onBlur={() => save({ huntCity: settings.huntCity })} />
-          </div>
-          <div>
-            <label className="text-xs font-semibold text-muted-foreground mb-1 block">Country</label>
-            <Input value={settings.huntCountry} placeholder="e.g. Nigeria, UK, UAE"
-              onChange={e => setSettings(s => s ? { ...s, huntCountry: e.target.value } : s)}
-              onBlur={() => save({ huntCountry: settings.huntCountry })} />
-          </div>
-          <div className="col-span-2">
-            <label className="text-xs font-semibold text-muted-foreground mb-1 block">Extra Context (optional)</label>
-            <Input value={settings.huntExtraContext} placeholder="e.g. focus on mid-size, avoid chains"
-              onChange={e => setSettings(s => s ? { ...s, huntExtraContext: e.target.value } : s)}
-              onBlur={() => save({ huntExtraContext: settings.huntExtraContext })} />
+        <div className="p-4 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="text-xs font-semibold text-muted-foreground mb-1 block">
+                Primary Category (or comma-separated rotation list)
+              </label>
+              <Input
+                value={settings.huntCategory}
+                placeholder="e.g. Dentist, MedSpa, Roofing, Law Firm"
+                onChange={e => setSettings(s => s ? { ...s, huntCategory: e.target.value } : s)}
+                onBlur={() => save({ huntCategory: settings.huntCategory })}
+              />
+              <div className="flex flex-wrap gap-1 mt-1.5">
+                {[
+                  { label: "+ Dentist", val: "Dentist" },
+                  { label: "+ MedSpa", val: "MedSpa" },
+                  { label: "+ Roofing", val: "Roofing" },
+                  { label: "+ HVAC", val: "HVAC" },
+                  { label: "+ Law Firm", val: "Law Firm" },
+                  { label: "+ Real Estate", val: "Real Estate Agency" },
+                ].map(item => (
+                  <button
+                    key={item.val}
+                    type="button"
+                    onClick={() => {
+                      const current = settings.huntCategory
+                        .split(",")
+                        .map(s => s.trim())
+                        .filter(Boolean);
+                      const next = current.includes(item.val)
+                        ? current.join(", ")
+                        : [...current, item.val].join(", ");
+                      save({ huntCategory: next });
+                    }}
+                    className="px-2 py-0.5 rounded border border-slate-200 bg-slate-50 hover:bg-slate-100 text-[11px] font-medium text-slate-700 cursor-pointer"
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-muted-foreground mb-1 block">Businesses per Run</label>
+              <Input type="number" min={5} max={100} value={settings.huntCount}
+                onChange={e => setSettings(s => s ? { ...s, huntCount: Number(e.target.value) } : s)}
+                onBlur={() => save({ huntCount: settings.huntCount })} />
+              <p className="text-[11px] text-muted-foreground mt-1">
+                Verified for live DNS & MX records + deduplicated against past sends.
+              </p>
+            </div>
+            <div className="sm:col-span-2">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+                <label className="text-xs font-semibold text-muted-foreground block">
+                  Target City or Multi-City Rotation Queue (comma-separated)
+                </label>
+                <div className="flex flex-wrap items-center gap-1">
+                  {[
+                    {
+                      label: "US Sunbelt Pack (8 Cities)",
+                      cities: "Austin, Miami, Phoenix, Dallas, Tampa, Atlanta, Charlotte, Nashville",
+                      country: "USA",
+                    },
+                    {
+                      label: "US Tier-1 Metros",
+                      cities: "New York, Los Angeles, Chicago, Houston, San Diego, Denver, Seattle",
+                      country: "USA",
+                    },
+                    {
+                      label: "UK & Ireland Pack",
+                      cities: "London, Manchester, Birmingham, Leeds, Glasgow, Dublin",
+                      country: "UK",
+                    },
+                    {
+                      label: "Canada & Australia",
+                      cities: "Toronto, Vancouver, Calgary, Montreal, Sydney, Melbourne, Brisbane",
+                      country: "Canada",
+                    },
+                  ].map(pack => (
+                    <button
+                      key={pack.label}
+                      type="button"
+                      onClick={() => save({ huntCity: pack.cities, huntCountry: pack.country })}
+                      className="px-2 py-0.5 rounded border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-[10px] font-semibold text-indigo-800 cursor-pointer"
+                    >
+                      + {pack.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <Input value={settings.huntCity} placeholder="e.g. Austin, Miami, Phoenix, Chicago, London"
+                onChange={e => setSettings(s => s ? { ...s, huntCity: e.target.value } : s)}
+                onBlur={() => save({ huntCity: settings.huntCity })} />
+              <p className="text-[11px] text-muted-foreground mt-1">
+                {settings.huntCity.split(/[\n,]+/).filter(c => c.trim()).length} cit{settings.huntCity.split(/[\n,]+/).filter(c => c.trim()).length === 1 ? "y" : "ies"} in rotation queue · Scheduler advances to the next city automatically on each run.
+              </p>
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-muted-foreground mb-1 block">Country</label>
+              <Input value={settings.huntCountry} placeholder="e.g. USA, UK, Canada, Nigeria"
+                onChange={e => setSettings(s => s ? { ...s, huntCountry: e.target.value } : s)}
+                onBlur={() => save({ huntCountry: settings.huntCountry })} />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-muted-foreground mb-1 block">Extra Context (optional)</label>
+              <Input value={settings.huntExtraContext} placeholder="e.g. focus on private practices missing online booking"
+                onChange={e => setSettings(s => s ? { ...s, huntExtraContext: e.target.value } : s)}
+                onBlur={() => save({ huntExtraContext: settings.huntExtraContext })} />
+            </div>
           </div>
         </div>
       </div>
@@ -2864,20 +5947,84 @@ function AutomationPanel() {
         </div>
       </div>
 
-      {/* Stats */}
+      {/* Stats & Live Autonomous Prospect Log */}
       {status?.stats && Object.keys(status.stats).length > 0 && (
-        <div className="rounded-xl border border-border/50 overflow-hidden">
-          <div className="p-3 bg-muted/20 border-b border-border/50">
-            <h4 className="font-bold text-sm flex items-center gap-2"><TrendingUp className="w-4 h-4 text-primary" /> Run Stats</h4>
+        <div className="rounded-xl border border-border/50 overflow-hidden space-y-0">
+          <div className="p-3 bg-muted/20 border-b border-border/50 flex flex-wrap items-center justify-between gap-2">
+            <h4 className="font-bold text-sm flex items-center gap-2">
+              <TrendingUp className="w-4 h-4 text-primary" /> Last Autonomous Cycle Telemetry
+            </h4>
+            {status.stats.lastRunAt && (
+              <span className="text-xs text-muted-foreground">
+                Completed {new Date(status.stats.lastRunAt).toLocaleString()}
+              </span>
+            )}
           </div>
-          <div className="p-4 grid grid-cols-3 gap-3">
-            {Object.entries(status.stats).map(([k, v]) => (
-              <div key={k} className="text-center rounded-lg border border-border/50 p-3">
-                <div className="text-2xl font-extrabold text-primary">{String(v)}</div>
-                <div className="text-xs text-muted-foreground capitalize">{k.replace(/_/g, " ")}</div>
+          <div className="p-4 grid grid-cols-2 sm:grid-cols-5 gap-3">
+            {[
+              { label: "Leads Scraped", value: status.stats.hunted ?? 0 },
+              { label: "AI Audited", value: status.stats.scored ?? 0 },
+              { label: "Emails Sent", value: status.stats.emailed ?? 0 },
+              { label: "Follow-Ups Sent", value: status.stats.followUps ?? 0 },
+              { label: "Duplicates Skipped", value: status.stats.skippedDuplicates ?? 0 },
+            ].map(item => (
+              <div key={item.label} className="text-center rounded-lg border border-border/50 p-3 bg-white">
+                <div className="text-2xl font-extrabold text-primary font-mono">{item.value}</div>
+                <div className="text-xs text-muted-foreground mt-0.5">{item.label}</div>
               </div>
             ))}
           </div>
+
+          {Array.isArray(status.stats.lastProspects) && status.stats.lastProspects.length > 0 && (
+            <div className="border-t border-border/50">
+              <div className="px-4 py-2.5 bg-slate-50 border-b border-border/50 flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-800">
+                  Processed Prospects in Last Run ({status.stats.lastProspects.length})
+                </span>
+                <span className="text-[11px] text-slate-500">
+                  Auto-generated shareable audit links & A/B/C rotational outreach
+                </span>
+              </div>
+              <div className="divide-y divide-border/40 max-h-64 overflow-y-auto bg-white">
+                {status.stats.lastProspects.map((p: any, idx: number) => (
+                  <div key={idx} className="px-4 py-2.5 flex items-center justify-between gap-3 text-xs">
+                    <div className="min-w-0">
+                      <div className="font-semibold text-slate-900 truncate">
+                        {p.businessName}
+                        {p.city ? <span className="font-normal text-slate-500"> · {p.city}</span> : null}
+                      </div>
+                      <div className="text-[11px] text-slate-500 truncate">
+                        {p.email || p.website || "Verified prospect"}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {p.reportUrl && (
+                        <a
+                          href={p.reportUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold hover:underline"
+                        >
+                          View Audit
+                        </a>
+                      )}
+                      <span
+                        className={`px-2 py-0.5 rounded font-semibold ${
+                          p.emailed
+                            ? "bg-emerald-50 text-emerald-700"
+                            : p.scored
+                            ? "bg-blue-50 text-blue-700"
+                            : "bg-slate-100 text-slate-600"
+                        }`}
+                      >
+                        {p.emailed ? "✓ Emailed" : p.scored ? "Audited" : `Score ${p.score ?? 5}/10`}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -3136,6 +6283,7 @@ function ProposalRequestRow({ request }: { request: CustomRequest }) {
 // ─── Website Reports Panel ────────────────────────────────────────────────────
 
 function WebsiteReportsPanel() {
+  const [, setLocation] = useLocation();
   const [reports, setReports] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -3165,7 +6313,27 @@ function WebsiteReportsPanel() {
     setReports(prev => prev.filter(r => r.reportId !== reportId));
   };
 
-  if (loading) return <LoadingSpinner text="Loading Website Audit Reports…" />;
+  if (loading) {
+    return (
+      <div className="space-y-3 animate-pulse">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div key={i} className="rounded-xl border border-[#E4E2DD] bg-white p-4 flex items-center justify-between gap-4">
+            <div className="space-y-2 flex-1">
+              <div className="flex items-center gap-2">
+                <div className="h-4 w-48 bg-slate-200 rounded" />
+                <div className="h-4 w-20 bg-slate-100 rounded" />
+              </div>
+              <div className="h-3 w-64 bg-slate-100 rounded" />
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="h-8 w-28 bg-slate-100 rounded-lg" />
+              <div className="h-8 w-20 bg-slate-200 rounded-lg" />
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -3220,11 +6388,14 @@ function WebsiteReportsPanel() {
                     <SelectItem value="won">Won ✓</SelectItem>
                   </SelectContent>
                 </Select>
-                <a href={`/report/${r.reportId}`}>
-                  <Button size="sm" variant="outline" className="h-8 text-xs gap-1">
-                    <ExternalLink className="w-3.5 h-3.5" /> View Report
-                  </Button>
-                </a>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setLocation(`/report/${r.reportId}`)}
+                  className="h-8 text-xs gap-1"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" /> View Report
+                </Button>
                 <CopyButton text={`${window.location.origin}/report/${r.reportId}`} />
                 <Button size="sm" variant="ghost" className="h-8 w-8 p-0 text-destructive/70 hover:text-destructive" onClick={() => deleteReport(r.reportId)}>
                   <Trash2 className="w-3.5 h-3.5" />
@@ -3241,6 +6412,7 @@ function WebsiteReportsPanel() {
 // ─── Main CRM Page ────────────────────────────────────────────────────────────
 
 export default function CRM() {
+  const [location, setLocation] = useLocation();
   const [prospects, setProspects] = useState<Prospect[]>(loadProspects);
   const [projects, setProjects] = useState<LeadProject[]>(loadProjects);
   const [activeProjectId, setActiveProjectState] = useState<string>(() =>
@@ -3255,8 +6427,10 @@ export default function CRM() {
     } catch {}
     return "hunter";
   });
-  const [canUseWebsiteBuilder, setCanUseWebsiteBuilder] = useState<boolean>(() =>
-    isUserAdmin(getCachedSaasUser())
+  const [canUseWebsiteBuilder, setCanUseWebsiteBuilder] = useState<boolean>(true);
+  const [builderAccessMode, setBuilderAccessMode] = useState<string>("all_users");
+  const [callerPlanId, setCallerPlanId] = useState<string>(
+    getCachedSaasUser()?.planId || "starter"
   );
 
   const handleSelectProject = useCallback((projectId: string) => {
@@ -3309,16 +6483,73 @@ export default function CRM() {
   );
 
   useEffect(() => {
-    getToken();
-    // Sync initial prospects into PostgreSQL on mount
-    saveProspects(loadProspects());
-    syncProjectsFromServer().then((merged) => {
-      if (merged.length > 0) setProjects(merged);
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const t = params.get("tab");
+      if (t && t !== "train-ai") setTab(t);
+    } catch {}
+  }, [location]);
+
+  useEffect(() => {
+    if (!getSaasToken()) {
+      clearSaasSession();
+      setLocation("/auth?mode=login&redirect=/crm");
+      return;
+    }
+    const localInitial = loadProspects();
+    setProspects(localInitial);
+    // Verify active user session
+    saasFetch("/api/saas/auth/me").catch(() => {
+      clearSaasSession();
+      setLocation("/auth?mode=login&redirect=/crm");
     });
-    saasFetch<{ allowed?: boolean }>("/api/website-builder/access")
+    // Load this user's private prospects from the server and merge with this user's local prospects
+    authFetch("/api/crm/prospects")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data && Array.isArray(data.prospects)) {
+          const remote: Prospect[] = data.prospects;
+          const currentLocal = loadProspects();
+          if (remote.length > 0 && currentLocal.length === 0) {
+            saveUserProspects(remote);
+            setProspects(remote);
+          } else if (currentLocal.length > 0) {
+            const byId = new Map<number | string, Prospect>();
+            for (const rp of remote) byId.set(rp.id, rp);
+            for (const lp of currentLocal) byId.set(lp.id, lp);
+            const mergedList = Array.from(byId.values());
+            saveProspects(mergedList);
+            setProspects(mergedList);
+          } else {
+            setProspects([]);
+          }
+        }
+      })
+      .catch(() => {});
+    syncProjectsFromServer().then((merged) => {
+      if (merged.length > 0) {
+        setProjects(merged);
+        setActiveProjectState((prev) =>
+          prev === "all" || merged.some((p) => p.id === prev)
+            ? prev
+            : merged[0]?.id || DEFAULT_PROJECT_ID
+        );
+      }
+    });
+    saasFetch<{
+      allowed?: boolean;
+      callerPlanId?: string;
+      config?: { mode?: string };
+    }>("/api/website-builder/access")
       .then((res) => {
         if (typeof res?.allowed === "boolean") {
           setCanUseWebsiteBuilder(res.allowed || isUserAdmin(getCachedSaasUser()));
+        }
+        if (res?.config?.mode) {
+          setBuilderAccessMode(res.config.mode);
+        }
+        if (res?.callerPlanId) {
+          setCallerPlanId(res.callerPlanId);
         }
       })
       .catch(() => {});
@@ -3416,19 +6647,19 @@ export default function CRM() {
   }
 
   return (
-    <div className="min-h-screen w-full max-w-[100vw] overflow-x-hidden bg-background">
+    <div className="min-h-screen w-full max-w-[100vw] overflow-x-hidden bg-[#FAF9F5] text-[#0B0F17]">
       <div className="max-w-6xl mx-auto px-3 sm:px-4 py-4 sm:py-6">
         {/* Header */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6 pb-4 border-b border-border/60">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6 pb-4 border-b border-[#E4E2DD]">
           <div>
-            <div className="flex items-center gap-2.5">
-              <div className="w-10 h-10 shrink-0 rounded-xl bg-slate-950 flex items-center justify-center text-white shadow-sm">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 shrink-0 rounded-xl bg-[#0B0F17] flex items-center justify-center text-amber-400">
                 <Radar className="w-5 h-5" />
               </div>
               <div className="min-w-0">
-                <h1 className="font-display font-extrabold text-xl sm:text-2xl tracking-tight">Vanguard Hunter CRM</h1>
-                <p className="text-xs sm:text-sm text-muted-foreground">
-                  Autonomous B2B Lead Discovery, Website Audit Engine, Cold Email Outreach & Sales CRM
+                <h1 className="font-display font-bold text-xl sm:text-2xl tracking-tight text-[#0B0F17]">Vanguard Hunter CRM</h1>
+                <p className="text-xs sm:text-sm text-[#525866]">
+                  Autonomous B2B Lead Discovery · Website &amp; Voice Diagnostic Engine · Multi-Inbox Sequences
                 </p>
               </div>
             </div>
@@ -3441,34 +6672,47 @@ export default function CRM() {
                 if (window.history.length > 1) {
                   window.history.back();
                 } else {
-                  window.location.href = "/dashboard";
+                  setLocation("/dashboard");
                 }
               }}
-              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-700 hover:text-slate-950 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#0B0F17] bg-[#F2F0EA] hover:bg-[#E4E2DD] rounded-lg transition-colors whitespace-nowrap cursor-pointer"
             >
               <ArrowLeft className="w-3.5 h-3.5" />
               <span>Back</span>
             </button>
-            <a
-              href="/landing"
-              className="px-3 py-2 text-xs font-semibold text-slate-700 hover:text-slate-950 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
+            <button
+              type="button"
+              onClick={() => setLocation("/landing")}
+              className="px-3 py-2 text-xs font-semibold text-[#0B0F17] bg-[#F2F0EA] hover:bg-[#E4E2DD] rounded-lg transition-colors whitespace-nowrap cursor-pointer"
             >
               Landing Page
-            </a>
-            <a
-              href="/dashboard"
-              className="px-3 py-2 text-xs font-semibold text-slate-800 hover:text-slate-950 border border-slate-300 bg-white hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+            </button>
+            <button
+              type="button"
+              onClick={() => setLocation("/dashboard")}
+              className="px-3 py-2 text-xs font-semibold text-[#0B0F17] border border-[#D8D5CD] bg-white hover:bg-[#F2F0EA] rounded-lg transition-colors whitespace-nowrap cursor-pointer"
             >
               User Dashboard
-            </a>
+            </button>
             {isUserAdmin(getCachedSaasUser()) && (
-              <a
-                href="/admin"
-                className="px-3 py-2 text-xs font-semibold text-white bg-slate-950 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap"
+              <button
+                type="button"
+                onClick={() => setLocation("/admin")}
+                className="px-3 py-2 text-xs font-semibold text-amber-300 bg-[#0B0F17] hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
               >
-                Admin Panel
-              </a>
+                Admin Console
+              </button>
             )}
+            <button
+              type="button"
+              onClick={() => {
+                clearSaasSession();
+                setLocation("/landing");
+              }}
+              className="px-3 py-2 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+            >
+              Sign Out
+            </button>
           </div>
         </div>
 
@@ -3500,9 +6744,16 @@ export default function CRM() {
             <TabsTrigger value="reports" className="flex-1 gap-1.5">
               <Globe className="w-4 h-4" /> Audit Reports
             </TabsTrigger>
-            {canUseWebsiteBuilder && (
+            {(canUseWebsiteBuilder || builderAccessMode !== "owner_only") && (
               <TabsTrigger value="website-builder" className="flex-1 gap-1.5 text-amber-700 font-bold">
-                <Sparkles className="w-4 h-4 text-amber-600" /> AI Website Builder (Owner)
+                <Sparkles className="w-4 h-4 text-amber-600" />
+                <span>
+                  {isUserAdmin(getCachedSaasUser())
+                    ? "AI Website Builder (Owner)"
+                    : canUseWebsiteBuilder
+                    ? "AI Website + Review Shield"
+                    : "🔒 AI Website Builder (VIP)"}
+                </span>
               </TabsTrigger>
             )}
             <TabsTrigger value="email-settings" className="flex-1 gap-1.5">
@@ -3546,11 +6797,71 @@ export default function CRM() {
             <WebsiteReportsPanel />
           </TabsContent>
 
-          {canUseWebsiteBuilder && (
+          {(canUseWebsiteBuilder || builderAccessMode !== "owner_only") && (
             <TabsContent value="website-builder">
-              <div className="bg-slate-950 rounded-2xl p-4 sm:p-6 text-slate-100">
-                <OwnerWebsiteBuilderPanel externalLeads={activeProjectExportableLeads} />
-              </div>
+              {canUseWebsiteBuilder ? (
+                <div className="bg-slate-950 rounded-2xl p-4 sm:p-6 text-slate-100">
+                  <OwnerWebsiteBuilderPanel externalLeads={activeProjectExportableLeads} />
+                </div>
+              ) : (
+                <div className="bg-slate-950 border border-amber-500/40 rounded-2xl p-6 sm:p-10 text-white shadow-2xl space-y-6">
+                  <div className="max-w-3xl space-y-3">
+                    <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-400/15 border border-amber-400/40 text-amber-300 text-xs font-extrabold uppercase tracking-wider">
+                      👑 High-Level Agency Exclusive Feature · Current Plan: {callerPlanId.toUpperCase()}
+                    </div>
+                    <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white">
+                      Unlock the AI 4-Tap Website Builder &amp; 5-Star Review Shield Engine
+                    </h2>
+                    <p className="text-sm sm:text-base text-slate-300 leading-relaxed">
+                      Stop sending cold emails without a finished asset. On the{" "}
+                      <strong className="text-amber-300">Agency Scale ($349/mo)</strong> and{" "}
+                      <strong className="text-amber-300">Enterprise VIP ($799/mo)</strong> plans, you automatically unlock our 1-Click AI Website Builder and 5-Star Review Shield Blocker so you can charge local businesses{" "}
+                      <strong className="text-emerald-400">$97–$297/month</strong> in recurring retainers.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+                      <div className="text-xs font-bold uppercase text-amber-400">1. Pre-Built 4-Tap Websites</div>
+                      <div className="text-sm font-bold text-white">Auto-Build Client Sites in 10 Seconds</div>
+                      <p className="text-xs text-slate-400 leading-relaxed">
+                        Automatically detects businesses with no website or a low-converting website and builds them a live preview at <code>/site/:id</code>.
+                      </p>
+                    </div>
+                    <div className="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+                      <div className="text-xs font-bold uppercase text-emerald-400">2. 5-Star Review Shield</div>
+                      <div className="text-sm font-bold text-white">Block 1–3 Star Google Reviews</div>
+                      <p className="text-xs text-slate-400 leading-relaxed">
+                        Every business also gets a standalone Review Shield funnel + printable QR table stand at <code>/review/:id</code> that you can sell for $97–$147/mo.
+                      </p>
+                    </div>
+                    <div className="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+                      <div className="text-xs font-bold uppercase text-blue-400">3. Built-In Client Checkout</div>
+                      <div className="text-sm font-bold text-white">Keep 100% of Client Payments</div>
+                      <p className="text-xs text-slate-400 leading-relaxed">
+                        Includes 1, 3, and 12-month hosting checkout via Credit Card (Lemon Squeezy), Bank Transfer, and Crypto.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setLocation("/dashboard?tab=billing&plan=scale")}
+                      className="px-6 py-3 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-extrabold text-xs sm:text-sm transition-colors cursor-pointer"
+                    >
+                      👑 Upgrade to Agency Scale ($349/mo) to Unlock Now →
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLocation("/dashboard?tab=billing&plan=enterprise")}
+                      className="px-5 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white font-bold text-xs sm:text-sm transition-colors cursor-pointer"
+                    >
+                      View Enterprise VIP ($799/mo)
+                    </button>
+                  </div>
+                </div>
+              )}
             </TabsContent>
           )}
 

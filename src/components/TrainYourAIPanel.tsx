@@ -40,6 +40,47 @@ const PRESET_TEMPLATES: Array<{
   callToAction: string;
 }> = [
   {
+    id: "website_review_service",
+    label: "Website Creation & Review Service (Primary Offer)",
+    offerDetails:
+      "We build modern, high-converting websites and automated 5-star Google review generation systems for local businesses.",
+    servicesOffered: [
+      {
+        id: "srv_website_creation",
+        name: "Website Creation & Mobile Redesign",
+        description:
+          "Custom, fast-loading business website with mobile click-to-call, clear service pages, and instant quote/booking capture.",
+        targetSignals:
+          "No website, outdated design, weak mobile layout, or low conversion rate",
+      },
+      {
+        id: "srv_review_service",
+        name: "5-Star Review Service & Reputation Shield",
+        description:
+          "Direct review generation link and automated review funnel that routes happy clients to Google Reviews while capturing private feedback first.",
+        targetSignals:
+          "Low Google review count, inconsistent new reviews, or no direct review collection link",
+      },
+    ],
+    targetPainPoints:
+      "Missing or outdated website, mobile visitors dropping off without calling, and satisfied customers leaving without posting a 5-star Google review.",
+    subjectLineGuide: "New website preview & review page for {{BusinessName}}",
+    staticEmailExample: (sender, company) => `Hi {{BusinessName}} Team,
+
+I was looking at {{BusinessName}} in {{City}} today and put together a custom website preview and a 5-star Google review collection page tailored for your team.
+
+At ${company}, our primary focus is helping {{Category}} businesses turn more local searches into booked clients with a clean, mobile-ready website and a simple review system that steadily grows your 5-star reputation.
+
+If you're open to it, I can share the live website preview and review link for {{BusinessName}} right away.
+
+Best regards,
+${sender}
+${company}`,
+    aiInstructions:
+      "Evaluate each business's website audit and diagnostic signals first. Only make Website Creation and/or 5-Star Review Service the primary offer when the audit indicates the business actually needs a website/redesign or review generation system. Keep the cold email classic, simple, and professional, and naturally include the live website preview or review link when generated.",
+    callToAction: "Would you like me to send over the live website preview and review page for {{BusinessName}}?",
+  },
+  {
     id: "web_ai_agency",
     label: "Web Design, AI Receptionist & SEO",
     offerDetails:
@@ -669,6 +710,36 @@ export default function TrainYourAIPanel({
                 <Plus className="w-3.5 h-3.5" />
                 <span>Add Offer / Service</span>
               </button>
+            </div>
+
+            {/* Classic Primary Offer Quick-Select for Website Creation & Review Service */}
+            <div className="p-3 rounded-lg border border-slate-200 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="text-xs text-slate-700">
+                <span className="font-semibold text-slate-900">Website Creation &amp; Review Service:</span>{" "}
+                When selected, the AI checks each lead&apos;s audit first and sets Website Creation &amp; Review Service as their Primary Offer (with inline Website &amp; Review generation) whenever the audit indicates the business needs them.
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const sender = senderName.trim() || "Alex Morgan";
+                    const company = businessName.trim() || "Apex Digital Growth";
+                    const preset = PRESET_TEMPLATES.find((p) => p.id === "website_review_service");
+                    if (preset) {
+                      setOfferDetails(preset.offerDetails);
+                      setServicesOffered(preset.servicesOffered.map((s) => ({ ...s })));
+                      setTargetPainPoints(preset.targetPainPoints);
+                      setSubjectLineGuide(preset.subjectLineGuide);
+                      setStaticEmailTemplate(preset.staticEmailExample(sender, company));
+                      setAiInstructions(preset.aiInstructions);
+                      setCallToAction(preset.callToAction);
+                    }
+                  }}
+                  className="px-2.5 py-1.5 rounded-md text-xs font-semibold bg-slate-900 text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  Set Website Creation &amp; Review Service as Primary Offer
+                </button>
+              </div>
             </div>
 
             <div className="space-y-3.5">

@@ -176,13 +176,13 @@ Return ONLY valid JSON with two keys:
     let response;
     try {
       response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-3.1-flash-lite",
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         config: { maxOutputTokens: 1024 },
       });
     } catch {
       response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: "gemini-3.8-flash",
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         config: { maxOutputTokens: 1024 },
       });

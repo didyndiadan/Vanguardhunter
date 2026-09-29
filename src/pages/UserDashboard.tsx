@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useLocation } from "wouter";
 import {
   SaasUser,
@@ -6,12 +6,15 @@ import {
   SaasPayment,
   UserActivity,
   SupportMessage,
+  getSaasToken,
+  getCachedSaasUser,
   saasFetch,
   setSaasSession,
   clearSaasSession,
   isUserAdmin,
 } from "@/lib/saas-auth";
 import { ExportLeadsBar } from "@/components/ProjectWorkspaceBar";
+import MultiSmtpManagerPanel, { SmtpAppPasswordGuide } from "@/components/MultiSmtpManagerPanel";
 import {
   LeadProject,
   ExportableLead,
@@ -21,6 +24,8 @@ import {
   syncProjectsFromServer,
   setActiveProjectId,
   loadProjectHuntedResults,
+  loadUserProspects,
+  saveUserProspects,
 } from "@/lib/projects";
 import {
   LayoutDashboard,
@@ -45,9 +50,143 @@ import {
   MessageSquare,
   Send,
   Bell,
+  Mail,
+  Compass,
+  CheckCircle2,
+  ChevronRight,
+  Search,
+  ExternalLink,
+  ChevronDown,
+  ChevronUp,
+  FileText,
 } from "lucide-react";
 
-type DashboardTab = "overview" | "projects" | "support" | "billing" | "activities" | "settings";
+/**
+ * Extracts a clean, normalized domain from a website URL or email address
+ * e.g. "https://www.austinsmilesdental.com/about" -> "austinsmilesdental.com"
+ */
+function extractCleanDomain(urlOrEmail?: string): string {
+  if (!urlOrEmail) return "";
+  let raw = String(urlOrEmail).trim().toLowerCase();
+  if (!raw) return "";
+  if (raw.includes("@") && !raw.startsWith("http")) {
+    raw = raw.split("@").pop() || "";
+  }
+  raw = raw.replace(/^[a-z]+:\/\//i, "");
+  raw = raw.replace(/^www\./i, "");
+  raw = raw.split("/")[0].split("?")[0].split("#")[0].split(":")[0];
+  return raw.trim();
+}
+
+function matchesBusinessOrDomain(
+  rawQuery: string,
+  item: {
+    businessName?: string;
+    website?: string;
+    email?: string;
+    category?: string;
+    city?: string;
+    projectName?: string;
+    reportId?: string;
+  }
+): boolean {
+  const q = rawQuery.trim().toLowerCase();
+  if (!q) return true;
+  const qDomain = extractCleanDomain(q);
+
+  const bName = (item.businessName || "").toLowerCase();
+  const webRaw = (item.website || "").toLowerCase();
+  const webDomain = extractCleanDomain(item.website);
+  const emailRaw = (item.email || "").toLowerCase();
+  const emailDomain = extractCleanDomain(item.email);
+  const cat = (item.category || "").toLowerCase();
+  const city = (item.city || "").toLowerCase();
+  const proj = (item.projectName || "").toLowerCase();
+  const repId = (item.reportId || "").toLowerCase();
+
+  if (
+    bName.includes(q) ||
+    webRaw.includes(q) ||
+    webDomain.includes(q) ||
+    emailRaw.includes(q) ||
+    emailDomain.includes(q) ||
+    cat.includes(q) ||
+    city.includes(q) ||
+    proj.includes(q) ||
+    repId.includes(q)
+  ) {
+    return true;
+  }
+
+  if (
+    qDomain &&
+    qDomain.length >= 2 &&
+    (webDomain.includes(qDomain) || emailDomain.includes(qDomain) || bName.includes(qDomain))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+type DashboardTab = "overview" | "projects" | "smtp" | "support" | "billing" | "activities" | "settings";
+
+const DISCOVERY_PRESET_PLAYBOOKS = [
+  {
+    id: "dentist-austin",
+    category: "Dentist",
+    city: "Austin",
+    country: "USA",
+    count: "50",
+    context: "Focus on private dental & orthodontic practices missing 24/7 booking widgets",
+    note: "High-ticket patient booking & AI receptionist demand",
+  },
+  {
+    id: "medspa-miami",
+    category: "MedSpa",
+    city: "Miami",
+    country: "USA",
+    count: "50",
+    context: "Aesthetic clinics & medspas needing instant lead capture and review funnels",
+    note: "High-LTV cosmetic consultation & review shield fit",
+  },
+  {
+    id: "roofing-phoenix",
+    category: "Roofing & Solar",
+    city: "Phoenix",
+    country: "USA",
+    count: "50",
+    context: "Residential & commercial roofing contractors without instant quote calculators",
+    note: "High-value home service quote capture",
+  },
+  {
+    id: "law-chicago",
+    category: "Law Firm",
+    city: "Chicago",
+    country: "USA",
+    count: "50",
+    context: "Personal injury & family law practices needing 24/7 client intake qualification",
+    note: "High-retainer legal intake & qualification",
+  },
+  {
+    id: "realestate-toronto",
+    category: "Real Estate Agency",
+    city: "Toronto",
+    country: "Canada",
+    count: "50",
+    context: "Independent brokerages & property teams missing automated showing schedulers",
+    note: "Listing inquiry & automated showing scheduler",
+  },
+  {
+    id: "hvac-london",
+    category: "HVAC & Plumbing",
+    city: "London",
+    country: "UK",
+    count: "50",
+    context: "Emergency heating & plumbing services losing after-hours calls to competitors",
+    note: "Emergency dispatch & missed-call recovery",
+  },
+];
 
 interface BillingConfig {
   lemonStoreId: string;
@@ -71,9 +210,9 @@ export default function UserDashboard() {
   const [, setLocation] = useLocation();
   const [activeTab, setActiveTab] = useState<DashboardTab>("overview");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(() => !getCachedSaasUser());
 
-  const [user, setUser] = useState<SaasUser | null>(null);
+  const [user, setUser] = useState<SaasUser | null>(() => getCachedSaasUser());
   const [activePlan, setActivePlan] = useState<SaasPlan | null>(null);
   const [allPlans, setAllPlans] = useState<SaasPlan[]>([]);
   const [activities, setActivities] = useState<UserActivity[]>([]);
@@ -96,14 +235,9 @@ export default function UserDashboard() {
   });
   const [recentReports, setRecentReports] = useState<any[]>([]);
   const [projects, setProjects] = useState<LeadProject[]>(loadProjects);
-  const [savedProspectsList, setSavedProspectsList] = useState<ExportableLead[]>(() => {
-    try {
-      const raw = localStorage.getItem("ds_crm_prospects");
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [savedProspectsList, setSavedProspectsList] = useState<ExportableLead[]>(() =>
+    loadUserProspects<ExportableLead>()
+  );
   const [newProjName, setNewProjName] = useState("");
   const [showNewProjForm, setShowNewProjForm] = useState(false);
 
@@ -123,6 +257,26 @@ export default function UserDashboard() {
   const [quickCategory, setQuickCategory] = useState("Dentist");
   const [quickCity, setQuickCity] = useState("Austin");
   const [quickCountry, setQuickCountry] = useState("USA");
+  const [quickCount, setQuickCount] = useState("50");
+  const [quickContext, setQuickContext] = useState("");
+  const [highlightQuickHunt, setHighlightQuickHunt] = useState(false);
+
+  // Getting Started & Lead Discovery Guided Tour state
+  const [showTourModal, setShowTourModal] = useState(false);
+  const [tourStep, setTourStep] = useState<1 | 2 | 3 | 4>(1);
+  const [tourDismissed, setTourDismissed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("vh_getting_started_dismissed") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [tourSelectedProjectId, setTourSelectedProjectId] = useState<string>(() => {
+    const initialProjects = loadProjects();
+    return initialProjects[0]?.id || DEFAULT_PROJECT_ID;
+  });
+  const [tourNewProjectName, setTourNewProjectName] = useState("");
+  const [tourProjectCreatedNotice, setTourProjectCreatedNotice] = useState("");
 
   // Profile Settings state
   const [profileName, setProfileName] = useState("");
@@ -133,14 +287,27 @@ export default function UserDashboard() {
   // Activity filter state
   const [activityFilter, setActivityFilter] = useState<string>("all");
 
+  // Search bar state for filtering generated reports & saved lead lists by business name or domain
+  const [dashboardSearchQuery, setDashboardSearchQuery] = useState<string>("");
+  const [searchScope, setSearchScope] = useState<"all" | "leads" | "reports">("all");
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Record<string, boolean>>({});
+  const [showAllReports, setShowAllReports] = useState<boolean>(false);
+  const dashboardSearchInputRef = useRef<HTMLInputElement | null>(null);
+
   const loadDashboard = useCallback(async () => {
+    if (!getSaasToken()) {
+      clearSaasSession();
+      setLocation("/auth?mode=login&redirect=/dashboard");
+      return;
+    }
     setLoading(true);
     try {
-      const [meData, plansData, cfgData, reportsData] = await Promise.all([
+      const [meData, plansData, cfgData, reportsData, crmData] = await Promise.all([
         saasFetch("/api/saas/auth/me"),
         fetch("/api/saas/plans").then((r) => r.json()),
         fetch("/api/saas/billing/config").then((r) => r.json()),
         saasFetch("/api/reports").catch(() => ({ reports: [] })),
+        saasFetch("/api/crm/prospects").catch(() => ({ prospects: [] })),
       ]);
 
       if (meData.user) {
@@ -148,6 +315,19 @@ export default function UserDashboard() {
         setProfileName(meData.user.fullName);
         setProfileCompany(meData.user.companyName);
         localStorage.setItem("vh_saas_user", JSON.stringify(meData.user));
+        // Now that vh_saas_user is set to the authenticated user, reload user-scoped projects & prospects
+        setProjects(loadProjects());
+        const localProspects = loadUserProspects<ExportableLead>();
+        const serverProspects: ExportableLead[] = Array.isArray(crmData?.prospects) ? crmData.prospects : [];
+        if (serverProspects.length > 0 && localProspects.length === 0) {
+          saveUserProspects(serverProspects);
+          setSavedProspectsList(serverProspects);
+        } else {
+          setSavedProspectsList(localProspects);
+        }
+        syncProjectsFromServer().then((merged) => {
+          if (merged.length > 0) setProjects(merged);
+        });
       }
       if (meData.plan) setActivePlan(meData.plan);
       if (Array.isArray(meData.activities)) setActivities(meData.activities);
@@ -160,38 +340,178 @@ export default function UserDashboard() {
         setUnreadSupportCount(unread);
       }
       if (meData.workspaceCounts) setWorkspaceCounts(meData.workspaceCounts);
-      if (Array.isArray(plansData.plans)) setAllPlans(plansData.plans);
+      if (Array.isArray(plansData.plans)) {
+        setAllPlans(plansData.plans);
+        const urlParams = new URLSearchParams(window.location.search);
+        const requestedPlanId = urlParams.get("plan");
+        const requestedCycle = urlParams.get("cycle");
+        if (requestedCycle === "annual" || requestedCycle === "monthly") {
+          setBillingCycle(requestedCycle);
+        }
+        if (requestedPlanId) {
+          const matchedPlan = plansData.plans.find((p: SaasPlan) => p.id === requestedPlanId);
+          if (matchedPlan) {
+            setCheckoutPlan(matchedPlan);
+            setActiveTab("billing");
+          }
+        }
+      }
       if (cfgData) setBillingConfig(cfgData);
       if (Array.isArray(reportsData)) {
-        setRecentReports(reportsData.slice(0, 6));
+        setRecentReports(reportsData);
       } else if (Array.isArray(reportsData?.reports)) {
-        setRecentReports(reportsData.reports.slice(0, 6));
+        setRecentReports(reportsData.reports);
       }
     } catch (err) {
       console.error("Failed to load user dashboard:", err);
+      clearSaasSession();
+      setLocation("/auth?mode=login&redirect=/dashboard");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [setLocation]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const tabParam = params.get("tab") as DashboardTab | null;
     if (
       tabParam &&
-      ["overview", "projects", "support", "billing", "activities", "settings"].includes(tabParam)
+      ["overview", "projects", "smtp", "support", "billing", "activities", "settings"].includes(tabParam)
     ) {
       setActiveTab(tabParam);
     }
+    const cycleParam = params.get("cycle");
+    if (cycleParam === "annual" || cycleParam === "monthly") {
+      setBillingCycle(cycleParam);
+    }
+    if (params.get("tour") === "1" || params.get("onboarding") === "1") {
+      setShowTourModal(true);
+      setTourStep(1);
+    }
     loadDashboard();
-    syncProjectsFromServer().then((merged) => {
-      if (merged.length > 0) setProjects(merged);
-    });
-    try {
-      const raw = localStorage.getItem("ds_crm_prospects");
-      if (raw) setSavedProspectsList(JSON.parse(raw));
-    } catch {}
+    setSavedProspectsList(loadUserProspects<ExportableLead>());
   }, [loadDashboard]);
+
+  useEffect(() => {
+    if (projects.length > 0 && !projects.some((p) => p.id === tourSelectedProjectId)) {
+      setTourSelectedProjectId(projects[0].id);
+    }
+  }, [projects, tourSelectedProjectId]);
+
+  // Keyboard shortcut (⌘K / Ctrl+K or '/') to quickly focus the dashboard search bar
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isEditable =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        if (activeTab !== "overview" && activeTab !== "projects") {
+          setActiveTab("overview");
+        }
+        setTimeout(() => {
+          dashboardSearchInputRef.current?.focus();
+          dashboardSearchInputRef.current?.select();
+        }, 40);
+      } else if (!isEditable && e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (activeTab === "overview" || activeTab === "projects") {
+          e.preventDefault();
+          dashboardSearchInputRef.current?.focus();
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [activeTab]);
+
+  const openTourStep = (step: 1 | 2 | 3 | 4 = 1) => {
+    setTourStep(step);
+    setShowTourModal(true);
+    setMobileMenuOpen(false);
+  };
+
+  const handleDismissTourBanner = () => {
+    setTourDismissed(true);
+    try {
+      localStorage.setItem("vh_getting_started_dismissed", "1");
+    } catch {}
+  };
+
+  const handleCreateProjectInsideTour = (e: React.FormEvent) => {
+    e.preventDefault();
+    const finalName = tourNewProjectName.trim() || `${quickCategory} - ${quickCity}`;
+    const now = new Date().toISOString();
+    const created: LeadProject = {
+      id: `proj_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      name: finalName,
+      description: `Lead discovery campaign for ${quickCategory} in ${quickCity}, ${quickCountry}`,
+      targetCategory: quickCategory,
+      targetCity: quickCity,
+      targetCountry: quickCountry,
+      extraContext: quickContext,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const next = [...projects, created];
+    setProjects(next);
+    saveProjects(next);
+    setActiveProjectId(created.id);
+    setTourSelectedProjectId(created.id);
+    setTourNewProjectName("");
+    setTourProjectCreatedNotice(`Project "${created.name}" created and selected.`);
+  };
+
+  const handleLaunchTourDiscovery = (autoRunInCrm: boolean) => {
+    const chosenProjId = tourSelectedProjectId || projects[0]?.id || DEFAULT_PROJECT_ID;
+    setActiveProjectId(chosenProjId);
+    // Update the selected project's target fields so it remembers the user's first discovery settings
+    const updatedProjects = projects.map((p) =>
+      p.id === chosenProjId
+        ? {
+            ...p,
+            targetCategory: quickCategory.trim() || "Dentist",
+            targetCity: quickCity.trim() || "Austin",
+            targetCountry: quickCountry.trim() || "USA",
+            extraContext: quickContext.trim(),
+            updatedAt: new Date().toISOString(),
+          }
+        : p
+    );
+    setProjects(updatedProjects);
+    saveProjects(updatedProjects);
+
+    localStorage.setItem(
+      "vh_quick_hunt",
+      JSON.stringify({
+        category: quickCategory.trim() || "Dentist",
+        city: quickCity.trim() || "Austin",
+        country: quickCountry.trim() || "USA",
+        count: quickCount || "50",
+        extraContext: quickContext.trim(),
+        autoRun: autoRunInCrm,
+      })
+    );
+    setShowTourModal(false);
+    setLocation(`/crm?tab=hunter&project=${encodeURIComponent(chosenProjId)}`);
+  };
+
+  const handleApplyTourToQuickBar = () => {
+    setShowTourModal(false);
+    setActiveTab("overview");
+    setHighlightQuickHunt(true);
+    setTimeout(() => {
+      const el = document.getElementById("quick-lead-hunt-launcher");
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }, 80);
+    setTimeout(() => setHighlightQuickHunt(false), 4000);
+  };
 
   const getProjectLeads = useCallback(
     (projectId: string): ExportableLead[] => {
@@ -407,9 +727,16 @@ export default function UserDashboard() {
           cardLast4,
         }),
       });
+      if (res.user) {
+        setUser(res.user);
+        setSaasSession(getSaasToken(), res.user);
+      }
+      if (res.plan) {
+        setActivePlan(res.plan);
+      }
       setCheckoutStatus({ type: "success", text: res.message || "Subscription upgraded via Lemon Squeezy!" });
       await loadDashboard();
-      setTimeout(() => setCheckoutPlan(null), 1600);
+      setTimeout(() => setCheckoutPlan(null), 2200);
     } catch (err: any) {
       setCheckoutStatus({ type: "error", text: err.message || "Lemon Squeezy checkout failed" });
     } finally {
@@ -435,10 +762,17 @@ export default function UserDashboard() {
           autoVerify: true,
         }),
       });
+      if (res.user) {
+        setUser(res.user);
+        setSaasSession(getSaasToken(), res.user);
+      }
+      if (res.plan) {
+        setActivePlan(res.plan);
+      }
       setCheckoutStatus({ type: "success", text: res.message || "Crypto payment verified!" });
       setCryptoTxHash("");
       await loadDashboard();
-      setTimeout(() => setCheckoutPlan(null), 1600);
+      setTimeout(() => setCheckoutPlan(null), 2200);
     } catch (err: any) {
       setCheckoutStatus({ type: "error", text: err.message || "Crypto submission failed" });
     } finally {
@@ -482,14 +816,95 @@ export default function UserDashboard() {
     } catch {}
   };
 
-  const huntLimit = activePlan?.monthlyHuntLimit || 1000;
-  const emailLimit = activePlan?.monthlyEmailLimit || 3000;
-  const huntsPct = Math.min(100, Math.round(((user?.huntsUsedThisMonth || 0) / huntLimit) * 100));
-  const emailsPct = Math.min(100, Math.round(((user?.emailsSentThisMonth || 0) / emailLimit) * 100));
+  const isFreePlanUser = (user?.planId || activePlan?.id) === "free";
+  const huntLimit = activePlan?.monthlyHuntLimit ?? (isFreePlanUser ? 50 : 1000);
+  const emailLimit = activePlan?.monthlyEmailLimit ?? (isFreePlanUser ? 150 : 3000);
+  const huntsPct = Math.min(100, Math.round(((user?.huntsUsedThisMonth || 0) / Math.max(1, huntLimit)) * 100));
+  const emailsPct = Math.min(100, Math.round(((user?.emailsSentThisMonth || 0) / Math.max(1, emailLimit)) * 100));
 
   const filteredActivities = activities.filter((a) =>
     activityFilter === "all" ? true : a.category === activityFilter
   );
+
+  const normalizedSearchQuery = dashboardSearchQuery.trim();
+  const isSearchActive = normalizedSearchQuery.length > 0;
+
+  // Filter generated website audit reports by business name or domain
+  const filteredReports = useMemo(() => {
+    if (!isSearchActive) return recentReports;
+    return recentReports.filter((r: any) =>
+      matchesBusinessOrDomain(normalizedSearchQuery, {
+        businessName: r.businessName,
+        website: r.website,
+        reportId: r.reportId,
+        category: r.category,
+        city: r.city,
+      })
+    );
+  }, [recentReports, isSearchActive, normalizedSearchQuery]);
+
+  const visibleReports = useMemo(() => {
+    if (isSearchActive || showAllReports) return filteredReports;
+    return filteredReports.slice(0, 6);
+  }, [filteredReports, isSearchActive, showAllReports]);
+
+  // Compute per-project lead lists and filtered leads by business name or domain
+  const projectLeadSummaries = useMemo(() => {
+    return projects.map((proj) => {
+      const allLeads = getProjectLeads(proj.id);
+      const matchingLeads = !isSearchActive
+        ? allLeads
+        : allLeads.filter((lead) =>
+            matchesBusinessOrDomain(normalizedSearchQuery, {
+              businessName: lead.businessName,
+              website: lead.website,
+              email: lead.email,
+              category: lead.category || proj.targetCategory,
+              city: lead.city || proj.targetCity,
+              projectName: proj.name,
+            })
+          );
+      const projectMetaMatches =
+        isSearchActive &&
+        matchesBusinessOrDomain(normalizedSearchQuery, {
+          businessName: proj.name,
+          category: proj.targetCategory,
+          city: proj.targetCity,
+          projectName: proj.name,
+        });
+      return {
+        project: proj,
+        allLeads,
+        matchingLeads,
+        projectMetaMatches,
+        hasMatch: !isSearchActive || matchingLeads.length > 0 || projectMetaMatches,
+      };
+    });
+  }, [projects, getProjectLeads, isSearchActive, normalizedSearchQuery]);
+
+  const visibleProjectSummaries = useMemo(() => {
+    if (!isSearchActive) return projectLeadSummaries;
+    return projectLeadSummaries.filter((item) => item.hasMatch);
+  }, [projectLeadSummaries, isSearchActive]);
+
+  const totalSavedLeadsCount = useMemo(
+    () => projectLeadSummaries.reduce((acc, item) => acc + item.allLeads.length, 0),
+    [projectLeadSummaries]
+  );
+
+  const matchingSavedLeads = useMemo(() => {
+    if (!isSearchActive) {
+      return projectLeadSummaries.flatMap((item) => item.allLeads);
+    }
+    return projectLeadSummaries.flatMap((item) => item.matchingLeads);
+  }, [projectLeadSummaries, isSearchActive]);
+
+  const toggleProjectExpand = (projectId: string) => {
+    setExpandedProjectIds((prev) => ({
+      ...prev,
+      [projectId]: !prev[projectId],
+    }));
+  };
 
   const sidebarContent = (
     <>
@@ -526,17 +941,24 @@ export default function UserDashboard() {
             <div className="text-xs font-semibold text-white truncate">
               {user?.companyName || "Apex Digital Growth"}
             </div>
-            <div className="text-[11px] text-slate-400 truncate mt-0.5">
-              {user?.email || "founder@apexagency.io"}
+            <div className="flex items-center justify-between gap-1.5 mt-0.5">
+              <span className="text-[11px] text-slate-400 truncate">
+                {user?.email || "founder@apexagency.io"}
+              </span>
+              <span className="shrink-0 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700/50 text-[10px] font-semibold text-emerald-400">
+                ✓ Verified
+              </span>
             </div>
             <div className="mt-2.5 pt-2.5 border-t border-slate-800 flex items-center justify-between text-[11px]">
               <span className="text-slate-400">Active Tier</span>
-              <span className="font-semibold text-blue-400 uppercase">{activePlan?.name || user?.planId || "Growth"}</span>
+              <span className="font-semibold text-[#C4B5FD] uppercase">
+                {activePlan?.name || (user?.planId === "free" ? "Free Explorer" : user?.planId) || "Free Explorer"}
+              </span>
             </div>
             <div className="mt-1 flex items-center justify-between text-[11px]">
               <span className="text-slate-400">Lead Credits</span>
               <span className="font-mono-num font-semibold text-emerald-400">
-                {(user?.creditsBalance ?? 4815).toLocaleString()}
+                {(user?.creditsBalance ?? (isFreePlanUser ? 50 : 1000)).toLocaleString()}
               </span>
             </div>
           </div>
@@ -586,6 +1008,24 @@ export default function UserDashboard() {
                 <span>AI Lead Hunter & CRM</span>
               </span>
               <ArrowUpRight className="w-3.5 h-3.5 text-slate-500" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleSelectTab("smtp")}
+              className={`w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-medium rounded-lg transition-colors cursor-pointer ${
+                activeTab === "smtp"
+                  ? "bg-blue-600 text-white"
+                  : "text-slate-400 hover:text-white hover:bg-slate-900"
+              }`}
+            >
+              <span className="flex items-center gap-3">
+                <Mail className="w-4 h-4 text-emerald-400" />
+                <span>Multi-SMTP & Gmails</span>
+              </span>
+              <span className="font-mono-num text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
+                Guide
+              </span>
             </button>
 
             <button
@@ -672,6 +1112,20 @@ export default function UserDashboard() {
 
             <button
               type="button"
+              onClick={() => openTourStep(1)}
+              className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-semibold rounded-lg bg-[#7C3AED]/20 hover:bg-[#7C3AED]/30 text-[#DDD6FE] border border-[#8B3DFF]/35 transition-colors cursor-pointer mb-1.5"
+            >
+              <span className="flex items-center gap-2.5">
+                <Compass className="w-4 h-4 text-[#C4B5FD]" />
+                <span>Getting Started Tour</span>
+              </span>
+              <span className="font-mono-num text-[10px] px-1.5 py-0.5 rounded bg-[#8B3DFF]/30 text-white">
+                4 Steps
+              </span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => {
                 setMobileMenuOpen(false);
                 setLocation("/landing");
@@ -702,21 +1156,21 @@ export default function UserDashboard() {
   );
 
   return (
-    <div className="min-h-screen w-full max-w-[100vw] overflow-x-hidden bg-[#F8FAFC] text-slate-900 flex flex-col lg:flex-row">
+    <div className="min-h-screen w-full max-w-[100vw] overflow-x-hidden bg-[#FAF9F5] text-[#0B0F17] flex flex-col lg:flex-row">
       {/* Desktop Left Sidebar ($260px Workspace Canvas) */}
-      <aside className="hidden lg:flex w-[260px] shrink-0 bg-slate-950 text-slate-200 border-r border-slate-800 flex-col justify-between">
+      <aside className="hidden lg:flex w-[260px] shrink-0 bg-[#0B0F17] text-slate-200 border-r border-slate-800 flex-col justify-between">
         {sidebarContent}
       </aside>
 
       {/* Mobile Slide-Over Sidebar Drawer */}
       {mobileMenuOpen && (
         <div
-          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs lg:hidden flex"
+          className="fixed inset-0 z-50 bg-[#0B0F17]/65 backdrop-blur-xs lg:hidden flex"
           onClick={(e) => {
             if (e.target === e.currentTarget) setMobileMenuOpen(false);
           }}
         >
-          <aside className="w-[270px] max-w-[85vw] h-full overflow-y-auto bg-slate-950 text-slate-200 border-r border-slate-800 flex flex-col justify-between shadow-2xl">
+          <aside className="w-[270px] max-w-[85vw] h-full overflow-y-auto bg-[#0B0F17] text-slate-200 border-r border-slate-800 flex flex-col justify-between shadow-2xl">
             {sidebarContent}
           </aside>
         </div>
@@ -725,12 +1179,12 @@ export default function UserDashboard() {
       {/* Main Content Viewport */}
       <div className="flex-1 flex flex-col min-w-0 w-full">
         {/* Top Bar Contract for SaaS Dashboard with Mobile Drawer Toggle & Explicit Back Button */}
-        <header className="bg-white border-b border-slate-200 px-4 sm:px-8 py-3 sm:h-16 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <header className="bg-white border-b border-[#E4E2DD] px-4 sm:px-8 py-3 sm:h-16 flex flex-wrap items-center justify-between gap-2 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
             <button
               type="button"
               onClick={() => setMobileMenuOpen(true)}
-              className="lg:hidden p-2 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-100 cursor-pointer"
+              className="lg:hidden p-2 rounded-lg border border-[#E4E2DD] text-[#0B0F17] hover:bg-[#F2F0EA] cursor-pointer"
               aria-label="Open workspace menu"
             >
               <Menu className="w-4 h-4" />
@@ -739,26 +1193,66 @@ export default function UserDashboard() {
             <button
               type="button"
               onClick={handleGoBack}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors cursor-pointer shrink-0"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#0B0F17] bg-[#F2F0EA] hover:bg-[#E4E2DD] transition-colors cursor-pointer shrink-0"
             >
               <ArrowLeft className="w-3.5 h-3.5" />
               <span>Back</span>
             </button>
 
-            <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500 truncate">
+            <div className="flex items-center gap-1.5 text-xs font-medium text-[#525866] truncate">
               <span className="hidden sm:inline">Workspace</span>
               <span className="hidden sm:inline" aria-hidden="true">/</span>
-              <span className="text-slate-900 font-semibold capitalize truncate">{activeTab}</span>
+              <span className="text-[#0B0F17] font-semibold capitalize truncate">{activeTab}</span>
               <span className="hidden md:inline" aria-hidden="true">·</span>
               <span className="hidden md:inline truncate">{user?.fullName || "Elena Vance"}</span>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Quick Header Search Input for Reports & Saved Leads */}
+            <div className="relative hidden xl:block w-64">
+              <Search className="w-3.5 h-3.5 text-[#525866] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={dashboardSearchQuery}
+                onChange={(e) => {
+                  setDashboardSearchQuery(e.target.value);
+                  if (activeTab !== "overview" && activeTab !== "projects") {
+                    setActiveTab("overview");
+                  }
+                }}
+                placeholder="Filter reports & leads by name/domain..."
+                aria-label="Filter generated reports and saved lead lists by business name or domain"
+                className="w-full pl-8 pr-12 py-1.5 text-xs bg-[#FAF9F5] border border-[#E4E2DD] rounded-lg text-[#0B0F17] placeholder:text-[#525866] focus:outline-none focus:bg-white focus:border-[#1D4ED8] transition-colors"
+              />
+              {dashboardSearchQuery ? (
+                <button
+                  type="button"
+                  onClick={() => setDashboardSearchQuery("")}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-[#525866] hover:text-[#0B0F17] cursor-pointer"
+                  title="Clear search"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              ) : (
+                <span className="font-mono-num text-[10px] text-[#525866] bg-white border border-[#E4E2DD] rounded px-1 py-0.2 absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none">
+                  ⌘K
+                </span>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => openTourStep(1)}
+              className="px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-[#5B21B6] bg-[#EDE9FE] hover:bg-[#DDD6FE] border border-[#7C3AED]/30 rounded-lg whitespace-nowrap flex items-center gap-1.5 cursor-pointer transition-colors"
+            >
+              <Compass className="w-3.5 h-3.5 text-[#7C3AED]" />
+              <span>Getting Started</span>
+            </button>
             <button
               type="button"
               onClick={loadDashboard}
-              className="px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 border border-slate-200 rounded-lg flex items-center gap-1.5 cursor-pointer"
+              className="px-2.5 sm:px-3 py-1.5 text-xs font-medium text-[#525866] hover:text-[#0B0F17] border border-[#E4E2DD] rounded-lg flex items-center gap-1.5 cursor-pointer"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
               <span className="hidden sm:inline">Sync</span>
@@ -766,9 +1260,9 @@ export default function UserDashboard() {
             <button
               type="button"
               onClick={() => setActiveTab("support")}
-              className="px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-slate-700 hover:text-slate-950 bg-slate-100 hover:bg-slate-200 rounded-lg whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
+              className="px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-[#0B0F17] bg-[#F2F0EA] hover:bg-[#E4E2DD] rounded-lg whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
             >
-              <MessageSquare className="w-3.5 h-3.5 text-blue-600" />
+              <MessageSquare className="w-3.5 h-3.5 text-[#1D4ED8]" />
               <span className="hidden sm:inline">Support</span>
               {unreadSupportCount > 0 && (
                 <span className="px-1.5 py-0.2 rounded-full bg-emerald-600 text-white text-[10px] font-bold">
@@ -779,7 +1273,7 @@ export default function UserDashboard() {
             <button
               type="button"
               onClick={() => setActiveTab("billing")}
-              className="px-2.5 sm:px-3.5 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg whitespace-nowrap cursor-pointer"
+              className="px-2.5 sm:px-3.5 py-1.5 text-xs font-semibold text-[#0B0F17] bg-[#F2F0EA] hover:bg-[#E4E2DD] rounded-lg whitespace-nowrap cursor-pointer"
             >
               <span className="sm:hidden">Billing</span>
               <span className="hidden sm:inline">Upgrade Plan / Crypto Top-Up</span>
@@ -787,22 +1281,34 @@ export default function UserDashboard() {
             <button
               type="button"
               onClick={() => setLocation("/crm")}
-              className="px-3 sm:px-4 py-1.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg whitespace-nowrap cursor-pointer"
+              className="px-3 sm:px-4 py-1.5 text-xs font-semibold text-white bg-gradient-to-r from-[#8B3DFF] to-[#4F46E5] hover:from-[#7C3AED] hover:to-[#4338CA] rounded-lg whitespace-nowrap cursor-pointer"
             >
               + Hunt Leads
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                clearSaasSession();
+                setLocation("/landing");
+              }}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg whitespace-nowrap cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Sign Out</span>
             </button>
           </div>
         </header>
 
-        {/* Mobile Quick-Navigation Tab Strip (prevents side-navigation scatter on phones) */}
-        <div className="lg:hidden bg-white border-b border-slate-200 px-4 py-2 flex items-center gap-1.5 overflow-x-auto">
+        {/* Mobile Quick-Navigation Tab Strip */}
+        <div className="lg:hidden bg-white border-b border-[#E4E2DD] px-4 py-2 flex items-center gap-1.5 overflow-x-auto">
           {(
             [
               { id: "overview", label: "Overview" },
-              { id: "projects", label: `📁 Projects (${projects.length})` },
+              { id: "projects", label: `Projects (${projects.length})` },
+              { id: "smtp", label: "Multi-SMTP & Gmail" },
               {
                 id: "support",
-                label: unreadSupportCount > 0 ? `💬 Support (${unreadSupportCount} New)` : "💬 Support & Inbox",
+                label: unreadSupportCount > 0 ? `Support (${unreadSupportCount} New)` : "Support & Inbox",
               },
               { id: "billing", label: "Plans & Crypto" },
               { id: "activities", label: "Activity Log" },
@@ -815,8 +1321,8 @@ export default function UserDashboard() {
               onClick={() => setActiveTab(t.id)}
               className={`px-3 py-1.5 text-xs font-semibold rounded-lg whitespace-nowrap transition-colors cursor-pointer ${
                 activeTab === t.id
-                  ? "bg-slate-950 text-white"
-                  : "bg-slate-100 text-slate-600 hover:text-slate-950"
+                  ? "bg-[#0B0F17] text-white"
+                  : "bg-[#F2F0EA] text-[#525866] hover:text-[#0B0F17]"
               }`}
             >
               {t.label}
@@ -825,7 +1331,7 @@ export default function UserDashboard() {
           <button
             type="button"
             onClick={() => setLocation("/crm")}
-            className="px-3 py-1.5 text-xs font-semibold rounded-lg whitespace-nowrap bg-blue-50 text-blue-700 cursor-pointer"
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg whitespace-nowrap bg-[#EFF6FF] text-[#1D4ED8] cursor-pointer"
           >
             CRM Hunter →
           </button>
@@ -841,38 +1347,354 @@ export default function UserDashboard() {
         </div>
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-[1240px] w-full mx-auto space-y-6 sm:space-y-8 overflow-x-hidden">
+          {/* UNIFIED SEARCH & FILTER BAR FOR GENERATED REPORTS & SAVED LEAD LISTS */}
+          {(activeTab === "overview" || activeTab === "projects") && (
+            <div className="p-4 sm:p-5 bg-white rounded-xl border border-[#E4E2DD] space-y-3.5">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div className="relative flex-1">
+                  <Search className="w-4 h-4 text-[#525866] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    ref={dashboardSearchInputRef}
+                    type="text"
+                    value={dashboardSearchQuery}
+                    onChange={(e) => setDashboardSearchQuery(e.target.value)}
+                    placeholder="Search generated audit reports & saved lead lists by business name or domain (e.g. Austin Smiles, austinsmiles.com)..."
+                    aria-label="Search generated reports and saved lead lists by business name or domain"
+                    className="w-full pl-10 pr-24 py-2.5 text-xs sm:text-sm bg-[#FAF9F5] border border-[#E4E2DD] rounded-lg text-[#0B0F17] placeholder:text-[#525866] focus:outline-none focus:bg-white focus:border-[#1D4ED8] focus:ring-2 focus:ring-[#1D4ED8]/15 transition-all"
+                  />
+                  <div className="absolute right-2.5 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
+                    {dashboardSearchQuery ? (
+                      <button
+                        type="button"
+                        onClick={() => setDashboardSearchQuery("")}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-[#F2F0EA] hover:bg-[#E4E2DD] text-[#0B0F17] cursor-pointer"
+                      >
+                        <X className="w-3 h-3" />
+                        <span>Clear</span>
+                      </button>
+                    ) : (
+                      <span className="hidden sm:inline-block font-mono-num text-[11px] text-[#525866] bg-white border border-[#E4E2DD] px-1.5 py-0.5 rounded">
+                        ⌘K or /
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                  {(
+                    [
+                      {
+                        id: "all",
+                        label: "All Workspace",
+                        count: matchingSavedLeads.length + filteredReports.length,
+                      },
+                      {
+                        id: "leads",
+                        label: "Saved Lead Lists",
+                        count: matchingSavedLeads.length,
+                      },
+                      {
+                        id: "reports",
+                        label: "Generated Reports",
+                        count: filteredReports.length,
+                      },
+                    ] as const
+                  ).map((scope) => (
+                    <button
+                      key={scope.id}
+                      type="button"
+                      onClick={() => setSearchScope(scope.id)}
+                      className={`px-3 py-2 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 cursor-pointer ${
+                        searchScope === scope.id
+                          ? "bg-[#0B0F17] text-white"
+                          : "bg-[#FAF9F5] text-[#525866] hover:text-[#0B0F17] border border-[#E4E2DD]"
+                      }`}
+                    >
+                      <span>{scope.label}</span>
+                      <span
+                        className={`font-mono-num text-[11px] px-1.5 py-0.2 rounded ${
+                          searchScope === scope.id
+                            ? "bg-white/15 text-white"
+                            : "bg-white text-[#0B0F17] border border-[#E4E2DD]"
+                        }`}
+                      >
+                        {scope.count}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Active Search Live Match Breakdown & Instant Filtered Results */}
+              {isSearchActive && (
+                <div className="pt-3 border-t border-[#E4E2DD] space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div className="flex flex-wrap items-center gap-2 text-[#525866]">
+                      <span>
+                        Filtering by business name or domain:{" "}
+                        <strong className="text-[#0B0F17] font-mono-num">"{normalizedSearchQuery}"</strong>
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-mono-num font-semibold text-[#1D4ED8]">
+                        {matchingSavedLeads.length} matching{" "}
+                        {matchingSavedLeads.length === 1 ? "saved lead" : "saved leads"}
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-mono-num font-semibold text-emerald-700">
+                        {filteredReports.length} matching{" "}
+                        {filteredReports.length === 1 ? "audit report" : "audit reports"}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDashboardSearchQuery("");
+                        setSearchScope("all");
+                      }}
+                      className="text-xs font-semibold text-[#1D4ED8] hover:underline cursor-pointer"
+                    >
+                      Reset Filter
+                    </button>
+                  </div>
+
+                  {/* Instant Filtered Results Grid when user is searching */}
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                    {(searchScope === "all" || searchScope === "leads") && (
+                      <div
+                        className={`${
+                          searchScope === "leads" ? "lg:col-span-12" : "lg:col-span-7"
+                        } rounded-xl border border-slate-200 bg-[#FAF9F5] overflow-hidden`}
+                      >
+                        <div className="px-4 py-2.5 bg-white border-b border-slate-200 flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <FolderKanban className="w-3.5 h-3.5 text-blue-600" />
+                            <span className="text-xs font-bold text-slate-950">
+                              Matching Leads in Saved Lists ({matchingSavedLeads.length})
+                            </span>
+                          </div>
+                          {matchingSavedLeads.length > 0 && (
+                            <ExportLeadsBar
+                              leads={matchingSavedLeads}
+                              projectName={`filtered-${normalizedSearchQuery}`}
+                              compact
+                            />
+                          )}
+                        </div>
+                        {matchingSavedLeads.length === 0 ? (
+                          <div className="p-5 text-center text-xs text-slate-500">
+                            No saved leads match "{normalizedSearchQuery}" by business name or domain.
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-slate-200 max-h-64 overflow-y-auto bg-white">
+                            {matchingSavedLeads.slice(0, 25).map((lead, idx) => {
+                              const cleanDom =
+                                extractCleanDomain(lead.website) || extractCleanDomain(lead.email);
+                              return (
+                                <div
+                                  key={`${lead.projectId || "p"}-${lead.id || idx}`}
+                                  className="px-4 py-2.5 flex items-center justify-between gap-3 hover:bg-slate-50"
+                                >
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <span className="text-xs font-bold text-slate-950 truncate">
+                                        {lead.businessName}
+                                      </span>
+                                      {cleanDom && (
+                                        <span className="font-mono-num text-[11px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 truncate">
+                                          {cleanDom}
+                                        </span>
+                                      )}
+                                      {lead.projectName && (
+                                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
+                                          {lead.projectName}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="text-[11px] text-slate-500 truncate mt-0.5">
+                                      {[lead.category, lead.city, lead.email].filter(Boolean).join(" · ") ||
+                                        "Saved workspace prospect"}
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    {lead.reportUrl && (
+                                      <button
+                                        type="button"
+                                        onClick={() => setLocation(lead.reportUrl!)}
+                                        className="px-2.5 py-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-md cursor-pointer"
+                                      >
+                                        Audit
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleOpenProjectInCRM(
+                                          lead.projectId || projects[0]?.id || DEFAULT_PROJECT_ID
+                                        )
+                                      }
+                                      className="px-2.5 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-50 rounded-md cursor-pointer"
+                                    >
+                                      Open in CRM →
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {(searchScope === "all" || searchScope === "reports") && (
+                      <div
+                        className={`${
+                          searchScope === "reports" ? "lg:col-span-12" : "lg:col-span-5"
+                        } rounded-xl border border-slate-200 bg-[#FAF9F5] overflow-hidden`}
+                      >
+                        <div className="px-4 py-2.5 bg-white border-b border-slate-200 flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <FileText className="w-3.5 h-3.5 text-emerald-600" />
+                            <span className="text-xs font-bold text-slate-950">
+                              Matching Audit Reports ({filteredReports.length})
+                            </span>
+                          </div>
+                        </div>
+                        {filteredReports.length === 0 ? (
+                          <div className="p-5 text-center text-xs text-slate-500">
+                            No generated website reports match "{normalizedSearchQuery}".
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-slate-200 max-h-64 overflow-y-auto bg-white">
+                            {filteredReports.map((r: any) => {
+                              const cleanDom = extractCleanDomain(r.website);
+                              return (
+                                <div
+                                  key={r.reportId}
+                                  className="px-4 py-2.5 flex items-center justify-between gap-3 hover:bg-slate-50"
+                                >
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <span className="text-xs font-bold text-slate-950 truncate">
+                                        {r.businessName || r.reportId}
+                                      </span>
+                                      {cleanDom && (
+                                        <span className="font-mono-num text-[11px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 truncate">
+                                          {cleanDom}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="text-[11px] text-slate-500 truncate mt-0.5">
+                                      <span>{r.website}</span>
+                                      <span aria-hidden="true"> · </span>
+                                      <span className="font-mono-num">{r.totalViews || 0} views</span>
+                                    </div>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => setLocation(`/report/${r.reportId}`)}
+                                    className="px-2.5 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-50 rounded-md shrink-0 cursor-pointer"
+                                  >
+                                    View Report →
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* TAB 1: OVERVIEW */}
           {activeTab === "overview" && (
             <>
+              {/* Apollo-Style Free Explorer Account Entitlements & Locked Features Banner */}
+              {isFreePlanUser && !isUserAdmin(user) && (
+                <div
+                  className="p-5 sm:p-6 rounded-2xl text-white shadow-sm border border-white/15 space-y-4"
+                  style={{
+                    background: "linear-gradient(115deg, #8B2CF5 0%, #6D3BF7 48%, #434CE8 100%)",
+                  }}
+                >
+                  <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-white/15 pb-4">
+                    <div>
+                      <div className="text-[11px] font-mono-num uppercase tracking-wider text-white/85">
+                        APOLLO-STYLE FREE EXPLORER ACCOUNT · LIMITED ACCESS TIER ($0/MO)
+                      </div>
+                      <h2 className="font-display text-lg sm:text-xl font-bold text-white mt-0.5">
+                        You are on the Free Explorer Plan ({user?.creditsBalance ?? 50} of 50 monthly lead credits remaining)
+                      </h2>
+                      <p className="text-xs text-white/90 mt-1 max-w-3xl">
+                        Free accounts include basic single-city discovery to test Vanguard Hunter live, while high-volume multi-city extraction, multi-inbox SMTP rotation, 24/7 Autopilot, and AI Website + Review Shield builders are locked until you upgrade.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("billing")}
+                      className="px-4 py-2.5 rounded-xl bg-white text-[#141413] hover:bg-stone-100 text-xs font-bold whitespace-nowrap self-start lg:self-center shadow-xs cursor-pointer"
+                    >
+                      Upgrade Account Plan →
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                    <div className="p-3.5 rounded-xl bg-white/15 border border-white/20 space-y-1.5">
+                      <div className="font-bold text-white">✓ What Free Explorer Users Get (Apollo Free Model)</div>
+                      <ul className="space-y-1 text-white/90 text-[11px]">
+                        <li>• <strong>50 Verified B2B Lead Credits / month</strong> (DNS &amp; MX verified emails)</li>
+                        <li>• <strong>Single-City Basic Search</strong> (capped at up to 25 leads per scan)</li>
+                        <li>• <strong>1 Connected Sender Mailbox</strong> (capped at 150 outreach emails / month)</li>
+                        <li>• <strong>1 Sample Website Diagnostic Audit Report</strong> preview (<code className="font-mono-num">/report/:id</code>)</li>
+                      </ul>
+                    </div>
+                    <div className="p-3.5 rounded-xl bg-[#141413]/35 border border-white/15 space-y-1.5">
+                      <div className="font-bold text-[#EDE9FE]">🔒 Locked on Free Plan (Requires Starter / Growth / Scale / VIP)</div>
+                      <ul className="space-y-1 text-white/85 text-[11px]">
+                        <li>• 🔒 <strong>20-City Bulk Lead Hunter</strong> &amp; Uncapped Batch Extraction (Growth+)</li>
+                        <li>• 🔒 <strong>Multi-Inbox Rotational Pool (3 to 100 Inboxes)</strong> &amp; 24/7 Autopilot</li>
+                        <li>• 🔒 <strong>AI 4-Tap Client Website Builder (<code className="font-mono-num">/site/:id</code>)</strong> &amp; 5-Star Review Shield</li>
+                        <li>• 🔒 <strong>Autonomous AI Outbound Phone Caller</strong> &amp; Bulk CSV/JSON Exports</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Top Metric Strip (Single-Elevation, Tabular Numerals) */}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-5">
                 <div className="p-5 bg-white rounded-xl border border-slate-200">
                   <div className="text-xs font-medium text-slate-500">Available Lead Credits</div>
                   <div className="font-mono-num text-2xl font-bold text-slate-950 mt-1">
-                    {(user?.creditsBalance ?? 4815).toLocaleString()}
+                    {(user?.creditsBalance ?? (isFreePlanUser ? 50 : 1000)).toLocaleString()}
                   </div>
                   <div className="text-xs text-slate-500 mt-2">
-                    <span>Plan: {activePlan?.name || "Growth"}</span>
+                    <span>Plan: {activePlan?.name || (isFreePlanUser ? "Free Explorer" : "Starter")}</span>
                     <span aria-hidden="true"> · </span>
-                    <span className="text-emerald-700 font-medium">Active</span>
+                    <span className={isFreePlanUser ? "text-[#7C3AED] font-semibold" : "text-emerald-700 font-medium"}>
+                      {isFreePlanUser ? "Free Tier (Capped)" : "Active"}
+                    </span>
                   </div>
                 </div>
 
                 <div className="p-5 bg-white rounded-xl border border-slate-200">
                   <div className="text-xs font-medium text-slate-500">Leads Hunted This Month</div>
                   <div className="font-mono-num text-2xl font-bold text-slate-950 mt-1">
-                    {(user?.huntsUsedThisMonth ?? 185).toLocaleString()}{" "}
+                    {(user?.huntsUsedThisMonth ?? 0).toLocaleString()}{" "}
                     <span className="text-xs font-normal text-slate-400">/ {huntLimit.toLocaleString()}</span>
                   </div>
                   <div className="w-full h-1.5 bg-slate-100 rounded-full mt-3 overflow-hidden">
-                    <div className="h-full bg-blue-600 rounded-full" style={{ width: `${huntsPct}%` }} />
+                    <div className="h-full bg-[#7C3AED] rounded-full" style={{ width: `${huntsPct}%` }} />
                   </div>
                 </div>
 
                 <div className="p-5 bg-white rounded-xl border border-slate-200">
                   <div className="text-xs font-medium text-slate-500">Outreach Emails Dispatched</div>
                   <div className="font-mono-num text-2xl font-bold text-slate-950 mt-1">
-                    {(user?.emailsSentThisMonth ?? 640).toLocaleString()}{" "}
+                    {(user?.emailsSentThisMonth ?? 0).toLocaleString()}{" "}
                     <span className="text-xs font-normal text-slate-400">/ {emailLimit.toLocaleString()}</span>
                   </div>
                   <div className="w-full h-1.5 bg-slate-100 rounded-full mt-3 overflow-hidden">
@@ -883,18 +1705,169 @@ export default function UserDashboard() {
                 <div className="p-5 bg-white rounded-xl border border-slate-200">
                   <div className="text-xs font-medium text-slate-500">Client Website Audit Reports</div>
                   <div className="font-mono-num text-2xl font-bold text-slate-950 mt-1">
-                    {workspaceCounts.auditReports || user?.auditsRunThisMonth || 38}
+                    {workspaceCounts.auditReports || user?.auditsRunThisMonth || 0}
                   </div>
-                  <div className="text-xs text-slate-500 mt-2">
-                    <span>Rotational Inboxes: {workspaceCounts.connectedEmailAccounts}</span>
-                    <span aria-hidden="true"> / </span>
-                    <span>{activePlan?.maxEmailAccounts || 10} max</span>
+                  <div className="text-xs text-slate-500 mt-2 flex items-center justify-between gap-2">
+                    <div>
+                      <span>Rotational Inboxes: {workspaceCounts.connectedEmailAccounts}</span>
+                      <span aria-hidden="true"> / </span>
+                      <span>{activePlan?.maxEmailAccounts ?? (isFreePlanUser ? 1 : 3)} max</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("smtp")}
+                      className="text-[11px] font-bold text-[#7C3AED] hover:underline cursor-pointer"
+                    >
+                      + Setup Gmails →
+                    </button>
                   </div>
                 </div>
               </div>
 
+              {/* Getting Started: Interactive Lead Discovery Onboarding Checklist & Tour Trigger */}
+              {!tourDismissed ? (
+                <div className="p-5 sm:p-6 bg-white rounded-xl border border-[#E4E2DD] space-y-5">
+                  <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-[#E4E2DD]">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 text-xs font-semibold text-[#1D4ED8]">
+                        <Compass className="w-4 h-4" />
+                        <span>Getting Started · First Lead Discovery Walkthrough</span>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono-num text-[#525866]">~60 sec setup</span>
+                      </div>
+                      <h2 className="font-display text-lg sm:text-xl font-bold text-[#0B0F17]">
+                        How to Initiate Your First Autonomous Lead Discovery Search
+                      </h2>
+                      <p className="text-xs sm:text-sm text-[#525866] max-w-3xl">
+                        Follow the 4-step workflow below or launch the interactive Guided Tour to configure your target market, organize a campaign project, and discover verified businesses with automated website diagnostics.
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => openTourStep(1)}
+                        className="px-4 py-2.5 text-xs font-semibold text-white bg-[#1D4ED8] hover:bg-[#1E40AF] rounded-lg transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Compass className="w-3.5 h-3.5" />
+                        <span>Launch Interactive Guided Tour</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleDismissTourBanner}
+                        className="px-3 py-2.5 text-xs font-medium text-[#525866] hover:text-[#0B0F17] border border-[#E4E2DD] hover:bg-[#FAF9F5] rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                      >
+                        Dismiss Guide
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+                    {[
+                      {
+                        step: 1 as const,
+                        index: "01",
+                        title: "Select Niche & City",
+                        desc: "Choose from 120+ business verticals (e.g. Dentist, MedSpa, Roofing) and specify your target city.",
+                        meta: `Current: ${quickCategory} · ${quickCity}`,
+                        done: Boolean(quickCategory.trim() && quickCity.trim()),
+                      },
+                      {
+                        step: 2 as const,
+                        index: "02",
+                        title: "Assign Campaign Project",
+                        desc: "Isolate scraped prospects, pipeline stages, and CSV/JSON exports inside a dedicated workspace project.",
+                        meta: `${projects.length} active ${projects.length === 1 ? "project" : "projects"}`,
+                        done: projects.length > 0,
+                      },
+                      {
+                        step: 3 as const,
+                        index: "03",
+                        title: "AI Website & Gap Scan",
+                        desc: "Automatically detect missing booking widgets, tech stacks, and generate shareable audit links.",
+                        meta: `Batch size: ${quickCount} leads`,
+                        done: savedProspectsList.length > 0 || recentReports.length > 0,
+                      },
+                      {
+                        step: 4 as const,
+                        index: "04",
+                        title: "Execute First Lead Hunt",
+                        desc: "Run the live discovery scan in the CRM Hunter or directly from the Quick-Launch bar below.",
+                        meta:
+                          savedProspectsList.length > 0
+                            ? `${savedProspectsList.length} leads in workspace`
+                            : "Ready to launch first scan",
+                        done: savedProspectsList.length > 0,
+                      },
+                    ].map((item) => (
+                      <button
+                        key={item.step}
+                        type="button"
+                        onClick={() => openTourStep(item.step)}
+                        className="text-left p-4 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] hover:bg-white hover:border-[#1D4ED8] transition-colors flex flex-col justify-between gap-3 group cursor-pointer"
+                      >
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="font-mono-num font-bold text-[#1D4ED8]">
+                              Step {item.index}
+                            </span>
+                            <span className="text-[11px] font-medium text-[#525866] group-hover:text-[#1D4ED8] flex items-center gap-0.5">
+                              <span>{item.done ? "Configured" : "Configure"}</span>
+                              <ChevronRight className="w-3.5 h-3.5" />
+                            </span>
+                          </div>
+                          <h3 className="text-sm font-bold text-[#0B0F17]">{item.title}</h3>
+                          <p className="text-xs text-[#525866] leading-relaxed">{item.desc}</p>
+                        </div>
+
+                        <div className="pt-2.5 border-t border-[#E4E2DD] flex items-center justify-between text-[11px] font-mono-num text-[#0B0F17]">
+                          <span className="truncate">{item.meta}</span>
+                          {item.done && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="px-4 py-3 bg-white rounded-xl border border-[#E4E2DD] flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-xs text-[#525866]">
+                    <Compass className="w-4 h-4 text-[#1D4ED8]" />
+                    <span className="font-semibold text-[#0B0F17]">Need a refresher on launching lead discovery campaigns?</span>
+                    <span className="hidden sm:inline">Open the 4-step interactive walkthrough with pre-built market templates anytime.</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTourDismissed(false);
+                        try {
+                          localStorage.removeItem("vh_getting_started_dismissed");
+                        } catch {}
+                      }}
+                      className="px-3 py-1.5 text-xs font-medium text-[#525866] hover:text-[#0B0F17] cursor-pointer"
+                    >
+                      Show Checklist
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openTourStep(1)}
+                      className="px-3 py-1.5 text-xs font-semibold text-white bg-[#0B0F17] hover:bg-slate-800 rounded-lg cursor-pointer"
+                    >
+                      Open Guided Tour →
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Quick Lead Hunt Launcher Bar */}
-              <div className="p-4 sm:p-6 bg-white rounded-xl border border-slate-200">
+              <div
+                id="quick-lead-hunt-launcher"
+                className={`p-4 sm:p-6 bg-white rounded-xl border transition-all ${
+                  highlightQuickHunt
+                    ? "border-[#1D4ED8] ring-2 ring-[#1D4ED8]/20"
+                    : "border-slate-200"
+                }`}
+              >
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 mb-4">
                   <div>
                     <h2 className="font-display text-base sm:text-lg font-bold text-slate-950">
@@ -904,13 +1877,24 @@ export default function UserDashboard() {
                       Discover active businesses in any target market with automated contact and domain verification.
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setLocation("/crm")}
-                    className="text-xs font-semibold text-blue-700 hover:underline self-start lg:self-auto cursor-pointer"
-                  >
-                    Open Full AI Hunter & Sequence Pipeline →
-                  </button>
+                  <div className="flex flex-wrap items-center gap-3 self-start lg:self-auto">
+                    <button
+                      type="button"
+                      onClick={() => openTourStep(1)}
+                      className="text-xs font-semibold text-[#525866] hover:text-[#0B0F17] flex items-center gap-1 cursor-pointer"
+                    >
+                      <Compass className="w-3.5 h-3.5 text-[#1D4ED8]" />
+                      <span>How It Works (Tour)</span>
+                    </button>
+                    <span className="text-slate-300" aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={() => setLocation("/crm")}
+                      className="text-xs font-semibold text-blue-700 hover:underline cursor-pointer"
+                    >
+                      Open Full AI Hunter & Sequence Pipeline →
+                    </button>
+                  </div>
                 </div>
 
                 <form
@@ -918,9 +1902,16 @@ export default function UserDashboard() {
                     e.preventDefault();
                     localStorage.setItem(
                       "vh_quick_hunt",
-                      JSON.stringify({ category: quickCategory, city: quickCity, country: quickCountry })
+                      JSON.stringify({
+                        category: quickCategory,
+                        city: quickCity,
+                        country: quickCountry,
+                        count: quickCount,
+                        extraContext: quickContext,
+                        autoRun: true,
+                      })
                     );
-                    setLocation("/crm");
+                    setLocation("/crm?tab=hunter");
                   }}
                   className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3"
                 >
@@ -966,136 +1957,336 @@ export default function UserDashboard() {
               </div>
 
               {/* Workspace Projects & Lead Export Summary Card on Overview */}
-              <div className="p-4 sm:p-6 bg-white rounded-xl border border-slate-200 space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <FolderKanban className="w-4 h-4 text-blue-600" />
-                      <h2 className="font-display text-base sm:text-lg font-bold text-slate-950">
-                        Your Active Projects & Lead Exports
-                      </h2>
-                    </div>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      Organize your lead generation into separate projects, switch between campaigns anytime, and export generated leads to CSV or JSON.
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowNewProjForm(true);
-                        setActiveTab("projects");
-                      }}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>New Project</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab("projects")}
-                      className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-800 cursor-pointer"
-                    >
-                      Manage All ({projects.length}) →
-                    </button>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
-                  {projects.map((proj) => {
-                    const projLeads = getProjectLeads(proj.id);
-                    return (
-                      <div
-                        key={proj.id}
-                        className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 flex flex-col justify-between gap-3"
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <h3 className="text-sm font-bold text-slate-950 truncate">{proj.name}</h3>
-                          <span className="font-mono-num text-xs font-bold text-blue-700 shrink-0">
-                            {projLeads.length} {projLeads.length === 1 ? "lead" : "leads"}
-                          </span>
-                        </div>
-
-                        <div className="pt-2.5 border-t border-slate-200/80 flex flex-wrap items-center justify-between gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleOpenProjectInCRM(proj.id)}
-                            className="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-950 hover:bg-slate-800 text-white cursor-pointer"
-                          >
-                            Work on Project →
-                          </button>
-                          <ExportLeadsBar
-                            leads={projLeads}
-                            projectName={proj.name}
-                            compact
-                          />
-                        </div>
+              {(searchScope === "all" || searchScope === "leads") && (
+                <div className="p-4 sm:p-6 bg-white rounded-xl border border-slate-200 space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <FolderKanban className="w-4 h-4 text-blue-600" />
+                        <h2 className="font-display text-base sm:text-lg font-bold text-slate-950">
+                          Your Active Projects & Saved Lead Lists
+                        </h2>
+                        <span className="font-mono-num text-xs font-semibold px-2 py-0.5 rounded-md bg-slate-100 text-slate-700">
+                          {isSearchActive
+                            ? `${matchingSavedLeads.length} of ${totalSavedLeadsCount} leads`
+                            : `${totalSavedLeadsCount} total leads`}
+                        </span>
                       </div>
-                    );
-                  })}
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        Organize your lead generation into separate projects, filter saved leads by business name or domain, and export to CSV or JSON.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowNewProjForm(true);
+                          setActiveTab("projects");
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>New Project</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab("projects")}
+                        className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-800 cursor-pointer"
+                      >
+                        Manage All ({projects.length}) →
+                      </button>
+                    </div>
+                  </div>
+
+                  {visibleProjectSummaries.length === 0 ? (
+                    <div className="p-6 rounded-xl border border-slate-200 bg-slate-50/60 text-center space-y-2">
+                      <p className="text-xs text-slate-600">
+                        No saved lead lists or businesses matched{" "}
+                        <span className="font-semibold text-slate-900">"{normalizedSearchQuery}"</span>.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setDashboardSearchQuery("")}
+                        className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg cursor-pointer"
+                      >
+                        Clear Search Filter
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                      {visibleProjectSummaries.map(({ project: proj, allLeads, matchingLeads }) => {
+                        const isExpanded = Boolean(expandedProjectIds[proj.id]) || isSearchActive;
+                        const leadsToDisplay = isSearchActive ? matchingLeads : allLeads;
+                        return (
+                          <div
+                            key={proj.id}
+                            className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 flex flex-col justify-between gap-3"
+                          >
+                            <div className="space-y-2">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <h3 className="text-sm font-bold text-slate-950 truncate">{proj.name}</h3>
+                                  {(proj.targetCategory || proj.targetCity) && (
+                                    <p className="text-[11px] text-slate-500 truncate">
+                                      {[proj.targetCategory, proj.targetCity, proj.targetCountry]
+                                        .filter(Boolean)
+                                        .join(" · ")}
+                                    </p>
+                                  )}
+                                </div>
+                                <span className="font-mono-num text-xs font-bold text-blue-700 shrink-0">
+                                  {isSearchActive
+                                    ? `${matchingLeads.length}/${allLeads.length} leads`
+                                    : `${allLeads.length} ${allLeads.length === 1 ? "lead" : "leads"}`}
+                                </span>
+                              </div>
+
+                              {allLeads.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleProjectExpand(proj.id)}
+                                  className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 text-[11px] font-semibold text-slate-700 hover:border-blue-600 transition-colors cursor-pointer"
+                                >
+                                  <span>
+                                    {isExpanded
+                                      ? `Hide Saved Leads (${leadsToDisplay.length})`
+                                      : `Preview Saved Leads & Domains (${leadsToDisplay.length})`}
+                                  </span>
+                                  {isExpanded ? (
+                                    <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
+                                  ) : (
+                                    <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+                                  )}
+                                </button>
+                              )}
+
+                              {isExpanded && leadsToDisplay.length > 0 && (
+                                <div className="rounded-lg border border-slate-200 bg-white divide-y divide-slate-100 max-h-48 overflow-y-auto">
+                                  {leadsToDisplay.slice(0, 15).map((lead, idx) => {
+                                    const cleanDom =
+                                      extractCleanDomain(lead.website) || extractCleanDomain(lead.email);
+                                    return (
+                                      <div
+                                        key={`${proj.id}-lead-${lead.id || idx}`}
+                                        className="px-2.5 py-2 flex items-center justify-between gap-2 text-[11px] hover:bg-slate-50"
+                                      >
+                                        <div className="min-w-0">
+                                          <div className="font-semibold text-slate-900 truncate">
+                                            {lead.businessName}
+                                          </div>
+                                          <div className="font-mono-num text-[10px] text-slate-500 truncate">
+                                            {cleanDom || lead.city || lead.category || "No domain"}
+                                          </div>
+                                        </div>
+                                        {lead.website && (
+                                          <a
+                                            href={
+                                              lead.website.startsWith("http")
+                                                ? lead.website
+                                                : `https://${lead.website}`
+                                            }
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="text-blue-600 hover:text-blue-800 shrink-0"
+                                            title={lead.website}
+                                          >
+                                            <ExternalLink className="w-3 h-3" />
+                                          </a>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="pt-2.5 border-t border-slate-200/80 flex flex-wrap items-center justify-between gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenProjectInCRM(proj.id)}
+                                className="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-950 hover:bg-slate-800 text-white cursor-pointer"
+                              >
+                                Work on Project →
+                              </button>
+                              <ExportLeadsBar
+                                leads={leadsToDisplay}
+                                projectName={proj.name}
+                                compact
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
-              </div>
+              )}
 
               {/* Two-Column Workspace Tables: Recent Website Audits & Recent Activity */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                 {/* Recent Client Website Audit Reports */}
-                <div className="lg:col-span-6 bg-white rounded-xl border border-slate-200 overflow-hidden">
-                  <div className="px-4 sm:px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-2">
-                    <div>
-                      <h3 className="text-sm font-bold text-slate-950">Client Website Audit Reports</h3>
-                      <p className="text-xs text-slate-500">Interactive diagnostic pages tracked for prospect opens</p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setLocation("/crm")}
-                      className="text-xs font-semibold text-blue-700 hover:underline whitespace-nowrap cursor-pointer"
-                    >
-                      Manage in CRM
-                    </button>
-                  </div>
-
-                  {recentReports.length === 0 ? (
-                    <div className="p-6 sm:p-8 text-center">
-                      <p className="text-xs text-slate-500 mb-3">
-                        No client website audit reports generated yet in this workspace.
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => setLocation("/crm")}
-                        className="px-3.5 py-2 text-xs font-semibold text-white bg-slate-950 rounded-lg cursor-pointer"
-                      >
-                        Generate First Website Audit in CRM
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="divide-y divide-slate-200">
-                      {recentReports.map((r: any) => (
-                        <div key={r.reportId} className="px-4 sm:px-6 py-3.5 flex items-center justify-between hover:bg-slate-50 gap-3">
-                          <div className="min-w-0">
-                            <div className="text-xs font-semibold text-slate-900 truncate">
-                              {r.businessName || r.reportId}
-                            </div>
-                            <div className="text-[11px] text-slate-500 truncate">
-                              <span>{r.website}</span>
-                              <span aria-hidden="true"> · </span>
-                              <span className="font-mono-num">{r.totalViews || 0} views</span>
-                            </div>
+                {(searchScope === "all" || searchScope === "reports") && (
+                  <div
+                    className={`${
+                      searchScope === "reports" ? "lg:col-span-12" : "lg:col-span-6"
+                    } bg-white rounded-xl border border-slate-200 overflow-hidden`}
+                  >
+                    <div className="px-4 sm:px-6 py-4 border-b border-slate-200 space-y-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h3 className="text-sm font-bold text-slate-950">
+                              Client Website Audit Reports
+                            </h3>
+                            <span className="font-mono-num text-[11px] font-semibold px-2 py-0.5 rounded bg-slate-100 text-slate-700">
+                              {isSearchActive
+                                ? `${filteredReports.length} of ${recentReports.length}`
+                                : recentReports.length}
+                            </span>
                           </div>
+                          <p className="text-xs text-slate-500">
+                            Interactive diagnostic pages tracked for prospect opens — filter by business or domain
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setLocation("/crm")}
+                          className="text-xs font-semibold text-blue-700 hover:underline whitespace-nowrap cursor-pointer"
+                        >
+                          Manage in CRM
+                        </button>
+                      </div>
+
+                      {/* Inline Quick Filter for Generated Reports */}
+                      <div className="relative">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                        <input
+                          type="text"
+                          value={dashboardSearchQuery}
+                          onChange={(e) => setDashboardSearchQuery(e.target.value)}
+                          placeholder="Filter generated reports by business name or domain..."
+                          aria-label="Filter generated reports by business name or domain"
+                          className="w-full pl-8 pr-8 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:border-blue-600"
+                        />
+                        {dashboardSearchQuery && (
                           <button
                             type="button"
-                            onClick={() => setLocation(`/report/${r.reportId}`)}
-                            className="px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
+                            onClick={() => setDashboardSearchQuery("")}
+                            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
+                            title="Clear report filter"
                           >
-                            View Report →
+                            <X className="w-3.5 h-3.5" />
                           </button>
-                        </div>
-                      ))}
+                        )}
+                      </div>
                     </div>
-                  )}
-                </div>
+
+                    {loading && recentReports.length === 0 ? (
+                      <div className="divide-y divide-slate-200 animate-pulse">
+                        {Array.from({ length: 4 }).map((_, i) => (
+                          <div key={i} className="px-4 sm:px-6 py-3.5 flex items-center justify-between gap-3">
+                            <div className="space-y-1.5 flex-1">
+                              <div className="h-3.5 w-44 bg-slate-200 rounded" />
+                              <div className="h-3 w-56 bg-slate-100 rounded" />
+                            </div>
+                            <div className="h-7 w-24 bg-slate-100 rounded-md shrink-0" />
+                          </div>
+                        ))}
+                      </div>
+                    ) : recentReports.length === 0 ? (
+                      <div className="p-6 sm:p-8 text-center">
+                        <p className="text-xs text-slate-500 mb-3">
+                          No client website audit reports generated yet in this workspace.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => setLocation("/crm")}
+                          className="px-3.5 py-2 text-xs font-semibold text-white bg-slate-950 rounded-lg cursor-pointer"
+                        >
+                          Generate First Website Audit in CRM
+                        </button>
+                      </div>
+                    ) : filteredReports.length === 0 ? (
+                      <div className="p-6 sm:p-8 text-center space-y-2">
+                        <p className="text-xs text-slate-500">
+                          No generated audit reports match{" "}
+                          <span className="font-semibold text-slate-900">"{normalizedSearchQuery}"</span>.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => setDashboardSearchQuery("")}
+                          className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg cursor-pointer"
+                        >
+                          Show All Reports ({recentReports.length})
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="divide-y divide-slate-200">
+                          {visibleReports.map((r: any) => {
+                            const cleanDom = extractCleanDomain(r.website);
+                            return (
+                              <div
+                                key={r.reportId}
+                                className="px-4 sm:px-6 py-3.5 flex items-center justify-between hover:bg-slate-50 gap-3"
+                              >
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="text-xs font-semibold text-slate-900 truncate">
+                                      {r.businessName || r.reportId}
+                                    </span>
+                                    {cleanDom && (
+                                      <span className="font-mono-num text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 truncate">
+                                        {cleanDom}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 truncate mt-0.5">
+                                    <span>{r.website}</span>
+                                    <span aria-hidden="true"> · </span>
+                                    <span className="font-mono-num">{r.totalViews || 0} views</span>
+                                  </div>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => setLocation(`/report/${r.reportId}`)}
+                                  className="px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
+                                >
+                                  View Report →
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        {!isSearchActive && filteredReports.length > 6 && (
+                          <div className="px-4 sm:px-6 py-2.5 bg-slate-50 border-t border-slate-200 flex items-center justify-between">
+                            <span className="text-[11px] text-slate-500 font-mono-num">
+                              Showing {visibleReports.length} of {filteredReports.length} generated reports
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setShowAllReports((v) => !v)}
+                              className="text-xs font-semibold text-blue-700 hover:underline cursor-pointer"
+                            >
+                              {showAllReports ? "Show Recent 6" : `View All ${filteredReports.length} Reports`}
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
 
                 {/* Recent User Activity Stream */}
-                <div className="lg:col-span-6 bg-white rounded-xl border border-slate-200 overflow-hidden">
+                <div
+                  className={`${
+                    searchScope === "reports"
+                      ? "hidden"
+                      : searchScope === "leads"
+                      ? "lg:col-span-12"
+                      : "lg:col-span-6"
+                  } bg-white rounded-xl border border-slate-200 overflow-hidden`}
+                >
                   <div className="px-4 sm:px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-2">
                     <div>
                       <h3 className="text-sm font-bold text-slate-950">Recent Workspace Activity</h3>
@@ -1110,19 +2301,33 @@ export default function UserDashboard() {
                     </button>
                   </div>
 
-                  <div className="divide-y divide-slate-200">
-                    {activities.slice(0, 6).map((act) => (
-                      <div key={act.id} className="px-4 sm:px-6 py-3.5 flex items-start justify-between gap-3 hover:bg-slate-50">
-                        <div className="min-w-0">
-                          <div className="text-xs font-semibold text-slate-900">{act.action}</div>
-                          <div className="text-[11px] text-slate-500 truncate mt-0.5">{act.details}</div>
+                  {loading && activities.length === 0 ? (
+                    <div className="divide-y divide-slate-200 animate-pulse">
+                      {Array.from({ length: 4 }).map((_, i) => (
+                        <div key={i} className="px-4 sm:px-6 py-3.5 flex items-start justify-between gap-3">
+                          <div className="space-y-1.5 flex-1">
+                            <div className="h-3.5 w-36 bg-slate-200 rounded" />
+                            <div className="h-3 w-64 bg-slate-100 rounded" />
+                          </div>
+                          <div className="h-3 w-16 bg-slate-100 rounded shrink-0" />
                         </div>
-                        <div className="text-[11px] font-mono-num text-slate-400 whitespace-nowrap shrink-0">
-                          {new Date(act.createdAt).toLocaleDateString()}
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-slate-200">
+                      {activities.slice(0, 6).map((act) => (
+                        <div key={act.id} className="px-4 sm:px-6 py-3.5 flex items-start justify-between gap-3 hover:bg-slate-50">
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold text-slate-900">{act.action}</div>
+                            <div className="text-[11px] text-slate-500 truncate mt-0.5">{act.details}</div>
+                          </div>
+                          <div className="text-[11px] font-mono-num text-slate-400 whitespace-nowrap shrink-0">
+                            {new Date(act.createdAt).toLocaleDateString()}
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             </>
@@ -1183,50 +2388,150 @@ export default function UserDashboard() {
               )}
 
               <div className="space-y-4">
-                {projects.map((proj) => {
-                  const projLeads = getProjectLeads(proj.id);
-                  return (
-                    <div
-                      key={proj.id}
-                      className="p-5 bg-white rounded-xl border border-slate-200 space-y-4"
+                {visibleProjectSummaries.length === 0 ? (
+                  <div className="p-8 bg-white rounded-xl border border-slate-200 text-center space-y-2">
+                    <p className="text-xs text-slate-600">
+                      No saved lead lists or businesses match{" "}
+                      <span className="font-semibold text-slate-900">"{normalizedSearchQuery}"</span>.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setDashboardSearchQuery("")}
+                      className="px-3.5 py-2 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg cursor-pointer"
                     >
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                        <div className="flex items-center gap-2.5 flex-wrap">
-                          <h3 className="font-display text-base font-bold text-slate-950">{proj.name}</h3>
-                          <span className="font-mono-num text-xs font-bold text-blue-700">
-                            · {projLeads.length} generated {projLeads.length === 1 ? "lead" : "leads"}
-                          </span>
-                        </div>
+                      Clear Search Filter
+                    </button>
+                  </div>
+                ) : (
+                  visibleProjectSummaries.map(({ project: proj, allLeads, matchingLeads }) => {
+                    const leadsToDisplay = isSearchActive ? matchingLeads : allLeads;
+                    const isExpanded = Boolean(expandedProjectIds[proj.id]) || isSearchActive;
+                    return (
+                      <div
+                        key={proj.id}
+                        className="p-5 bg-white rounded-xl border border-slate-200 space-y-4"
+                      >
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                          <div className="flex items-center gap-2.5 flex-wrap">
+                            <h3 className="font-display text-base font-bold text-slate-950">{proj.name}</h3>
+                            <span className="font-mono-num text-xs font-bold text-blue-700">
+                              ·{" "}
+                              {isSearchActive
+                                ? `${matchingLeads.length} of ${allLeads.length} matching leads`
+                                : `${allLeads.length} saved ${allLeads.length === 1 ? "lead" : "leads"}`}
+                            </span>
+                            {(proj.targetCategory || proj.targetCity) && (
+                              <span className="text-xs text-slate-500">
+                                ({[proj.targetCategory, proj.targetCity, proj.targetCountry].filter(Boolean).join(", ")})
+                              </span>
+                            )}
+                          </div>
 
-                        <div className="flex items-center gap-2 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => handleOpenProjectInCRM(proj.id)}
-                            className="px-4 py-2 rounded-lg text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
-                          >
-                            Open Project in AI Hunter & CRM →
-                          </button>
-                          {projects.length > 1 && (
+                          <div className="flex items-center gap-2 shrink-0">
+                            {allLeads.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => toggleProjectExpand(proj.id)}
+                                className="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-800 flex items-center gap-1.5 cursor-pointer"
+                              >
+                                <span>{isExpanded ? "Hide Leads" : `View Leads (${leadsToDisplay.length})`}</span>
+                                {isExpanded ? (
+                                  <ChevronUp className="w-3.5 h-3.5" />
+                                ) : (
+                                  <ChevronDown className="w-3.5 h-3.5" />
+                                )}
+                              </button>
+                            )}
                             <button
                               type="button"
-                              onClick={() => handleDeleteDashboardProject(proj.id)}
-                              className="p-2 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 border border-slate-200 cursor-pointer"
-                              title="Delete project"
+                              onClick={() => handleOpenProjectInCRM(proj.id)}
+                              className="px-4 py-2 rounded-lg text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
                             >
-                              <Trash2 className="w-4 h-4" />
+                              Open Project in AI Hunter & CRM →
                             </button>
-                          )}
+                            {projects.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteDashboardProject(proj.id)}
+                                className="p-2 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 border border-slate-200 cursor-pointer"
+                                title="Delete project"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            )}
+                          </div>
                         </div>
-                      </div>
 
-                      <ExportLeadsBar
-                        leads={projLeads}
-                        projectName={proj.name}
-                        label={`Export Leads for "${proj.name}"`}
-                      />
-                    </div>
-                  );
-                })}
+                        {isExpanded && leadsToDisplay.length > 0 && (
+                          <div className="rounded-xl border border-slate-200 overflow-hidden">
+                            <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 grid grid-cols-12 text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                              <div className="col-span-5 sm:col-span-4">Business Name</div>
+                              <div className="col-span-4 sm:col-span-4">Domain / Website</div>
+                              <div className="hidden sm:block sm:col-span-2">Location / Niche</div>
+                              <div className="col-span-3 sm:col-span-2 text-right">Action</div>
+                            </div>
+                            <div className="divide-y divide-slate-200 max-h-72 overflow-y-auto bg-white">
+                              {leadsToDisplay.map((lead, idx) => {
+                                const cleanDom =
+                                  extractCleanDomain(lead.website) || extractCleanDomain(lead.email);
+                                return (
+                                  <div
+                                    key={`${proj.id}-row-${lead.id || idx}`}
+                                    className="px-4 py-2.5 grid grid-cols-12 items-center gap-2 text-xs hover:bg-slate-50"
+                                  >
+                                    <div className="col-span-5 sm:col-span-4 font-semibold text-slate-900 truncate">
+                                      {lead.businessName}
+                                    </div>
+                                    <div className="col-span-4 sm:col-span-4 truncate">
+                                      {cleanDom ? (
+                                        <span className="font-mono-num text-[11px] px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
+                                          {cleanDom}
+                                        </span>
+                                      ) : (
+                                        <span className="text-slate-400 text-[11px]">No domain</span>
+                                      )}
+                                    </div>
+                                    <div className="hidden sm:block sm:col-span-2 text-[11px] text-slate-500 truncate">
+                                      {[lead.city, lead.category].filter(Boolean).join(" · ") || "—"}
+                                    </div>
+                                    <div className="col-span-3 sm:col-span-2 flex items-center justify-end gap-1.5">
+                                      {lead.reportUrl && (
+                                        <button
+                                          type="button"
+                                          onClick={() => setLocation(lead.reportUrl!)}
+                                          className="px-2 py-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded cursor-pointer"
+                                        >
+                                          Report
+                                        </button>
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={() => handleOpenProjectInCRM(proj.id)}
+                                        className="px-2 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-50 rounded cursor-pointer"
+                                      >
+                                        CRM →
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        <ExportLeadsBar
+                          leads={leadsToDisplay}
+                          projectName={proj.name}
+                          label={
+                            isSearchActive
+                              ? `Export Matching Leads (${leadsToDisplay.length}) for "${proj.name}"`
+                              : `Export Leads for "${proj.name}"`
+                          }
+                        />
+                      </div>
+                    );
+                  })
+                )}
               </div>
             </div>
           )}
@@ -1567,25 +2872,52 @@ export default function UserDashboard() {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
                 {allPlans.map((plan) => {
                   const isCurrent = user?.planId === plan.id;
+                  const isHighLevel = plan.id === "scale" || plan.id === "enterprise";
                   const price = billingCycle === "annual" ? plan.annualPrice : plan.monthlyPrice;
                   return (
                     <div
                       key={plan.id}
                       className={`p-5 sm:p-6 bg-white rounded-xl border flex flex-col justify-between ${
-                        isCurrent ? "border-blue-700 ring-1 ring-blue-700" : "border-slate-200"
+                        isCurrent
+                          ? "border-[#7C3AED] ring-1 ring-[#7C3AED]"
+                          : isHighLevel
+                          ? "border-[#4F46E5]/80 ring-1 ring-[#7C3AED]/40"
+                          : "border-slate-200"
                       }`}
                     >
                       <div>
-                        <div className="flex items-center justify-between gap-2 mb-1">
+                        <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
                           <h3 className="font-display text-lg font-bold text-slate-950">{plan.name}</h3>
-                          {isCurrent && <span className="text-xs font-semibold text-blue-700">Active Plan</span>}
+                          {isCurrent && <span className="text-xs font-semibold text-[#7C3AED]">Active Plan</span>}
+                          {!isCurrent && isHighLevel && (
+                            <span className="px-2 py-0.5 rounded bg-[#EDE9FE] border border-[#C4B5FD] text-[10px] font-extrabold uppercase tracking-wider text-[#5B21B6]">
+                              👑 High-Level VIP
+                            </span>
+                          )}
                         </div>
-                        <p className="text-xs text-slate-500 mb-4">{plan.audience}</p>
+                        <p className="text-xs text-slate-500 mb-3">{plan.audience}</p>
+
+                        {isHighLevel && (
+                          <div className="mb-3 p-2 rounded-lg bg-[#F5F3FF] border border-[#DDD6FE] text-[11px] font-bold text-[#4C1D95] leading-snug">
+                            ✨ Auto-Unlocks AI Website + 5-Star Review Shield Builder
+                          </div>
+                        )}
+
                         <div className="pb-4 mb-4 border-b border-slate-200">
                           <span className="font-mono-num text-3xl font-bold text-slate-950">${price}</span>
                           <span className="text-xs text-slate-500"> / mo</span>
                         </div>
-                        <div className="space-y-2 text-xs text-slate-600 mb-6">
+                        <div className="space-y-2 text-xs text-slate-600 mb-5">
+                          <div className="flex justify-between pb-1.5 border-b border-slate-100">
+                            <span>AI Website &amp; Review Shield</span>
+                            <span
+                              className={`font-bold ${
+                                isHighLevel ? "text-emerald-700" : "text-slate-400"
+                              }`}
+                            >
+                              {isHighLevel ? "✨ Unlocked" : "High-Level Only"}
+                            </span>
+                          </div>
                           <div className="flex justify-between">
                             <span>Monthly Leads</span>
                             <span className="font-mono-num font-semibold text-slate-900">
@@ -1605,31 +2937,50 @@ export default function UserDashboard() {
                             </span>
                           </div>
                         </div>
+
+                        {Array.isArray(plan.features) && plan.features.length > 0 && (
+                          <ul className="space-y-1.5 mb-5 pt-3 border-t border-slate-100">
+                            {plan.features.slice(0, 4).map((feat, idx) => (
+                              <li key={idx} className="text-[11px] text-slate-600 flex items-start gap-1.5 leading-snug">
+                                <Check className="w-3.5 h-3.5 text-blue-600 shrink-0 mt-0.5" />
+                                <span>{feat}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
                       </div>
 
                       <div className="space-y-2">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setCheckoutPlan(plan);
-                            setPaymentMethodTab("lemon");
-                            setCheckoutStatus(null);
-                          }}
-                          className="w-full py-2 px-3 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
-                        >
-                          {isCurrent ? "Top Up via Lemon Squeezy" : `Upgrade via Lemon Squeezy`}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setCheckoutPlan(plan);
-                            setPaymentMethodTab("crypto");
-                            setCheckoutStatus(null);
-                          }}
-                          className="w-full py-2 px-3 bg-slate-950 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
-                        >
-                          Pay with Crypto (USDT / BTC)
-                        </button>
+                        {plan.id === "free" ? (
+                          <div className="w-full py-2 px-3 bg-slate-100 text-slate-600 text-xs font-semibold rounded-lg text-center">
+                            {isCurrent ? "Current Free Explorer Tier" : "Included Free Tier ($0/mo)"}
+                          </div>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCheckoutPlan(plan);
+                                setPaymentMethodTab("lemon");
+                                setCheckoutStatus(null);
+                              }}
+                              className="w-full py-2 px-3 bg-gradient-to-r from-[#8B3DFF] to-[#4F46E5] hover:from-[#7C3AED] hover:to-[#4338CA] text-white text-xs font-semibold rounded-lg transition-all cursor-pointer"
+                            >
+                              {isCurrent ? "Top Up via Lemon Squeezy" : `Upgrade via Lemon Squeezy`}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCheckoutPlan(plan);
+                                setPaymentMethodTab("crypto");
+                                setCheckoutStatus(null);
+                              }}
+                              className="w-full py-2 px-3 bg-slate-950 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+                            >
+                              Pay with Crypto (USDT / BTC)
+                            </button>
+                          </>
+                        )}
                       </div>
                     </div>
                   );
@@ -1694,6 +3045,44 @@ export default function UserDashboard() {
                     </div>
                   )}
 
+                  {/* Instant Upgrade Entitlements Summary */}
+                  <div className="p-3.5 rounded-lg bg-blue-50/70 border border-blue-200 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-800">
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                      <span>
+                        <strong>Credits Added Immediately:</strong>{" "}
+                        <span className="font-mono-num font-bold text-blue-700">
+                          +{checkoutPlan.monthlyHuntLimit.toLocaleString()} leads
+                        </span>
+                      </span>
+                      <span>
+                        <strong>Monthly Outreach:</strong>{" "}
+                        <span className="font-mono-num font-semibold">
+                          {checkoutPlan.monthlyEmailLimit.toLocaleString()} emails/mo
+                        </span>
+                      </span>
+                      <span>
+                        <strong>SMTP Inboxes:</strong>{" "}
+                        <span className="font-mono-num font-semibold">{checkoutPlan.maxEmailAccounts}</span>
+                      </span>
+                      {(checkoutPlan.id === "scale" || checkoutPlan.id === "enterprise") && (
+                        <span className="px-2 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-950 font-bold">
+                          ✨ Unlocks AI 4-Tap Website + 5-Star Review Shield Builder
+                        </span>
+                      )}
+                    </div>
+                    {checkoutPlan.lemonCheckoutUrl && (
+                      <a
+                        href={checkoutPlan.lemonCheckoutUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[11px] font-semibold text-blue-700 hover:underline inline-flex items-center gap-1"
+                      >
+                        <span>Hosted Checkout Link</span>
+                        <ArrowUpRight className="w-3 h-3" />
+                      </a>
+                    )}
+                  </div>
+
                   {paymentMethodTab === "lemon" ? (
                     <form onSubmit={handleLemonCheckout} className="grid grid-cols-1 md:grid-cols-12 gap-4 sm:gap-6 items-end">
                       <div className="md:col-span-5">
@@ -1726,7 +3115,9 @@ export default function UserDashboard() {
                           disabled={checkoutBusy}
                           className="w-full py-2.5 px-4 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
                         >
-                          {checkoutBusy ? "Processing Order..." : "Complete Lemon Squeezy Order"}
+                          {checkoutBusy
+                            ? "Processing Order..."
+                            : `Pay $${billingCycle === "annual" ? checkoutPlan.annualPrice * 12 : checkoutPlan.monthlyPrice} & Upgrade Now`}
                         </button>
                       </div>
                     </form>
@@ -1780,9 +3171,24 @@ export default function UserDashboard() {
 
                       <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
                         <div className="md:col-span-9">
-                          <label className="block text-xs font-medium text-slate-700 mb-1">
-                            On-Chain Transaction Hash (TXID / Reference)
-                          </label>
+                          <div className="flex items-center justify-between mb-1">
+                            <label className="block text-xs font-medium text-slate-700">
+                              On-Chain Transaction Hash (TXID / Reference)
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setCryptoTxHash(
+                                  `0x${Array.from({ length: 32 }, () =>
+                                    Math.floor(Math.random() * 16).toString(16)
+                                  ).join("")}`
+                                )
+                              }
+                              className="text-[11px] font-semibold text-blue-700 hover:underline cursor-pointer"
+                            >
+                              Fill Sample TXID
+                            </button>
+                          </div>
                           <input
                             type="text"
                             required
@@ -1925,9 +3331,21 @@ export default function UserDashboard() {
             </div>
           )}
 
+          {/* TAB: MULTI-SMTP & APP PASSWORD INSTRUCTIONS */}
+          {activeTab === "smtp" && (
+            <div className="space-y-6">
+              <MultiSmtpManagerPanel
+                mode="user"
+                title="Multi-SMTP & Multiple Gmail Accounts + App Password Setup Guide"
+                subtitle="Connect multiple Gmail or custom SMTP accounts to wire up your outreach & messaging activities, and follow the step-by-step instructions below to generate your Gmail 16-character App Password or other SMTP credentials."
+              />
+            </div>
+          )}
+
           {/* TAB 4: WORKSPACE SETTINGS */}
           {activeTab === "settings" && (
-            <div className="max-w-xl bg-white rounded-xl border border-slate-200 p-5 sm:p-7 space-y-6">
+            <div className="space-y-8">
+              <div className="max-w-xl bg-white rounded-xl border border-slate-200 p-5 sm:p-7 space-y-6">
               <div>
                 <h2 className="font-display text-xl font-bold text-slate-950">Workspace Profile & Security</h2>
                 <p className="text-xs text-slate-500 mt-0.5">
@@ -1997,10 +3415,468 @@ export default function UserDashboard() {
                   </button>
                 </div>
               </form>
+              </div>
+
+              {/* Multi-SMTP & App Password Setup Instructions right inside Workspace Settings */}
+              <div className="pt-2">
+                <MultiSmtpManagerPanel
+                  mode="user"
+                  title="Email Sending Pool (Multi-Gmail & SMTP) + App Password Instructions"
+                  subtitle="Connect multiple Gmail or SMTP accounts for sending messages and view step-by-step instructions on how to get a Gmail App Password or other SMTP credentials."
+                />
+              </div>
             </div>
           )}
         </main>
       </div>
+
+      {/* INTERACTIVE GETTING STARTED & FIRST LEAD DISCOVERY GUIDED TOUR MODAL */}
+      {showTourModal && (
+        <div
+          className="fixed inset-0 z-50 bg-[#0B0F17]/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6 overflow-y-auto"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowTourModal(false);
+          }}
+        >
+          <div className="bg-white border border-[#E4E2DD] rounded-2xl max-w-3xl w-full overflow-hidden shadow-2xl my-auto">
+            {/* Modal Header */}
+            <div className="bg-[#0B0F17] text-white px-5 sm:px-7 py-5 flex items-start justify-between gap-4 border-b border-slate-800">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-xs text-[#C4B5FD] font-semibold">
+                  <Compass className="w-4 h-4" />
+                  <span>Interactive Workspace Walkthrough</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono-num text-slate-300">Step {tourStep} of 4</span>
+                </div>
+                <h2 className="font-display text-lg sm:text-xl font-bold tracking-tight text-white">
+                  Initiate Your First Autonomous B2B Lead Discovery Search
+                </h2>
+                <p className="text-xs text-slate-300">
+                  Configure your first target vertical and geography below—your selections sync directly with the AI Lead Hunter.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowTourModal(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer shrink-0"
+                aria-label="Close guided tour"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Stepper Navigation Strip */}
+            <div className="bg-[#FAF9F5] border-b border-[#E4E2DD] px-5 sm:px-7 py-3 grid grid-cols-2 sm:grid-cols-4 gap-2">
+              {(
+                [
+                  { step: 1, label: "01. Target Market" },
+                  { step: 2, label: "02. Project Setup" },
+                  { step: 3, label: "03. AI Diagnostics" },
+                  { step: 4, label: "04. Launch Search" },
+                ] as const
+              ).map((item) => (
+                <button
+                  key={item.step}
+                  type="button"
+                  onClick={() => setTourStep(item.step)}
+                  className={`px-3 py-2 rounded-lg text-xs font-semibold text-left transition-colors cursor-pointer flex items-center justify-between ${
+                    tourStep === item.step
+                      ? "bg-[#0B0F17] text-white"
+                      : tourStep > item.step
+                      ? "bg-white text-emerald-700 border border-[#E4E2DD]"
+                      : "bg-white text-[#525866] border border-[#E4E2DD] hover:text-[#0B0F17]"
+                  }`}
+                >
+                  <span className="truncate">{item.label}</span>
+                  {tourStep > item.step && <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />}
+                </button>
+              ))}
+            </div>
+
+            {/* Modal Step Content Body */}
+            <div className="p-5 sm:p-7 space-y-6 max-h-[70vh] overflow-y-auto">
+              {/* STEP 1: TARGET NICHE & GEOGRAPHY */}
+              {tourStep === 1 && (
+                <div className="space-y-5">
+                  <div>
+                    <h3 className="font-display text-base sm:text-lg font-bold text-[#0B0F17]">
+                      01. Choose Your Target Business Vertical & City
+                    </h3>
+                    <p className="text-xs sm:text-sm text-[#525866] mt-1 leading-relaxed">
+                      Vanguard Hunter scans live business directories across 120+ industries, verifies active domains, and removes dead websites automatically. Pick a high-converting preset playbook below or type any custom niche and city.
+                    </p>
+                  </div>
+
+                  {/* Preset Market Playbooks */}
+                  <div className="space-y-2">
+                    <div className="text-xs font-semibold text-[#0B0F17]">
+                      1-Click High-Converting Market Playbooks:
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                      {DISCOVERY_PRESET_PLAYBOOKS.map((preset) => {
+                        const isSelected =
+                          quickCategory.toLowerCase() === preset.category.toLowerCase() &&
+                          quickCity.toLowerCase() === preset.city.toLowerCase();
+                        return (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            onClick={() => {
+                              setQuickCategory(preset.category);
+                              setQuickCity(preset.city);
+                              setQuickCountry(preset.country);
+                              setQuickCount(preset.count);
+                              setQuickContext(preset.context);
+                            }}
+                            className={`p-3 rounded-xl border text-left transition-colors cursor-pointer ${
+                              isSelected
+                                ? "border-[#1D4ED8] bg-[#EFF6FF]/60"
+                                : "border-[#E4E2DD] bg-[#FAF9F5] hover:bg-white hover:border-slate-300"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-bold text-[#0B0F17] truncate">
+                                {preset.category}
+                              </span>
+                              <span className="text-[11px] font-mono-num text-[#1D4ED8] font-semibold shrink-0">
+                                {preset.city}, {preset.country}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-[#525866] mt-1 line-clamp-2">
+                              {preset.note}
+                            </p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Custom Inputs */}
+                  <div className="p-4 rounded-xl bg-[#FAF9F5] border border-[#E4E2DD] grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-semibold text-[#0B0F17] mb-1">
+                        Business Category / Niche
+                      </label>
+                      <input
+                        type="text"
+                        value={quickCategory}
+                        onChange={(e) => setQuickCategory(e.target.value)}
+                        placeholder="e.g. Dentist, MedSpa, Solar"
+                        className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-[#1D4ED8]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-semibold text-[#0B0F17] mb-1">
+                        Target City
+                      </label>
+                      <input
+                        type="text"
+                        value={quickCity}
+                        onChange={(e) => setQuickCity(e.target.value)}
+                        placeholder="e.g. Austin, Miami, London"
+                        className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-[#1D4ED8]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-semibold text-[#0B0F17] mb-1">
+                        Country
+                      </label>
+                      <input
+                        type="text"
+                        value={quickCountry}
+                        onChange={(e) => setQuickCountry(e.target.value)}
+                        placeholder="e.g. USA, UK, Canada"
+                        className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-[#1D4ED8]"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* STEP 2: PROJECT WORKSPACE ORGANIZATION */}
+              {tourStep === 2 && (
+                <div className="space-y-5">
+                  <div>
+                    <h3 className="font-display text-base sm:text-lg font-bold text-[#0B0F17]">
+                      02. Assign Your Search to a Dedicated Campaign Project
+                    </h3>
+                    <p className="text-xs sm:text-sm text-[#525866] mt-1 leading-relaxed">
+                      Every lead search is saved inside a Project workspace so your scraped businesses, CRM pipeline stages, and 1-click CSV/JSON exports stay organized by client or vertical.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2.5">
+                    <label className="block text-xs font-semibold text-[#0B0F17]">
+                      Select Active Project for This Search:
+                    </label>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {projects.map((proj) => {
+                        const projLeads = getProjectLeads(proj.id);
+                        const isSelected = tourSelectedProjectId === proj.id;
+                        return (
+                          <button
+                            key={proj.id}
+                            type="button"
+                            onClick={() => {
+                              setTourSelectedProjectId(proj.id);
+                              setActiveProjectId(proj.id);
+                            }}
+                            className={`p-3.5 rounded-xl border text-left transition-colors cursor-pointer flex items-center justify-between gap-3 ${
+                              isSelected
+                                ? "border-[#1D4ED8] bg-[#EFF6FF]/60"
+                                : "border-[#E4E2DD] bg-[#FAF9F5] hover:bg-white"
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="text-xs font-bold text-[#0B0F17] truncate">
+                                {proj.name}
+                              </div>
+                              <div className="text-[11px] text-[#525866] font-mono-num mt-0.5">
+                                {projLeads.length} saved {projLeads.length === 1 ? "lead" : "leads"}
+                              </div>
+                            </div>
+                            <span
+                              className={`text-[11px] font-semibold px-2 py-0.5 rounded ${
+                                isSelected
+                                  ? "bg-[#1D4ED8] text-white"
+                                  : "bg-white text-[#525866] border border-[#E4E2DD]"
+                              }`}
+                            >
+                              {isSelected ? "Selected" : "Select"}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Optional Inline New Project Creator */}
+                  <form
+                    onSubmit={handleCreateProjectInsideTour}
+                    className="p-4 rounded-xl bg-[#FAF9F5] border border-[#E4E2DD] space-y-2.5"
+                  >
+                    <div className="text-xs font-semibold text-[#0B0F17]">
+                      Or Create a New Campaign Project Right Now:
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-2.5">
+                      <input
+                        type="text"
+                        value={tourNewProjectName}
+                        onChange={(e) => setTourNewProjectName(e.target.value)}
+                        placeholder={`e.g. ${quickCategory} - ${quickCity} Outreach`}
+                        className="flex-1 px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-[#1D4ED8]"
+                      />
+                      <button
+                        type="submit"
+                        className="px-4 py-2 text-xs font-semibold text-white bg-[#0B0F17] hover:bg-slate-800 rounded-lg whitespace-nowrap cursor-pointer"
+                      >
+                        + Create & Select Project
+                      </button>
+                    </div>
+                    {tourProjectCreatedNotice && (
+                      <p className="text-xs font-medium text-emerald-700">
+                        {tourProjectCreatedNotice}
+                      </p>
+                    )}
+                  </form>
+                </div>
+              )}
+
+              {/* STEP 3: AUTONOMOUS AI DIAGNOSTICS & ENRICHMENT */}
+              {tourStep === 3 && (
+                <div className="space-y-5">
+                  <div>
+                    <h3 className="font-display text-base sm:text-lg font-bold text-[#0B0F17]">
+                      03. Configure Discovery Volume & Autonomous AI Diagnostics
+                    </h3>
+                    <p className="text-xs sm:text-sm text-[#525866] mt-1 leading-relaxed">
+                      When you import discovered businesses into your CRM pipeline, Vanguard Hunter automatically runs a multi-layer diagnostic and prepares personalized outreach assets:
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
+                      <div className="font-mono-num text-xs font-bold text-[#1D4ED8]">Layer 01</div>
+                      <div className="text-xs font-bold text-[#0B0F17]">Tech Stack & Gap Detection</div>
+                      <p className="text-[11px] text-[#525866] leading-relaxed">
+                        Detects CMS (WordPress, Wix, Squarespace), missing 24/7 chat/booking widgets, and mobile conversion bottlenecks.
+                      </p>
+                    </div>
+                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
+                      <div className="font-mono-num text-xs font-bold text-[#1D4ED8]">Layer 02</div>
+                      <div className="text-xs font-bold text-[#0B0F17]">Shareable Audit Page</div>
+                      <p className="text-[11px] text-[#525866] leading-relaxed">
+                        Generates a bespoke `/report/:id` diagnostic URL for each prospect that tracks live opens and consultation requests.
+                      </p>
+                    </div>
+                    <div className="p-3.5 rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] space-y-1">
+                      <div className="font-mono-num text-xs font-bold text-[#1D4ED8]">Layer 03</div>
+                      <div className="text-xs font-bold text-[#0B0F17]">Omnichannel Pitch Ready</div>
+                      <p className="text-[11px] text-[#525866] leading-relaxed">
+                        Drafts Cold Email A/B/C variants, WhatsApp/LinkedIn messages, and a neural Studio Voice Pitch script automatically.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-[#FAF9F5] border border-[#E4E2DD] grid grid-cols-1 sm:grid-cols-12 gap-4">
+                    <div className="sm:col-span-4">
+                      <label className="block text-[11px] font-semibold text-[#0B0F17] mb-1">
+                        Businesses per Search Batch
+                      </label>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        {["25", "50", "100"].map((num) => (
+                          <button
+                            key={num}
+                            type="button"
+                            onClick={() => setQuickCount(num)}
+                            className={`py-2 text-xs font-mono-num font-bold rounded-lg border cursor-pointer transition-colors ${
+                              quickCount === num
+                                ? "bg-[#0B0F17] text-white border-[#0B0F17]"
+                                : "bg-white text-[#0B0F17] border-slate-300 hover:bg-slate-50"
+                            }`}
+                          >
+                            {num}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="sm:col-span-8">
+                      <label className="block text-[11px] font-semibold text-[#0B0F17] mb-1">
+                        Optional AI Qualifying Context / Focus
+                      </label>
+                      <input
+                        type="text"
+                        value={quickContext}
+                        onChange={(e) => setQuickContext(e.target.value)}
+                        placeholder="e.g. Focus on independent practices missing online booking"
+                        className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-[#1D4ED8]"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* STEP 4: SUMMARY & 1-CLICK EXECUTION */}
+              {tourStep === 4 && (
+                <div className="space-y-5">
+                  <div>
+                    <h3 className="font-display text-base sm:text-lg font-bold text-[#0B0F17]">
+                      04. Ready to Launch Your First Lead Discovery Search
+                    </h3>
+                    <p className="text-xs sm:text-sm text-[#525866] mt-1 leading-relaxed">
+                      Review your configured discovery parameters below. Click <strong>Launch Live Lead Discovery Now</strong> to open the AI Hunter and immediately scan your target market.
+                    </p>
+                  </div>
+
+                  <div className="rounded-xl border border-[#E4E2DD] bg-[#FAF9F5] divide-y divide-[#E4E2DD] text-xs">
+                    <div className="px-4 py-3 flex items-center justify-between gap-4">
+                      <span className="text-[#525866] font-medium">Target Business Vertical</span>
+                      <span className="font-bold text-[#0B0F17]">{quickCategory || "Dentist"}</span>
+                    </div>
+                    <div className="px-4 py-3 flex items-center justify-between gap-4">
+                      <span className="text-[#525866] font-medium">Target Market Geography</span>
+                      <span className="font-bold text-[#0B0F17]">
+                        {quickCity || "Austin"}, {quickCountry || "USA"}
+                      </span>
+                    </div>
+                    <div className="px-4 py-3 flex items-center justify-between gap-4">
+                      <span className="text-[#525866] font-medium">Assigned Campaign Project</span>
+                      <span className="font-bold text-[#1D4ED8]">
+                        {projects.find((p) => p.id === tourSelectedProjectId)?.name ||
+                          projects[0]?.name ||
+                          "Default Project"}
+                      </span>
+                    </div>
+                    <div className="px-4 py-3 flex items-center justify-between gap-4">
+                      <span className="text-[#525866] font-medium">Discovery Batch Size</span>
+                      <span className="font-mono-num font-bold text-[#0B0F17]">
+                        Up to {quickCount} verified businesses
+                      </span>
+                    </div>
+                    <div className="px-4 py-3 flex items-center justify-between gap-4">
+                      <span className="text-[#525866] font-medium">AI Qualification Focus</span>
+                      <span className="text-[#0B0F17] truncate max-w-xs">
+                        {quickContext || "Standard website conversion & AI readiness audit"}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => handleLaunchTourDiscovery(true)}
+                      className="w-full py-3 px-4 bg-[#1D4ED8] hover:bg-[#1E40AF] text-white text-xs font-bold rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <Crosshair className="w-4 h-4" />
+                      <span>Launch Live Lead Discovery Now →</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleApplyTourToQuickBar}
+                      className="w-full py-3 px-4 bg-[#FAF9F5] hover:bg-[#F2F0EA] text-[#0B0F17] border border-[#E4E2DD] text-xs font-semibold rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <span>Apply to Dashboard Quick-Hunt Bar</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer Controls */}
+            <div className="bg-[#FAF9F5] border-t border-[#E4E2DD] px-5 sm:px-7 py-4 flex items-center justify-between gap-3">
+              <div>
+                {tourStep > 1 ? (
+                  <button
+                    type="button"
+                    onClick={() => setTourStep((prev) => Math.max(1, prev - 1) as 1 | 2 | 3 | 4)}
+                    className="px-3.5 py-2 text-xs font-semibold text-[#0B0F17] bg-white hover:bg-[#F2F0EA] border border-[#E4E2DD] rounded-lg transition-colors cursor-pointer"
+                  >
+                    ← Previous Step
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setShowTourModal(false)}
+                    className="px-3.5 py-2 text-xs font-medium text-[#525866] hover:text-[#0B0F17] cursor-pointer"
+                  >
+                    Skip for Now
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2.5">
+                {tourStep < 4 ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleLaunchTourDiscovery(true)}
+                      className="hidden sm:inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#1D4ED8] hover:bg-[#EFF6FF] rounded-lg transition-colors cursor-pointer"
+                    >
+                      <span>Quick-Launch in CRM Now</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTourStep((prev) => Math.min(4, prev + 1) as 1 | 2 | 3 | 4)}
+                      className="px-4 py-2 text-xs font-semibold text-white bg-[#0B0F17] hover:bg-slate-800 rounded-lg transition-colors cursor-pointer"
+                    >
+                      Next Step →
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handleLaunchTourDiscovery(true)}
+                    className="px-4 py-2 text-xs font-bold text-white bg-[#1D4ED8] hover:bg-[#1E40AF] rounded-lg transition-colors cursor-pointer"
+                  >
+                    Start Lead Discovery Search →
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

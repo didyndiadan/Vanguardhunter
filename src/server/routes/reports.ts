@@ -3,6 +3,25 @@ import { randomBytes } from "crypto";
 import { db, websiteReportsTable } from "../../db";
 import { eq, sql, desc, and, or, isNull, isNotNull, inArray } from "drizzle-orm";
 import { requireAdmin } from "../lib/admin-auth";
+import { resolveUserFromRequest } from "../lib/ai-training";
+
+function isOwnerEmail(email?: string | null): boolean {
+  if (!email) return false;
+  const e = email.trim().toLowerCase();
+  return e === "jwandersonar@gmail.com" || e === "admin@vanguardhunter.io";
+}
+
+function doesReportBelongToUser(
+  row: typeof websiteReportsTable.$inferSelect,
+  user: { id: number; email: string } | null
+): boolean {
+  if (!user) return false;
+  const ad = (row.analysisData || {}) as any;
+  if (ad._ownerUserId !== undefined && ad._ownerUserId !== null) {
+    return Number(ad._ownerUserId) === user.id;
+  }
+  return isOwnerEmail(user.email);
+}
 
 // ─── HTML / URL sanitisation ──────────────────────────────────────────────────
 
@@ -56,15 +75,22 @@ export async function createReport(params: {
   website: string;
   analysisData: any;
   baseUrl: string;
+  ownerUserId?: number | null;
+  ownerEmail?: string | null;
 }): Promise<{ reportId: string; reportUrl: string }> {
   // 8-char uppercase hex looks like "8DJ4KPLA"
   const reportId = randomBytes(4).toString("hex").toUpperCase();
   const reportUrl = `${params.baseUrl}/report/${reportId}`;
+  const enrichedData = {
+    ...(params.analysisData && typeof params.analysisData === "object" ? params.analysisData : {}),
+    ...(params.ownerUserId !== undefined ? { _ownerUserId: params.ownerUserId } : {}),
+    ...(params.ownerEmail !== undefined ? { _ownerEmail: params.ownerEmail } : {}),
+  };
   await db.insert(websiteReportsTable).values({
     reportId,
     businessName: params.businessName,
     website: params.website || "",
-    analysisData: params.analysisData ?? {},
+    analysisData: enrichedData,
     reportUrl,
   });
   return { reportId, reportUrl };
@@ -128,14 +154,42 @@ router.get("/reports/:reportId", async (req, res) => {
   }
 });
 
-// ─── Admin: list all reports ──────────────────────────────────────────────────
+// ─── User / Admin: list reports for the caller ────────────────────────────────
 
-router.get("/reports/admin/all", requireAdmin, async (_req, res) => {
+router.get("/reports", async (req, res) => {
   try {
+    const user = await resolveUserFromRequest(req);
     const rows = await db.select().from(websiteReportsTable)
       .orderBy(desc(websiteReportsTable.createdAt))
       .limit(500);
-    res.json(rows.map(r => ({
+    const filtered = user ? rows.filter(r => doesReportBelongToUser(r, user)) : [];
+    res.json({
+      reports: filtered.map(r => ({
+        reportId: r.reportId,
+        businessName: r.businessName,
+        website: r.website,
+        reportUrl: r.reportUrl,
+        createdAt: r.createdAt?.toISOString() ?? null,
+        firstViewed: r.firstViewed?.toISOString() ?? null,
+        lastViewed: r.lastViewed?.toISOString() ?? null,
+        totalViews: r.totalViews,
+        proposalRequested: r.proposalRequested,
+        status: r.status,
+      })),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/reports/admin/all", requireAdmin, async (req, res) => {
+  try {
+    const user = await resolveUserFromRequest(req);
+    const rows = await db.select().from(websiteReportsTable)
+      .orderBy(desc(websiteReportsTable.createdAt))
+      .limit(500);
+    const filtered = user ? rows.filter(r => doesReportBelongToUser(r, user)) : rows;
+    res.json(filtered.map(r => ({
       reportId: r.reportId,
       businessName: r.businessName,
       website: r.website,

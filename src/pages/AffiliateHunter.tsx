@@ -14,6 +14,7 @@ import {
   FileText, Send, Zap, BarChart3, Download, Check, Copy, Megaphone,
 } from "lucide-react";
 import API_BASE from "@/lib/api";
+import { LeadScrapingProgressSkeleton } from "@/components/ScrapingAndReportSkeletons";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -294,7 +295,15 @@ function HuntTab({ campaignId, onImported }: { campaignId: number; onImported: (
       </div>
 
       {error && <div className="flex items-center gap-2 text-red-600 bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-sm"><AlertTriangle className="w-4 h-4 flex-shrink-0" />{error}</div>}
-      {progress && <div className="text-sm text-gray-600 bg-gray-50 rounded-xl px-4 py-2">{progress}</div>}
+      {hunting && (
+        <LeadScrapingProgressSkeleton
+          categories={[category]}
+          cityLabel={city || "Target City"}
+          targetCount={count}
+          statusText={progress}
+        />
+      )}
+      {progress && !hunting && <div className="text-sm text-gray-600 bg-gray-50 rounded-xl px-4 py-2">{progress}</div>}
 
       {/* Results */}
       {results.length > 0 && (

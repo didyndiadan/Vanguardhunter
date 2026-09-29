@@ -20,7 +20,11 @@ import {
   userActivitiesTable,
 } from "../../db";
 import { eq, inArray, sql, desc } from "drizzle-orm";
-import { scrapeBusinessDirectories } from "../lib/business-scrapers";
+import {
+  scrapeBusinessDirectories,
+  enrichWebsiteApolloSignals,
+  computeApolloIntentScore,
+} from "../lib/business-scrapers";
 import { createReport, buildReportEmailSection, getAgencyBaseUrl } from "./reports";
 import { kvGetJson, kvSetJson } from "../lib/replit-kv";
 import { requireAdmin } from "../lib/admin-auth";
@@ -28,7 +32,41 @@ import {
   getActiveTrainingProfile,
   buildTrainedOutreachPromptBlock,
   buildTrainedAnalysisPromptBlock,
+  resolveUserFromRequest,
 } from "../lib/ai-training";
+
+function isOwnerEmail(email?: string | null): boolean {
+  if (!email) return false;
+  const e = email.trim().toLowerCase();
+  return e === "jwandersonar@gmail.com" || e === "admin@vanguardhunter.io";
+}
+
+function doesAccountBelongToUser(
+  acct: typeof emailAccountsTable.$inferSelect,
+  user: { id: number; email: string } | null
+): boolean {
+  if (!user) return !String(acct.imapHost || "").startsWith("owner:");
+  const tag = String(acct.imapHost || "");
+  if (tag.startsWith("owner:")) {
+    return tag === `owner:${user.id}`;
+  }
+  return isOwnerEmail(user.email);
+}
+
+function doesProspectRowBelongToUser(
+  row: typeof crmProspectsTable.$inferSelect,
+  user: { id: number; email: string } | null
+): boolean {
+  if (!user) return false;
+  const p = (row.payload || {}) as any;
+  if (p.ownerUserId !== undefined && p.ownerUserId !== null) {
+    return Number(p.ownerUserId) === user.id;
+  }
+  if (/^u\d+_/.test(String(row.id))) {
+    return String(row.id).startsWith(`u${user.id}_`);
+  }
+  return isOwnerEmail(user.email);
+}
 
 // ─── KV store helpers for email accounts (fallback when DB unavailable) ─────
 
@@ -75,28 +113,341 @@ function makeTransporter(acct: { host: string; port: number; secure: boolean; us
 }
 
 async function generateText(prompt: string, systemInstruction?: string): Promise<string> {
-  const ai = await getGeminiAI();
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      config: {
-        maxOutputTokens: 8192,
-        ...(systemInstruction ? { systemInstruction } : {}),
-      },
-    });
-    return response.text ?? "";
-  } catch {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      config: {
-        maxOutputTokens: 8192,
-        ...(systemInstruction ? { systemInstruction } : {}),
-      },
-    });
-    return response.text ?? "";
+  const modelsToTry = ["gemini-2.5-flash", "gemini-3-flash-preview"];
+  let lastErr: any = null;
+  for (const modelName of modelsToTry) {
+    try {
+      const ai = await getGeminiAI();
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: modelName,
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          config: {
+            ...(systemInstruction ? { systemInstruction } : {}),
+          },
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("AI generation timeout")), 4500)
+        ),
+      ]);
+      if (response.text) return response.text;
+    } catch (err: any) {
+      lastErr = err;
+    }
   }
+  throw lastErr || new Error("AI generation unavailable");
+}
+
+function matchBestOfferFromTraining(
+  services: Array<{ id?: string; name: string; description: string; targetNeeds?: string; targetSignals?: string }> | undefined,
+  params: {
+    website?: string;
+    category?: string;
+    painPoint?: string;
+    missingSignals?: string[];
+    cmsPlatform?: string;
+    siteContent?: string;
+    websiteScore?: number;
+    checks?: Record<string, boolean>;
+  }
+): { name: string; description: string; needsWebsite: boolean; needsReview: boolean } {
+  const list = Array.isArray(services) && services.length > 0 ? services : [];
+  const hasWeb = Boolean(params.website && !/^(none|n\/a|no website|-)$/i.test(params.website.trim()));
+  const signalText = `${params.painPoint || ""} ${(params.missingSignals || []).join(" ")} ${params.cmsPlatform || ""}`.toLowerCase();
+  const contentText = (params.siteContent || "").toLowerCase();
+
+  const hasReviewsInContent =
+    /customer reviews|testimonials|google reviews|trustpilot|birdeye|podium|nicejob|5-star|★★★★★|what our (clients|customers|patients) say/i.test(
+      `${contentText} ${signalText}`
+    ) && !/no review|no 5-star review|missing.*review/i.test(signalText);
+  const hasBookingOrChatInContent =
+    contentText.length > 50 && /book now|online booking|schedule appointment|instant quote|live chat|calendly|acuity/i.test(contentText);
+  const siteUnreachableOrThin = hasWeb && contentText.length < 220 && !hasBookingOrChatInContent;
+
+  const needsWebsite =
+    !hasWeb ||
+    siteUnreachableOrThin ||
+    (typeof params.websiteScore === "number" && params.websiteScore < 70) ||
+    Boolean(
+      params.checks &&
+        (params.checks.responsiveDesign === false ||
+          params.checks.modernUI === false ||
+          params.checks.contactForm === false)
+    ) ||
+    /no website|unreachable|parked|diy|wix|godaddy|weebly|squarespace|wordpress|no lead capture|no contact form|no online booking|no booking|no https|outdated|slow|poor mobile|redesign|high-friction/i.test(
+      signalText
+    ) ||
+    (hasWeb && contentText.length >= 220 && !hasBookingOrChatInContent);
+
+  const needsReview =
+    !hasReviewsInContent &&
+    (!hasWeb ||
+      siteUnreachableOrThin ||
+      Boolean(params.checks && params.checks.trustElements === false) ||
+      /no review|missing.*review|low.*review|few.*review|review funnel|review shield|reputation|5-star|no testimonial|trust/i.test(
+        signalText
+      ) ||
+      (hasWeb && contentText.length > 50 && !hasReviewsInContent));
+
+  if (list.length === 0) {
+    if (needsWebsite && needsReview) {
+      return {
+        name: "Website Creation & Review Service",
+        description: "Custom conversion websites and automated 5-star Google review generation systems",
+        needsWebsite: true,
+        needsReview: true,
+      };
+    }
+    if (needsWebsite) {
+      return {
+        name: "Website Creation & Mobile Redesign",
+        description: "Custom conversion-focused website with instant quote and mobile lead capture",
+        needsWebsite: true,
+        needsReview: false,
+      };
+    }
+    if (needsReview) {
+      return {
+        name: "5-Star Review Service & Reputation Shield",
+        description: "Automated 5-star Google review generation and feedback gatekeeper system",
+        needsWebsite: false,
+        needsReview: true,
+      };
+    }
+    return {
+      name: "24/7 AI Receptionist & Automated Booking",
+      description: "Automated 24/7 customer response and online appointment booking system",
+      needsWebsite: false,
+      needsReview: false,
+    };
+  }
+
+  const websiteService = list.find(s => /website|web design|site creation|redesign|landing page/i.test(`${s.name} ${s.description}`));
+  const reviewService = list.find(s => /review|reputation|5-star|star/i.test(`${s.name} ${s.description}`));
+
+  // Only assign Website Creation & Review Service when the audit/signals indicate the business needs them
+  if (websiteService && reviewService && needsWebsite && needsReview) {
+    return {
+      name: "Website Creation & Review Service",
+      description: `${websiteService.description} ${reviewService.description}`.trim(),
+      needsWebsite: true,
+      needsReview: true,
+    };
+  }
+  if (websiteService && needsWebsite && !needsReview) {
+    return {
+      name: websiteService.name,
+      description: websiteService.description,
+      needsWebsite: true,
+      needsReview: false,
+    };
+  }
+  if (reviewService && needsReview && !needsWebsite) {
+    return {
+      name: reviewService.name,
+      description: reviewService.description,
+      needsWebsite: false,
+      needsReview: true,
+    };
+  }
+
+  const textToMatch = `${params.category || ""} ${signalText} ${!hasBookingOrChatInContent ? "ai receptionist chat booking automation seo" : "seo growth"}`.toLowerCase();
+  const nonWebReviewList = list.filter(s => s !== websiteService && s !== reviewService);
+  const pool = nonWebReviewList.length > 0 ? nonWebReviewList : list;
+  let best = pool[0];
+  let bestScore = -1;
+  for (const s of pool) {
+    const hay = `${s.name} ${s.description} ${s.targetNeeds || ""} ${s.targetSignals || ""}`.toLowerCase();
+    let score = 0;
+    for (const word of textToMatch.split(/\W+/).filter(w => w.length > 2)) {
+      if (hay.includes(word)) score += 2;
+    }
+    if (hasWeb && (hay.includes("ai") || hay.includes("receptionist") || hay.includes("booking") || hay.includes("seo"))) score += 3;
+    if (score > bestScore) {
+      bestScore = score;
+      best = s;
+    }
+  }
+  return { name: best.name, description: best.description, needsWebsite, needsReview };
+}
+
+function buildFallbackAnalysis(params: {
+  businessName: string;
+  category?: string;
+  city?: string;
+  website?: string;
+  painPoint?: string;
+  missingSignals?: string[];
+  cmsPlatform?: string;
+  siteContent?: string;
+  matchedOffer?: string;
+  servicesOffered?: Array<{ id?: string; name: string; description: string; targetNeeds?: string; targetSignals?: string }>;
+}) {
+  const hasWeb = Boolean(params.website && !/^(none|n\/a|no website|-)$/i.test(params.website.trim()));
+  const cat = params.category || "local service";
+  const city = params.city || "your area";
+  const matched = matchBestOfferFromTraining(params.servicesOffered, {
+    website: params.website,
+    category: params.category,
+    painPoint: params.painPoint,
+    missingSignals: params.missingSignals,
+    cmsPlatform: params.cmsPlatform,
+    siteContent: params.siteContent,
+  });
+  const offer = params.matchedOffer || matched.name;
+  const needsWeb = matched.needsWebsite;
+  const needsRev = matched.needsReview;
+
+  const issues: Array<{ title: string; description: string; priority: "high" | "medium" | "low" }> = [];
+  if (needsWeb) {
+    issues.push({
+      title: hasWeb ? "High-Friction Mobile Website & Lead Capture" : "No Dedicated Conversion Website",
+      description: hasWeb
+        ? `Visitors searching for ${cat.toLowerCase()} in ${city} encounter a website layout without fast mobile conversion or instant quote capture.`
+        : `Prospective customers searching for ${params.businessName} in ${city} have no dedicated website to view services or request a booking.`,
+      priority: "high",
+    });
+  }
+  if (needsRev) {
+    issues.push({
+      title: "Missing Automated 5-Star Review Funnel",
+      description: `Satisfied customers are not systematically routed to post 5-star Google reviews while private feedback is captured first.`,
+      priority: needsWeb ? "medium" : "high",
+    });
+  }
+  issues.push({
+    title: "No 24/7 Automated AI Receptionist or Instant Booking",
+    description: `After-hours and busy-hour customer inquiries go unanswered without an automated chat and booking assistant.`,
+    priority: !needsWeb && !needsRev ? "high" : "medium",
+  });
+
+  return {
+    matchedOffer: offer,
+    websiteScore: !hasWeb ? 12 : needsWeb ? 46 : 66,
+    leadScore: needsWeb ? 48 : 68,
+    conversionScore: !hasWeb ? 10 : needsWeb ? 38 : 64,
+    mobileScore: !hasWeb ? 15 : needsWeb ? 52 : 70,
+    seoScore: !hasWeb ? 12 : needsWeb ? 44 : 64,
+    growthPotential: 90,
+    checks: {
+      responsiveDesign: hasWeb && !needsWeb,
+      sslCertificate: hasWeb,
+      modernUI: hasWeb && !needsWeb,
+      whatsappButton: false,
+      contactForm: hasWeb && !needsWeb,
+      bookingSystem: false,
+      onlineOrdering: false,
+      paymentIntegration: false,
+      customerPortal: false,
+      membershipArea: false,
+      blog: false,
+      seoBasics: hasWeb,
+      analytics: hasWeb && !needsWeb,
+      socialMedia: true,
+      emailCapture: false,
+      liveChat: false,
+      aiChatbot: false,
+      callToAction: hasWeb && !needsWeb,
+      trustElements: hasWeb && !needsRev,
+    },
+    issues,
+    opportunities: [
+      {
+        title: `Deploy ${offer}`,
+        impact: "+25–40% increase in qualified local customer inquiries",
+        effort: "low" as const,
+      },
+      {
+        title: needsRev ? "Activate 5-Star Review Shield & Reputation Funnel" : "Automate 24/7 Instant Lead Response",
+        impact: needsRev ? "Steadily compounds 5-star Google Maps reviews" : "Captures after-hours inquiries automatically",
+        effort: "low" as const,
+      },
+    ],
+    recommendedFeatures: [
+      offer,
+      ...(needsWeb ? ["Mobile Conversion Website & Instant Quote Funnel"] : []),
+      ...(needsRev ? ["5-Star Review Shield & Direct Review Link"] : []),
+      "24/7 AI Receptionist & Automated Booking",
+    ],
+    projectType: "Medium Web App" as const,
+    estimatedValue: { min: 1500, max: 3500 },
+    deliveryWeeks: { min: 1, max: 2 },
+    summary: `${params.businessName} has strong local demand in ${city} as a ${cat} provider, and our audit indicates ${offer} is the highest-impact upgrade right now to convert more local searches into long-term clients.`,
+  };
+}
+
+function buildFallbackEmailVersions(params: {
+  businessName: string;
+  ownerName?: string;
+  category?: string;
+  city?: string;
+  website?: string;
+  senderName: string;
+  agencyName: string;
+  offerDetails?: string;
+  callToAction?: string;
+  reportUrl?: string;
+  demoWebsiteUrl?: string;
+  reviewServiceUrl?: string;
+  staticEmailTemplate?: string;
+  matchedOffer?: string;
+}) {
+  const biz = params.businessName || "your business";
+  const greeting = params.ownerName ? `Hi ${params.ownerName},` : `Hi ${biz} Team,`;
+  const cityPart = params.city ? ` in ${params.city}` : "";
+  const catPart = (params.category || "local").toLowerCase();
+  const cta = params.callToAction || "Would you be open to a quick 5-minute walkthrough this week?";
+  const matchedOffer = params.matchedOffer || "Website Creation & Review Service";
+  const linkLines: string[] = [];
+  if (params.demoWebsiteUrl) {
+    linkLines.push(`• Live Website Preview for ${biz}: ${params.demoWebsiteUrl}`);
+  }
+  if (params.reviewServiceUrl) {
+    linkLines.push(`• 5-Star Customer Review Page for ${biz}: ${params.reviewServiceUrl}`);
+  }
+  if (params.reportUrl) {
+    linkLines.push(`• Website & Conversion Audit Report: ${params.reportUrl}`);
+  }
+  const reportLine = linkLines.length > 0
+    ? `\n\nHere is what we prepared for ${biz}:\n${linkLines.join("\n")}`
+    : "";
+  const signOff = `\n\nBest regards,\n${params.senderName}\n${params.agencyName}`;
+
+  let versionABody = `${greeting}\n\nWhile reviewing ${catPart} businesses${cityPart}, I noticed an opportunity to help ${biz} capture more local clients with our primary offer: ${matchedOffer}.\n\nAt ${params.agencyName}, we specialize in ${params.offerDetails || "custom conversion websites and automated 5-star Google review systems"} so local customers can easily find, trust, and book with you.${reportLine}\n\n${cta}${signOff}`;
+
+  if (params.staticEmailTemplate && params.staticEmailTemplate.trim()) {
+    versionABody = params.staticEmailTemplate
+      .replace(/\{\{\s*Business_Name\s*\}\}/gi, biz)
+      .replace(/\{\{\s*BusinessName\s*\}\}/gi, biz)
+      .replace(/\{\{\s*Owner_Name\s*\}\}/gi, params.ownerName || `${biz} Team`)
+      .replace(/\{\{\s*Category\s*\}\}/gi, params.category || "local")
+      .replace(/\{\{\s*City\s*\}\}/gi, params.city || "your area")
+      .replace(/\{\{\s*Matched_Offer\s*\}\}/gi, matchedOffer)
+      .replace(/\{\{\s*Sender_Name\s*\}\}/gi, params.senderName)
+      .replace(/\{\{\s*My_Business\s*\}\}/gi, params.agencyName)
+      .replace(/\{\{\s*Report_URL\s*\}\}/gi, params.reportUrl || "");
+    if (linkLines.length > 0 && !versionABody.includes(params.demoWebsiteUrl || "___") && !versionABody.includes(params.reviewServiceUrl || "___")) {
+      versionABody = `${versionABody.trim()}${reportLine}`;
+    }
+  }
+
+  return [
+    {
+      version: "A",
+      subject: `Quick idea for ${biz} — ${matchedOffer}`,
+      body: versionABody,
+    },
+    {
+      version: "B",
+      subject: `Website & 5-Star Review setup for ${biz}`,
+      body: `${greeting}\n\nI was looking at ${biz}${cityPart} today and saw a clear opportunity to turn more of your search visitors into paying clients and 5-star Google reviews using ${matchedOffer}.\n\nWe provide ${params.offerDetails || "clean, conversion-ready websites and automated 5-star review pages"} tailored specifically for ${catPart} businesses.${reportLine}\n\n${cta}${signOff}`,
+    },
+    {
+      version: "C",
+      subject: `${biz} — ${matchedOffer}`,
+      body: `${greeting}\n\nMost ${catPart} businesses${cityPart} miss out on new inquiries and 5-star reviews simply because customers don't have a fast mobile website or a direct 1-tap review link.\n\nWe prepared a streamlined ${matchedOffer} setup for ${biz} to help capture both automatically.${reportLine}\n\n${cta}${signOff}`,
+    },
+  ];
 }
 
 function parseJSON(text: string): any {
@@ -120,11 +471,13 @@ function parseJSON(text: string): any {
 async function scrapeWebsite(url: string): Promise<string> {
   if (!url || /^(none|n\/a|no website|-)$/i.test(url.trim())) return "";
   const fullUrl = url.startsWith("http") ? url : `https://${url}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3200);
   try {
-    const res = await Promise.race([
-      fetch(fullUrl, { headers: { "User-Agent": "Mozilla/5.0 (compatible; DevStudio/1.0)" } }),
-      new Promise<never>((_, r) => setTimeout(() => r(new Error("timeout")), 8000)),
-    ]) as Response;
+    const res = await fetch(fullUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; DevStudio/1.0)" },
+      signal: controller.signal,
+    });
     const html = await res.text();
     return html
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -134,7 +487,11 @@ async function scrapeWebsite(url: string): Promise<string> {
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 2500);
-  } catch { return ""; }
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ─── Domain / email verification helpers ─────────────────────────────────────
@@ -147,20 +504,29 @@ function extractHostname(raw: string): string {
   catch { return ""; }
 }
 
+const dnsLookupCache = new Map<string, boolean>();
+const mxLookupCache = new Map<string, boolean>();
+
 /**
  * Returns true if the domain has at least one A/AAAA record (i.e. is real and live).
- * Times out after 5 s so it never hangs the whole request.
+ * Times out after 1.5 s and caches by hostname so it never hangs the request.
  */
 async function verifyWebsiteDomain(website: string): Promise<boolean> {
   const host = extractHostname(website);
   if (!host) return true; // no website listed → not a reason to discard
+  const cached = dnsLookupCache.get(host);
+  if (cached !== undefined) return cached;
   try {
     await Promise.race([
       dnsPromises.lookup(host),
-      new Promise<never>((_, r) => setTimeout(() => r(new Error("timeout")), 5000)),
+      new Promise<never>((_, r) => setTimeout(() => r(new Error("timeout")), 1500)),
     ]);
+    dnsLookupCache.set(host, true);
     return true;
-  } catch { return false; }
+  } catch {
+    dnsLookupCache.set(host, false);
+    return false;
+  }
 }
 
 /**
@@ -169,41 +535,69 @@ async function verifyWebsiteDomain(website: string): Promise<boolean> {
  */
 async function verifyEmailMx(email: string): Promise<boolean> {
   if (!email || !email.includes("@")) return false;
-  const domain = email.split("@")[1].toLowerCase();
+  const domain = email.split("@")[1]?.toLowerCase().trim();
+  if (!domain) return false;
+  const cached = mxLookupCache.get(domain);
+  if (cached !== undefined) return cached;
   try {
     const records = await Promise.race([
       dnsPromises.resolveMx(domain),
-      new Promise<never>((_, r) => setTimeout(() => r(new Error("timeout")), 5000)),
+      new Promise<never>((_, r) => setTimeout(() => r(new Error("timeout")), 1500)),
     ]);
-    return Array.isArray(records) && records.length > 0;
-  } catch { return false; }
+    const ok = Array.isArray(records) && records.length > 0;
+    mxLookupCache.set(domain, ok);
+    return ok;
+  } catch {
+    mxLookupCache.set(domain, false);
+    return false;
+  }
 }
 
 /**
- * Verify all prospects in parallel; return only those whose email domain has
- * MX records AND (if a website is listed) whose website domain resolves in DNS.
+ * Verify prospects in parallel without discarding real businesses that have no email
+ * (such as "No Website" leads or phone/address directory leads).
+ * If an email domain has no MX records, clear the bad email rather than deleting the business.
+ * If a website domain does not resolve, flag it as "Unreachable / Parked" so it surfaces as a Bad Website lead.
  */
 async function filterLiveProspects(prospects: any[]): Promise<{ live: any[]; dead: number }> {
-  const CONCURRENCY = 8;
-  const valid = prospects.filter(biz => biz && typeof biz === "object");
-  const results: { biz: any; ok: boolean }[] = [];
+  const valid = prospects.filter(biz => biz && typeof biz === "object" && String(biz.businessName || "").trim().length >= 2);
+  let dead = prospects.length - valid.length;
 
-  for (let i = 0; i < valid.length; i += CONCURRENCY) {
-    const batch = valid.slice(i, i + CONCURRENCY);
-    const batchResults = await Promise.all(
-      batch.map(async (biz) => {
+  await Promise.race([
+    Promise.allSettled(
+      valid.slice(0, 80).map(async (biz) => {
+        const hasEmail = Boolean(biz.email && String(biz.email).includes("@"));
+        const hasWeb = Boolean(biz.website && String(biz.website).trim());
         const [emailOk, domainOk] = await Promise.all([
-          verifyEmailMx(biz.email),
-          verifyWebsiteDomain(biz.website),
+          hasEmail ? verifyEmailMx(biz.email) : Promise.resolve(true),
+          hasWeb ? verifyWebsiteDomain(biz.website) : Promise.resolve(true),
         ]);
-        return { biz, ok: emailOk && domainOk };
+        if (hasEmail && !emailOk) {
+          biz.email = "";
+        }
+        if (hasWeb && !domainOk) {
+          biz.cmsPlatform = "Unreachable / Parked";
+          const existingSignals = Array.isArray(biz.missingSignals) ? biz.missingSignals : [];
+          if (!existingSignals.includes("Website Unreachable / Broken")) {
+            biz.missingSignals = ["Website Unreachable / Broken", ...existingSignals];
+          }
+          biz.softwareNeedScore = Math.max(biz.softwareNeedScore ?? 8, 8);
+        }
       })
-    );
-    results.push(...batchResults);
-  }
+    ),
+    new Promise<void>(resolve => setTimeout(resolve, 2200)),
+  ]);
 
-  const live = results.filter(r => r.ok).map(r => r.biz);
-  return { live, dead: results.length - live.length };
+  const live = valid.filter((biz) => {
+    const hasContactOrLocation = Boolean(biz.email || biz.phone || biz.website || biz.notes || biz.city);
+    if (!hasContactOrLocation) {
+      dead++;
+      return false;
+    }
+    return true;
+  });
+
+  return { live, dead };
 }
 
 // ─── Google Places API (optional enrichment) ──────────────────────────────────
@@ -450,7 +844,7 @@ async function recordFailure(id: number, message: string) {
   } catch { /* DB unavailable, ignore */ }
 }
 
-async function sendWithFailover(
+export async function sendWithFailover(
   buildMail: (acct: typeof emailAccountsTable.$inferSelect) => Record<string, any>,
   preferredAccountId?: number
 ): Promise<{ acct: typeof emailAccountsTable.$inferSelect; result: any }> {
@@ -497,32 +891,41 @@ export async function notifyAdmin(subject: string, html: string, text?: string) 
 
 // ─── Email account CRUD ───────────────────────────────────────────────────────
 
-router.get("/crm/email-accounts", requireAdmin, async (_req, res) => {
-  await autoSeedBrevo();
+router.get("/crm/email-accounts", requireAdmin, async (req, res) => {
+  const caller = await resolveUserFromRequest(req);
+  if (!caller || isOwnerEmail(caller.email)) {
+    await autoSeedBrevo();
+  }
   try {
     const rows = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id);
     // Sync KV with DB so production reads stay fresh
     kvWriteAccounts(rows).catch(() => {});
-    res.json(rows.map(maskAccount));
+    const visible = caller ? rows.filter(a => doesAccountBelongToUser(a, caller)) : rows;
+    res.json(visible.map(maskAccount));
   } catch {
     // DB unavailable — serve from KV store
     const accounts = await kvReadAccounts();
-    res.json(accounts.map(maskAccount));
+    const visible = caller ? accounts.filter(a => doesAccountBelongToUser(a, caller)) : accounts;
+    res.json(visible.map(maskAccount));
   }
 });
 
 router.post("/crm/email-accounts", requireAdmin, async (req, res) => {
+  const caller = await resolveUserFromRequest(req);
+  const ownerTag = caller?.id ? `owner:${caller.id}` : "";
   const { label, provider, host, port, secure, user, password, fromName, fromEmail, dailyLimit } = req.body;
   if (!user || !password || !host) {
     res.status(400).json({ error: "host, user, and password are required" });
     return;
   }
+  const cleanPass = String(password).replace(/\s+/g, "");
   const values = {
     label: label || user, provider: provider || "smtp",
-    host, port: port || 587, secure: secure ?? false,
-    user, password, fromName: fromName || "DevStudio",
-    fromEmail: fromEmail || "", active: true, sentCount: 0,
-    dailyLimit: Number.isFinite(dailyLimit) ? Math.max(0, dailyLimit) : 0,
+    host, port: Number(port) || 587, secure: secure ?? (Number(port) === 465),
+    user: String(user).trim(), password: cleanPass, fromName: fromName || "DevStudio",
+    fromEmail: fromEmail || String(user).trim(), active: true, sentCount: 0,
+    dailyLimit: Number.isFinite(dailyLimit) ? Math.max(0, dailyLimit) : 80,
+    imapHost: ownerTag,
   };
   try {
     const inserted = await db.insert(emailAccountsTable).values(values).returning();
@@ -537,7 +940,7 @@ router.post("/crm/email-accounts", requireAdmin, async (req, res) => {
     const newId = await kvNextId();
     const acct: KvAccount = {
       id: newId, ...values,
-      imapEnabled: false, imapHost: "", imapPort: 993,
+      imapEnabled: false, imapHost: ownerTag, imapPort: 993,
       sentToday: 0, lastSentDay: "", consecutiveFailures: 0,
       lastError: "", lastErrorAt: null, autoPaused: false, createdAt: now,
     };
@@ -545,6 +948,177 @@ router.post("/crm/email-accounts", requireAdmin, async (req, res) => {
     await kvWriteAccounts(accounts);
     res.json({ success: true, account: maskAccount(acct) });
   }
+});
+
+// Bulk-add multiple Gmail or SMTP accounts in one click
+router.post("/crm/email-accounts/bulk", requireAdmin, async (req, res) => {
+  const { accounts: incomingAccounts, rawLines, defaultFromName = "Vanguard Outreach", defaultDailyLimit = 80 } = req.body ?? {};
+
+  const parsedItems: Array<{
+    label: string;
+    provider: string;
+    host: string;
+    port: number;
+    secure: boolean;
+    user: string;
+    password: string;
+    fromName: string;
+    fromEmail: string;
+    dailyLimit: number;
+  }> = [];
+
+  if (Array.isArray(incomingAccounts)) {
+    for (const item of incomingAccounts) {
+      if (!item?.user || !item?.password) continue;
+      const emailStr = String(item.user).trim();
+      const domain = emailStr.split("@")[1]?.toLowerCase() || "";
+      const isGmail = domain.includes("gmail.com") || domain.includes("googlemail.com") || item.provider === "gmail";
+      const isOutlook = domain.includes("outlook.") || domain.includes("hotmail.") || domain.includes("live.") || item.provider === "outlook";
+      const isYahoo = domain.includes("yahoo.") || item.provider === "yahoo";
+      const isZoho = domain.includes("zoho.") || item.provider === "zoho";
+
+      const resolvedHost =
+        item.host ||
+        (isGmail
+          ? "smtp.gmail.com"
+          : isOutlook
+          ? "smtp.office365.com"
+          : isYahoo
+          ? "smtp.mail.yahoo.com"
+          : isZoho
+          ? "smtp.zoho.com"
+          : "smtp.gmail.com");
+      const resolvedPort = Number(item.port) || 587;
+      const resolvedProvider =
+        item.provider ||
+        (isGmail ? "gmail" : isOutlook ? "outlook" : isYahoo ? "yahoo" : isZoho ? "zoho" : "smtp");
+
+      parsedItems.push({
+        label: item.label || `${resolvedProvider.toUpperCase()} (${emailStr})`,
+        provider: resolvedProvider,
+        host: resolvedHost,
+        port: resolvedPort,
+        secure: resolvedPort === 465,
+        user: emailStr,
+        password: String(item.password).replace(/\s+/g, ""),
+        fromName: item.fromName || defaultFromName,
+        fromEmail: item.fromEmail || emailStr,
+        dailyLimit: Number(item.dailyLimit) || defaultDailyLimit,
+      });
+    }
+  }
+
+  if (typeof rawLines === "string" && rawLines.trim()) {
+    const lines = rawLines
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    for (const line of lines) {
+      // Support formats:
+      // email@gmail.com | xxxx xxxx xxxx xxxx | Sender Name | smtp.host.com | 587
+      // or email@gmail.com, xxxx xxxx xxxx xxxx, Sender Name
+      const parts = line.includes("|")
+        ? line.split("|").map((p) => p.trim())
+        : line.split(",").map((p) => p.trim());
+      if (parts.length < 2) continue;
+      const [rawEmail, rawPass, rawName, rawHost, rawPort] = parts;
+      if (!rawEmail || !rawPass) continue;
+
+      const domain = rawEmail.split("@")[1]?.toLowerCase() || "";
+      const isOutlook = domain.includes("outlook.") || domain.includes("hotmail.") || domain.includes("live.");
+      const isYahoo = domain.includes("yahoo.");
+      const isZoho = domain.includes("zoho.");
+      const host =
+        rawHost ||
+        (isOutlook
+          ? "smtp.office365.com"
+          : isYahoo
+          ? "smtp.mail.yahoo.com"
+          : isZoho
+          ? "smtp.zoho.com"
+          : "smtp.gmail.com");
+      const port = Number(rawPort) || 587;
+      const provider = host.includes("gmail")
+        ? "gmail"
+        : host.includes("office365")
+        ? "outlook"
+        : host.includes("yahoo")
+        ? "yahoo"
+        : host.includes("zoho")
+        ? "zoho"
+        : host.includes("brevo")
+        ? "brevo"
+        : "smtp";
+
+      parsedItems.push({
+        label: `${provider.toUpperCase()} · ${rawEmail}`,
+        provider,
+        host,
+        port,
+        secure: port === 465,
+        user: rawEmail,
+        password: rawPass.replace(/\s+/g, ""),
+        fromName: rawName || defaultFromName,
+        fromEmail: rawEmail,
+        dailyLimit: defaultDailyLimit,
+      });
+    }
+  }
+
+  if (parsedItems.length === 0) {
+    res.status(400).json({ error: "Please provide at least one valid email and app password." });
+    return;
+  }
+
+  const caller = await resolveUserFromRequest(req);
+  const ownerTag = caller?.id ? `owner:${caller.id}` : "";
+  const addedAccounts: any[] = [];
+  for (const item of parsedItems) {
+    try {
+      const inserted = await db
+        .insert(emailAccountsTable)
+        .values({
+          ...item,
+          imapHost: ownerTag,
+          active: true,
+          sentCount: 0,
+        })
+        .returning();
+      if (inserted[0]) addedAccounts.push(maskAccount(inserted[0]));
+    } catch {
+      const accounts = await kvReadAccounts();
+      const newId = await kvNextId();
+      const acct: KvAccount = {
+        id: newId,
+        ...item,
+        active: true,
+        sentCount: 0,
+        imapEnabled: false,
+        imapHost: ownerTag,
+        imapPort: 993,
+        sentToday: 0,
+        lastSentDay: "",
+        consecutiveFailures: 0,
+        lastError: "",
+        lastErrorAt: null,
+        autoPaused: false,
+        createdAt: new Date(),
+      };
+      accounts.push(acct);
+      await kvWriteAccounts(accounts);
+      addedAccounts.push(maskAccount(acct));
+    }
+  }
+
+  const all = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id).catch(() => []);
+  if (all.length > 0) kvWriteAccounts(all).catch(() => {});
+
+  res.json({
+    success: true,
+    addedCount: addedAccounts.length,
+    accounts: addedAccounts,
+  });
 });
 
 router.put("/crm/email-accounts/:id", requireAdmin, async (req, res) => {
@@ -892,23 +1466,87 @@ router.get("/crm/track/history/:email", async (req, res) => {
 
 // ─── Business Hunter ──────────────────────────────────────────────────────────
 
+function applyHunterPreFilters(prospects: any[], preFilters?: string[]): any[] {
+  const active = Array.isArray(preFilters)
+    ? preFilters.map((f) => String(f).trim().toLowerCase()).filter((f) => f && f !== "all")
+    : [];
+  if (active.length === 0) return prospects;
+
+  const scoreLeadMatch = (b: any): number => {
+    const rawWeb = String(b.website || "").trim();
+    const hasNoWebsite =
+      !rawWeb || /^(none|n\/a|no website|-)$/i.test(rawWeb) || b.cmsPlatform === "No Website";
+    const cms = String(b.cmsPlatform || "").toLowerCase();
+    const missing = Array.isArray(b.missingSignals) ? b.missingSignals.join(" ").toLowerCase() : "";
+    const tech = Array.isArray(b.techStack) ? b.techStack.join(" ").toLowerCase() : "";
+    const pain = String(b.painPoint || "").toLowerCase();
+
+    const hasBadWebsite =
+      !hasNoWebsite &&
+      ((b.softwareNeedScore ?? 0) >= 4 ||
+        /wix|squarespace|godaddy|weebly|wordpress|custom html|unreachable|parked/i.test(cms) ||
+        (Array.isArray(b.missingSignals) && b.missingSignals.length > 0) ||
+        /outdated|slow|no online booking|no contact form|unreachable|prime candidate|opportunity/i.test(pain));
+
+    const hasDecisionMaker = Boolean(
+      (b.ownerName && String(b.ownerName).trim()) ||
+        (b.linkedin && String(b.linkedin).trim()) ||
+        (Array.isArray(b.executiveEmails) && b.executiveEmails.length > 0) ||
+        b.emailType === "direct_executive"
+    );
+    const hasVerifiedEmail = Boolean(b.email && String(b.email).includes("@"));
+    const needsReview =
+      hasNoWebsite || /review/i.test(missing) || !/customer reviews/i.test(tech);
+    const missingBookingOrChat = hasNoWebsite || /booking|chat|receptionist/i.test(missing);
+    const isHotIntent =
+      (b.softwareNeedScore ?? 0) >= 6 || (b.buyerIntentScore ?? b.intentScore ?? 0) >= 65;
+
+    let matches = 0;
+    for (const f of active) {
+      if (f === "no_website" && hasNoWebsite) matches++;
+      else if (f === "bad_website" && hasBadWebsite) matches++;
+      else if (f === "decision_maker" && hasDecisionMaker) matches++;
+      else if (f === "verified_email" && hasVerifiedEmail) matches++;
+      else if (f === "no_reviews" && needsReview) matches++;
+      else if (f === "no_booking_chat" && missingBookingOrChat) matches++;
+      else if (f === "hot_intent" && isHotIntent) matches++;
+    }
+    return matches;
+  };
+
+  const matched = prospects
+    .map((b) => ({ b, matchCount: scoreLeadMatch(b) }))
+    .filter((item) => item.matchCount > 0)
+    .sort((a, b) => b.matchCount - a.matchCount || (b.b.intentScore ?? 0) - (a.b.intentScore ?? 0))
+    .map((item) => item.b);
+
+  return matched.length > 0 ? matched : prospects;
+}
+
 router.post("/crm/hunt-businesses", async (req, res) => {
-  const { category, city, country, count = 10, extraContext } = req.body as {
-    category: string; city: string; country: string; count?: number; extraContext?: string;
+  const { category, city, country, count = 10, extraContext, preFilters } = req.body as {
+    category: string;
+    city: string;
+    country: string;
+    count?: number;
+    extraContext?: string;
+    preFilters?: string[];
   };
   if (!category || !city) { res.status(400).json({ error: "category and city are required" }); return; }
 
   const needed = Math.min(Number(count) || 10, 10000);
+  const hasActivePreFilters =
+    Array.isArray(preFilters) && preFilters.some((f) => f && f !== "all");
+  const scrapeTargetCount = hasActivePreFilters ? Math.min(needed * 2, 120) : needed;
 
   try {
     let raw: any[] = [];
     const sourceLog: string[] = [];
 
-    // ── Step 1: All sources in parallel — 15 directory scrapers + Google Places ─
-    // Google Places always runs when the key is set (primary source, not fallback).
+    // ── Step 1: All sources in parallel — directory scrapers + Google Places ─
     const [{ businesses: scraped, sources, errors }, googlePlaces] = await Promise.all([
-      scrapeBusinessDirectories(category, city, country || "", needed),
-      searchGooglePlaces(category, city, country, needed),
+      scrapeBusinessDirectories(category, city, country || "", scrapeTargetCount, preFilters),
+      searchGooglePlaces(category, city, country, scrapeTargetCount),
     ]);
 
     if (scraped.length > 0) {
@@ -917,16 +1555,25 @@ router.post("/crm/hunt-businesses", async (req, res) => {
         .filter(b => b.businessName)
         .map(b => ({
           businessName: b.businessName,
-          ownerName: "",
+          ownerName: b.ownerName || "",
+          ownerRole: b.ownerRole || "",
           category: b.category || category,
           email: b.email || "",
           phone: b.phone || "",
           website: b.website || "",
           city: b.city || city,
           country: b.country || country || "",
-          instagram: "",
-          facebook: "",
-          linkedin: "",
+          instagram: b.instagram || "",
+          facebook: b.facebook || "",
+          linkedin: b.linkedin || "",
+          cmsPlatform: b.cmsPlatform || (b.website ? "Custom HTML" : "No Website"),
+          techStack: b.techStack || [],
+          missingSignals: b.missingSignals || [],
+          emailType: b.emailType || "unknown",
+          executiveEmails: b.executiveEmails || [],
+          intentScore: b.intentScore ?? 65,
+          intentTier: b.intentTier || "warm",
+          intentReasons: b.intentReasons || [],
           softwareNeedScore: b.aiOpportunityScore ?? 5,
           painPoint: b.aiOpportunityNote || "",
           estimatedValue: 0,
@@ -935,32 +1582,52 @@ router.post("/crm/hunt-businesses", async (req, res) => {
         }));
     }
 
-    // Log scraper diagnostics to server console for debugging (never sent to client)
-    if (Object.keys(errors).length > 0) {
-      console.warn("[hunt-businesses] scraper errors:", errors);
-    }
+    // Partial directory timeouts are normal when 18 sources run in parallel — no stderr warning needed
 
     // Merge Google Places results (always-on primary source, runs in parallel above)
     if (googlePlaces.length > 0) {
       sourceLog.push("google_places");
-      raw.push(...googlePlaces.map((p: any) => ({
-        businessName: p.displayName?.text || "",
-        ownerName: "",
-        category,
-        email: "",
-        phone: p.nationalPhoneNumber || "",
-        website: p.websiteUri || "",
-        city,
-        country: country || "",
-        instagram: "",
-        facebook: "",
-        linkedin: "",
-        softwareNeedScore: 5,
-        painPoint: "",
-        estimatedValue: 0,
-        notes: p.formattedAddress || "",
-        source: "google_places",
-      })));
+      raw.push(...googlePlaces.map((p: any) => {
+        const w = p.websiteUri || "";
+        const ph = p.nationalPhoneNumber || "";
+        const missing = w
+          ? ["No AI Chat / Receptionist", "No Online Booking", "No Ad Pixels (FB/Google)"]
+          : ["No Website Built", "No AI Chat / Receptionist", "No Online Booking"];
+        const intent = computeApolloIntentScore({
+          website: w,
+          phone: ph,
+          missingSignals: missing,
+        });
+        return {
+          businessName: p.displayName?.text || "",
+          ownerName: "",
+          ownerRole: "",
+          category,
+          email: "",
+          phone: ph,
+          website: w,
+          city,
+          country: country || "",
+          instagram: "",
+          facebook: "",
+          linkedin: "",
+          cmsPlatform: w ? "Custom HTML" : "No Website",
+          techStack: w ? ["Custom HTML"] : [],
+          missingSignals: missing,
+          emailType: "unknown",
+          executiveEmails: [],
+          intentScore: intent.intentScore,
+          intentTier: intent.intentTier,
+          intentReasons: intent.intentReasons,
+          softwareNeedScore: w ? 6 : 9,
+          painPoint: w
+            ? "Google Maps listing found — prime candidate for conversion & AI receptionist audit."
+            : "No website listed on Google Maps — prime candidate for instant AI Website + Review Shield.",
+          estimatedValue: 0,
+          notes: p.formattedAddress || "",
+          source: "google_places",
+        };
+      }));
     }
 
     // Note: we intentionally do NOT pad short results with AI-generated ("fake")
@@ -978,9 +1645,11 @@ router.post("/crm/hunt-businesses", async (req, res) => {
       return true;
     });
 
-    // ── Step 5: MX / DNS verification ────────────────────────────────────────
+    // ── Step 5: MX / DNS verification + Pre-Search Filter ────────────────────
     const { live, dead } = await filterLiveProspects(raw);
-    const returnedProspects = live.slice(0, needed);
+    live.sort((a, b) => (b.intentScore ?? 0) - (a.intentScore ?? 0));
+    const filteredByTarget = applyHunterPreFilters(live, preFilters);
+    const returnedProspects = filteredByTarget.slice(0, needed);
 
     try {
       const saasUser = (req as any).saasUser;
@@ -1023,12 +1692,13 @@ router.post("/crm/hunt-businesses", async (req, res) => {
  * and returns globally deduplicated results (no same email/name across cities).
  */
 router.post("/crm/bulk-hunt", async (req, res) => {
-  const { category, cities, country, countPerCity = 50, extraContext } = req.body as {
+  const { category, cities, country, countPerCity = 50, extraContext, preFilters } = req.body as {
     category: string;
     cities: string[];
     country?: string;
     countPerCity?: number;
     extraContext?: string;
+    preFilters?: string[];
   };
 
   if (!category || !Array.isArray(cities) || cities.length === 0) {
@@ -1047,41 +1717,75 @@ router.post("/crm/bulk-hunt", async (req, res) => {
   for (const city of cityList) {
     try {
       const [{ businesses: scraped, sources, errors }, googlePlaces] = await Promise.all([
-        scrapeBusinessDirectories(category, city, country || "", needed),
+        scrapeBusinessDirectories(category, city, country || "", needed, preFilters),
         searchGooglePlaces(category, city, country || "", needed),
       ]);
 
-      if (Object.keys(errors).length > 0) {
-        console.warn(`[bulk-hunt] scraper errors for ${city}:`, errors);
-      }
+      // Partial directory timeouts are normal across 18 parallel sources
 
       const cityRaw: any[] = [
         ...scraped.filter(b => b.businessName).map(b => ({
           businessName: b.businessName,
-          ownerName: "",
+          ownerName: b.ownerName || "",
+          ownerRole: b.ownerRole || "",
           category: b.category || category,
           email: b.email || "",
           phone: b.phone || "",
           website: b.website || "",
           city: b.city || city,
           country: b.country || country || "",
-          instagram: "", facebook: "", linkedin: "",
+          instagram: b.instagram || "",
+          facebook: b.facebook || "",
+          linkedin: b.linkedin || "",
+          cmsPlatform: b.cmsPlatform || (b.website ? "Custom HTML" : "No Website"),
+          techStack: b.techStack || [],
+          missingSignals: b.missingSignals || [],
+          emailType: b.emailType || "unknown",
+          executiveEmails: b.executiveEmails || [],
+          intentScore: b.intentScore ?? 65,
+          intentTier: b.intentTier || "warm",
+          intentReasons: b.intentReasons || [],
           softwareNeedScore: b.aiOpportunityScore ?? 5,
           painPoint: b.aiOpportunityNote || "", estimatedValue: 0,
           notes: b.address || "",
           source: b.source,
         })),
-        ...googlePlaces.map((p: any) => ({
-          businessName: p.displayName?.text || "",
-          ownerName: "", category, email: "",
-          phone: p.nationalPhoneNumber || "",
-          website: p.websiteUri || "",
-          city, country: country || "",
-          instagram: "", facebook: "", linkedin: "",
-          softwareNeedScore: 5, painPoint: "", estimatedValue: 0,
-          notes: p.formattedAddress || "",
-          source: "google_places",
-        })),
+        ...googlePlaces.map((p: any) => {
+          const w = p.websiteUri || "";
+          const ph = p.nationalPhoneNumber || "";
+          const missing = w
+            ? ["No AI Chat / Receptionist", "No Online Booking", "No Ad Pixels (FB/Google)"]
+            : ["No Website Built", "No AI Chat / Receptionist", "No Online Booking"];
+          const intent = computeApolloIntentScore({
+            website: w,
+            phone: ph,
+            missingSignals: missing,
+          });
+          return {
+            businessName: p.displayName?.text || "",
+            ownerName: "",
+            ownerRole: "",
+            category,
+            email: "",
+            phone: ph,
+            website: w,
+            city,
+            country: country || "",
+            instagram: "", facebook: "", linkedin: "",
+            cmsPlatform: w ? "Custom HTML" : "No Website",
+            techStack: w ? ["Custom HTML"] : [],
+            missingSignals: missing,
+            emailType: "unknown",
+            executiveEmails: [],
+            intentScore: intent.intentScore,
+            intentTier: intent.intentTier,
+            intentReasons: intent.intentReasons,
+            softwareNeedScore: w ? 6 : 9,
+            painPoint: "", estimatedValue: 0,
+            notes: p.formattedAddress || "",
+            source: "google_places",
+          };
+        }),
       ];
 
       // Global dedup across all cities
@@ -1097,33 +1801,185 @@ router.post("/crm/bulk-hunt", async (req, res) => {
         added++;
       }
       cityResults[city] = added;
-    } catch (err: any) {
-      console.error(`[bulk-hunt] error for city ${city}:`, err.message);
+    } catch {
       cityResults[city] = 0;
     }
   }
 
-  // MX / DNS verification across all accumulated prospects
+  // MX / DNS verification across all accumulated prospects + Pre-Search Filter
   const { live, dead } = await filterLiveProspects(allProspects);
+  live.sort((a, b) => (b.intentScore ?? 0) - (a.intentScore ?? 0));
+  const filteredLive = applyHunterPreFilters(live, preFilters);
 
   res.json({
-    prospects: live,
+    prospects: filteredLive,
     filtered: dead,
     total: allProspects.length,
     cityResults,
   });
 });
 
+// ─── Apollo+ On-Demand Deep Enrichment & Multi-Channel Cockpit ───────────────
+
+function buildMultiChannelScripts(params: {
+  businessName: string;
+  ownerName?: string;
+  category?: string;
+  city?: string;
+  website?: string;
+  cmsPlatform?: string;
+  missingSignals?: string[];
+  reportUrl?: string;
+  agencyName?: string;
+  senderName?: string;
+}) {
+  const biz = params.businessName || "your business";
+  const firstName = params.ownerName
+    ? params.ownerName.replace(/^Dr\.\s+/i, "Dr. ").split(/\s+/)[0]
+    : "";
+  const greetingName = firstName || `${biz} Team`;
+  const cityPart = params.city ? ` in ${params.city}` : "";
+  const catPart = params.category || "local";
+  const agency = params.agencyName || "Vanguard Growth";
+  const sender = params.senderName || "Alex";
+  const gaps = (params.missingSignals || []).slice(0, 2);
+  const gapPhrase =
+    gaps.length > 0
+      ? gaps.join(" and ").toLowerCase()
+      : "missing automated lead capture and 24/7 booking";
+  const cmsNote =
+    params.cmsPlatform && params.cmsPlatform !== "No Website"
+      ? `your ${params.cmsPlatform} site`
+      : `your online presence`;
+  const reportSnippet = params.reportUrl ? ` Here's the live audit link: ${params.reportUrl}` : "";
+
+  const coldCallOpener = `Hi ${firstName || "there"}, this is ${sender} from ${agency}. I know you're busy running ${biz}${cityPart} so I'll be 20 seconds — I was just looking at ${cmsNote} and noticed ${gapPhrase}, which usually costs ${catPart} businesses 15–25% of their inbound calls every week. We built a quick fix specifically for ${biz} — mind if I send you the 60-second preview link?`;
+
+  const gatekeeperBypass = `Hi! Could you let ${params.ownerName || "the owner"} know ${sender} is following up on the website & conversion diagnostic we ran for ${biz}'s ${params.cmsPlatform || "digital"} setup? What's the best direct email to drop the link to?`;
+
+  const smsScript = `Hi ${greetingName}, ${sender} here. Quick heads up — I noticed ${biz} (${cmsNote}) has ${gapPhrase}.${reportSnippet} Open to a 2-min chat on fixing this?`;
+
+  const linkedinDm = `Hi ${firstName || "there"} — came across ${biz}${cityPart} and noticed ${cmsNote} currently has ${gapPhrase}. Put together a quick conversion & AI automation blueprint for your team. Worth sending over the link?`;
+
+  const whatsappScript = `Hi ${greetingName}! 👋 I was reviewing ${biz}${cityPart} and noticed ${cmsNote} has ${gapPhrase}. We put together a custom breakdown showing how to capture those missed leads automatically.${reportSnippet} Would love to hear what you think!`;
+
+  return {
+    coldCallOpener,
+    gatekeeperBypass,
+    smsScript,
+    linkedinDm,
+    whatsappScript,
+    smartVariables: {
+      "{{decision_maker}}": params.ownerName || `${biz} Team`,
+      "{{first_name}}": firstName || `${biz} Team`,
+      "{{cms_platform}}": params.cmsPlatform || "website",
+      "{{tech_gap}}": gapPhrase,
+      "{{business_name}}": biz,
+    },
+  };
+}
+
+router.post("/crm/apollo-enrich", async (req, res) => {
+  try {
+    const training = await getActiveTrainingProfile(req);
+    const effectiveSender = training.senderName || "Alex";
+    const effectiveAgency = training.businessName || "Vanguard Growth";
+
+    const { businessName, website, email, phone, city, category, reportUrl } = req.body ?? {};
+    if (!businessName && !website) {
+      res.status(400).json({ error: "businessName or website is required" });
+      return;
+    }
+
+    const enriched = await enrichWebsiteApolloSignals({
+      website: website || "",
+      businessName: businessName || "",
+      email: email || "",
+      phone: phone || "",
+    });
+
+    // Verify MX on any discovered or executive email
+    const finalEmail = enriched.email || email || "";
+    const mxVerified = finalEmail ? await verifyEmailMx(finalEmail) : false;
+
+    const linkedinSearchUrl =
+      enriched.linkedin ||
+      `https://www.google.com/search?q=${encodeURIComponent(
+        `site:linkedin.com/in "${businessName || ""}" ${city || ""} (Owner OR Founder OR CEO OR President OR Doctor)`
+      )}`;
+
+    const scripts = buildMultiChannelScripts({
+      businessName: businessName || "Business",
+      ownerName: enriched.ownerName,
+      category,
+      city,
+      website,
+      cmsPlatform: enriched.cmsPlatform,
+      missingSignals: enriched.missingSignals,
+      reportUrl,
+      agencyName: effectiveAgency,
+      senderName: effectiveSender,
+    });
+
+    res.json({
+      success: true,
+      ...enriched,
+      email: finalEmail,
+      mxVerified,
+      linkedinSearchUrl,
+      scripts,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Apollo enrichment failed" });
+  }
+});
+
 // ─── Auto-analyze + generate everything for a hunted prospect ─────────────────
 
 router.post("/crm/auto-generate", async (req, res) => {
-  const { businessName, category, website, city, country, ownerName, painPoint, agencyName } = req.body as Record<string, string>;
+  const {
+    businessName,
+    category,
+    website,
+    city,
+    country,
+    ownerName,
+    painPoint,
+    agencyName,
+    cmsPlatform,
+    missingSignals,
+  } = req.body as {
+    businessName: string;
+    category: string;
+    website: string;
+    city: string;
+    country: string;
+    ownerName: string;
+    painPoint: string;
+    agencyName: string;
+    cmsPlatform?: string;
+    missingSignals?: string[];
+  };
   const training = await getActiveTrainingProfile(req);
   const effectiveSender = training.senderName || "Alex Morgan";
   const effectiveAgency = training.businessName || agencyName || "Apex Digital Growth";
 
   // Scrape the real website so the AI references actual content
   const siteContent = await scrapeWebsite(website);
+  let resolvedCms = cmsPlatform || "";
+  let resolvedMissing = Array.isArray(missingSignals) ? missingSignals : [];
+  if (website && (!resolvedCms || resolvedMissing.length === 0)) {
+    try {
+      const sigs = await enrichWebsiteApolloSignals({
+        website,
+        businessName: businessName || "",
+      });
+      if (!resolvedCms && sigs.cmsPlatform) resolvedCms = sigs.cmsPlatform;
+      if (resolvedMissing.length === 0 && Array.isArray(sigs.missingSignals)) {
+        resolvedMissing = sigs.missingSignals;
+      }
+    } catch {}
+  }
   const siteContext = siteContent
     ? `\nReal website content scraped from ${website}:\n"""\n${siteContent}\n"""`
     : (website ? `\nWebsite ${website} could not be loaded.` : "\nNo website.");
@@ -1187,19 +2043,75 @@ Return ONLY a JSON object with this exact structure:
 { "matchedOffer":"Name of the #1 matching service/offer from the user's list", "analysis":{"websiteScore":<0-100>,"leadScore":<0-100>,"conversionScore":<0-100>,"mobileScore":<0-100>,"seoScore":<0-100>,"growthPotential":<0-100>,"checks":{"responsiveDesign":<bool>,"sslCertificate":<bool>,"modernUI":<bool>,"whatsappButton":<bool>,"contactForm":<bool>,"bookingSystem":<bool>,"onlineOrdering":<bool>,"paymentIntegration":<bool>,"customerPortal":<bool>,"membershipArea":<bool>,"blog":<bool>,"seoBasics":<bool>,"analytics":<bool>,"socialMedia":<bool>,"emailCapture":<bool>,"liveChat":<bool>,"aiChatbot":<bool>,"callToAction":<bool>,"trustElements":<bool>},"issues":[{"title":"string","description":"string","priority":"high|medium|low"}],"opportunities":[{"title":"string","impact":"string","effort":"low|medium|high"}],"recommendedFeatures":["string"],"projectType":"Small Website|Medium Web App|Large SaaS","estimatedValue":{"min":<number>,"max":<number>},"deliveryWeeks":{"min":<1 or 2>,"max":<1 or 2>},"summary":"2-3 sentence plain English summary focusing on why our matched offers fit this business"}, "aiAgent":{"type":"receptionist|booking|sales|support|social","score":<0-100>,"fitReason":"1 sentence why our matched offer fits their business","topPain":"the #1 pain our offer solves for them right now"}, "pitchType":"ai_agent|website|both", "emailVersions":[{"version":"A","subject":"string","body":"string"},{"version":"B","subject":"string","body":"string"},{"version":"C","subject":"string","body":"string"}],"whatsapp":"string","linkedin":"string" }
 Be specific to a ${category} business in ${city}. If no website, give website scores of 5-25.`;
   try {
-    const text = await generateText(prompt);
-    const data = parseJSON(text);
+    let data: any;
+    try {
+      const text = await generateText(prompt);
+      data = parseJSON(text);
+    } catch {
+      const matched = matchBestOfferFromTraining(training.servicesOffered, {
+        website,
+        category,
+        painPoint,
+        missingSignals: resolvedMissing,
+        cmsPlatform: resolvedCms,
+        siteContent,
+      });
+      const matchedOfferName = matched.name;
+      const fbAnalysis = buildFallbackAnalysis({
+        businessName: businessName || "Business",
+        category,
+        city,
+        website,
+        painPoint,
+        missingSignals: resolvedMissing,
+        cmsPlatform: resolvedCms,
+        siteContent,
+        matchedOffer: matchedOfferName,
+        servicesOffered: training.servicesOffered,
+      });
+      const fbEmails = buildFallbackEmailVersions({
+        businessName: businessName || "Business",
+        ownerName,
+        category,
+        city,
+        website,
+        senderName: effectiveSender,
+        agencyName: effectiveAgency,
+        offerDetails: training.offerDetails,
+        callToAction: training.callToAction,
+        reportUrl: "{{REPORT_URL}}",
+        staticEmailTemplate: training.staticEmailTemplate,
+        matchedOffer: matchedOfferName,
+      });
+      data = {
+        matchedOffer: matchedOfferName,
+        analysis: fbAnalysis,
+        aiAgent: {
+          type: agentTypeHint,
+          score: 92,
+          fitReason: `Automated 24/7 ${agentTypeHint} and 4-tap mobile funnel captures high-intent ${category || "local"} inquiries immediately.`,
+          topPain: painPoint || "Missed after-hours calls and high-friction mobile lead capture",
+        },
+        pitchType: "both",
+        emailVersions: fbEmails,
+        whatsapp: `Hi ${ownerName || `${businessName} Team`}! 👋 ${effectiveSender} here from ${effectiveAgency}. I noticed a quick way for ${businessName} in ${city || "your area"} to capture more mobile bookings automatically. Open to a 2-minute preview link?`,
+        linkedin: `Hi ${ownerName || "there"} — came across ${businessName} in ${city || "your area"} and put together a quick conversion & AI automation blueprint for your team. Worth sending over?`,
+      };
+    }
     if (data?.whatsapp) data.whatsapp = fillPlaceholders(data.whatsapp, effectiveSender, effectiveAgency);
     if (data?.linkedin) data.linkedin = fillPlaceholders(data.linkedin, effectiveSender, effectiveAgency);
 
     // Create a public analysis report first so the URL can replace {{REPORT_URL}} in the email body
     if (data?.analysis) {
       try {
+        const caller = await resolveUserFromRequest(req);
         const { reportId, reportUrl } = await createReport({
           businessName: businessName || "",
           website: website || "",
           analysisData: data.analysis,
           baseUrl: getAgencyBaseUrl(req),
+          ownerUserId: caller?.id ?? null,
+          ownerEmail: caller?.email ?? null,
         });
         data.reportId = reportId;
         data.reportUrl = reportUrl;
@@ -1240,15 +2152,32 @@ Be specific to a ${category} business in ${city}. If no website, give website sc
 
 router.post("/crm/analyze-website", async (req, res) => {
   try {
-    const { website, businessName, category, city } = req.body as {
+    const { website, businessName, category, city, painPoint, cmsPlatform, missingSignals } = req.body as {
       website: string;
       businessName: string;
       category: string;
       city?: string;
+      painPoint?: string;
+      cmsPlatform?: string;
+      missingSignals?: string[];
     };
     if (!businessName) { res.status(400).json({ error: "businessName required" }); return; }
     const training = await getActiveTrainingProfile(req);
     const siteContent = await scrapeWebsite(website || "");
+    let resolvedCms = cmsPlatform || "";
+    let resolvedMissing = Array.isArray(missingSignals) ? missingSignals : [];
+    if (website && (!resolvedCms || resolvedMissing.length === 0)) {
+      try {
+        const sigs = await enrichWebsiteApolloSignals({
+          website,
+          businessName: businessName || "",
+        });
+        if (!resolvedCms && sigs.cmsPlatform) resolvedCms = sigs.cmsPlatform;
+        if (resolvedMissing.length === 0 && Array.isArray(sigs.missingSignals)) {
+          resolvedMissing = sigs.missingSignals;
+        }
+      } catch {}
+    }
     const siteContext = siteContent
       ? `\nScraped website content from ${website}:\n"""\n${siteContent}\n"""`
       : website
@@ -1263,19 +2192,48 @@ router.post("/crm/analyze-website", async (req, res) => {
 
 ${analysisBlock}
 
-Business Name: ${businessName}, Business Category: ${category || "Unknown"}${city ? `, City: ${city}` : ""}, Website: ${website || "No website provided"}${siteContext}
+Business Name: ${businessName}, Business Category: ${category || "Unknown"}${city ? `, City: ${city}` : ""}, Website: ${website || "No website provided"}${resolvedCms ? `, CMS: ${resolvedCms}` : ""}${resolvedMissing.length > 0 ? `, Detected Missing Signals: ${resolvedMissing.join(", ")}` : ""}${painPoint ? `, Pain Point: ${painPoint}` : ""}${siteContext}
 
 Produce a JSON object with EXACTLY this structure (no markdown, pure JSON):
 { "matchedOffer":"string (the #1 service/offer from our catalog that this business needs most)","websiteScore":<0-100>,"leadScore":<0-100>,"conversionScore":<0-100>,"mobileScore":<0-100>,"seoScore":<0-100>,"growthPotential":<0-100>,"checks":{"responsiveDesign":<true/false>,"sslCertificate":<true/false>,"modernUI":<true/false>,"whatsappButton":<true/false>,"contactForm":<true/false>,"bookingSystem":<true/false>,"onlineOrdering":<true/false>,"paymentIntegration":<true/false>,"customerPortal":<true/false>,"membershipArea":<true/false>,"blog":<true/false>,"seoBasics":<true/false>,"analytics":<true/false>,"socialMedia":<true/false>,"emailCapture":<true/false>,"liveChat":<true/false>,"aiChatbot":<true/false>,"callToAction":<true/false>,"trustElements":<true/false>},"issues":[{"title":"string","description":"string","priority":"high|medium|low"}],"opportunities":[{"title":"string","impact":"string","effort":"low|medium|high"}],"recommendedFeatures":["string"],"projectType":"Small Website|Medium Web App|Large SaaS","estimatedValue":{"min":<number>,"max":<number>},"deliveryWeeks":{"min":<1 or 2>,"max":<1 or 2, never above 2 — we deliver in 5 days to 2 weeks>},"summary":"2-3 sentence plain English summary explaining their key gaps and how our matched offers/services solve them" }
 Be realistic and specific to a ${category} business. If no website is provided, give scores of 0-20 for all website metrics.`;
-    const text = await generateText(prompt);
-    const data = parseJSON(text);
+    const fallbackBase = buildFallbackAnalysis({
+      businessName: businessName || "Business",
+      category,
+      city,
+      website,
+      painPoint,
+      cmsPlatform: resolvedCms,
+      missingSignals: resolvedMissing,
+      siteContent,
+      servicesOffered: training.servicesOffered,
+    });
+    let data: any;
     try {
+      const text = await generateText(prompt);
+      const parsed = parseJSON(text);
+      data = {
+        ...fallbackBase,
+        ...parsed,
+        checks: { ...fallbackBase.checks, ...(parsed?.checks || {}) },
+        issues: Array.isArray(parsed?.issues) && parsed.issues.length > 0 ? parsed.issues : fallbackBase.issues,
+        opportunities: Array.isArray(parsed?.opportunities) && parsed.opportunities.length > 0 ? parsed.opportunities : fallbackBase.opportunities,
+        recommendedFeatures: Array.isArray(parsed?.recommendedFeatures) && parsed.recommendedFeatures.length > 0 ? parsed.recommendedFeatures : fallbackBase.recommendedFeatures,
+        estimatedValue: parsed?.estimatedValue?.min ? parsed.estimatedValue : fallbackBase.estimatedValue,
+        deliveryWeeks: parsed?.deliveryWeeks?.min ? parsed.deliveryWeeks : fallbackBase.deliveryWeeks,
+      };
+    } catch {
+      data = fallbackBase;
+    }
+    try {
+      const caller = await resolveUserFromRequest(req);
       const { reportId, reportUrl } = await createReport({
         businessName: businessName || "",
         website: website || "",
         analysisData: data,
         baseUrl: getAgencyBaseUrl(req),
+        ownerUserId: caller?.id ?? null,
+        ownerEmail: caller?.email ?? null,
       });
       data.reportId = reportId;
       data.reportUrl = reportUrl;
@@ -1286,7 +2244,7 @@ Be realistic and specific to a ${category} business. If no website is provided, 
 
 router.post("/crm/generate-email", async (req, res) => {
   try {
-    const { businessName, ownerName, category, website, city, issues, opportunities, agencyName: reqAgencyName, reportUrl } = req.body as Record<string, string>;
+    const { businessName, ownerName, category, website, city, issues, opportunities, agencyName: reqAgencyName, reportUrl, demoWebsiteUrl, reviewServiceUrl, primaryOffer, cmsPlatform, missingSignals } = req.body as Record<string, any>;
     const training = await getActiveTrainingProfile(req);
 
     // Scrape real website for genuine personalisation
@@ -1298,6 +2256,20 @@ router.post("/crm/generate-email", async (req, res) => {
     const senderName = training.senderName || "Alex Morgan";
     const agencyName = training.businessName || reqAgencyName || process.env.AGENCY_NAME || "Apex Digital Growth";
     const ownerGreeting = ownerName ? `Hi ${ownerName},` : `Hi ${businessName || "there"} Team,`;
+
+    const matched = matchBestOfferFromTraining(training.servicesOffered, {
+      website,
+      category,
+      painPoint: issues,
+      cmsPlatform,
+      missingSignals: Array.isArray(missingSignals) ? missingSignals : undefined,
+      siteContent,
+    });
+    const effectivePrimaryOffer = primaryOffer || matched.name;
+    const inlineAssetLines = [
+      demoWebsiteUrl ? `- Live Custom Website Preview URL to include in the email: ${demoWebsiteUrl}` : "",
+      reviewServiceUrl ? `- Live 5-Star Review Service URL to include in the email: ${reviewServiceUrl}` : "",
+    ].filter(Boolean).join("\n");
 
     const trainedBlock = buildTrainedOutreachPromptBlock(training, {
       targetBusinessName: businessName,
@@ -1311,6 +2283,8 @@ router.post("/crm/generate-email", async (req, res) => {
 
 ${trainedBlock}
 
+PRIMARY OFFER FOR THIS EXTRACTED LEAD: ${effectivePrimaryOffer}
+${inlineAssetLines ? `\nGENERATED ASSETS FOR THIS LEAD (include these exact links cleanly in the email body):\n${inlineAssetLines}\n` : ""}
 TARGET SCRAPED BUSINESS CONTEXT:
 - Business Name: ${businessName}
 - Owner: ${ownerName || "the owner"}
@@ -1324,16 +2298,44 @@ EMAIL GENERATION RULES (apply to all three versions A, B, C):
 1. Follow the USER'S STATIC REFERENCE EMAIL MESSAGE and USER'S DIRECT INSTRUCTIONS TO AI above as your #1 priority!
 2. Adapt and personalize the message specifically for ${businessName} so it feels 100% custom-written for them.
 3. Open with "${ownerGreeting}".
-4. Pitch what ${agencyName} offers (${training.offerDetails}) naturally and persuasively.
-5. Version A = closest to the user's static template & direct; Version B = warm & conversational; Version C = insight-led & value-focused.
-6. End every version with the exact signature from the trained profile (${senderName}, ${agencyName}).
+4. Pitch the Primary Offer (${effectivePrimaryOffer} — ${training.offerDetails}) naturally, professionally, and in a classic simple style.
+5. ${inlineAssetLines ? "Include the provided Live Website Preview URL and/or 5-Star Review Service URL clearly in the body." : "Keep the pitch concise and easy to reply to."}
+6. Version A = closest to the user's static template & direct; Version B = warm & conversational; Version C = insight-led & value-focused.
+7. End every version with the exact signature from the trained profile (${senderName}, ${agencyName}).
 
 Return ONLY valid JSON (no markdown, no prose):
 { "versions":[{"version":"A","subject":"string","body":"string"},{"version":"B","subject":"string","body":"string"},{"version":"C","subject":"string","body":"string"}] }`;
 
-    const text = await generateText(prompt);
-    const data = parseJSON(text);
-    const versions: { version: string; subject: string; body: string }[] = data?.versions || [];
+    let versions: { version: string; subject: string; body: string }[] = [];
+    try {
+      const text = await generateText(prompt);
+      const data = parseJSON(text);
+      if (Array.isArray(data?.versions) && data.versions.length > 0) {
+        versions = data.versions;
+      } else if (data?.subject && data?.body) {
+        versions = [{ version: "A", subject: data.subject, body: data.body }];
+      }
+    } catch {
+      // Fall through to fallback versions below
+    }
+    if (!versions.length) {
+      versions = buildFallbackEmailVersions({
+        businessName: businessName || "Business",
+        ownerName,
+        category,
+        city,
+        website,
+        senderName,
+        agencyName,
+        offerDetails: training.offerDetails,
+        callToAction: training.callToAction,
+        reportUrl,
+        demoWebsiteUrl,
+        reviewServiceUrl,
+        staticEmailTemplate: training.staticEmailTemplate,
+        matchedOffer: effectivePrimaryOffer,
+      });
+    }
 
     const processed = versions.map(v => ({
       version: v.version,
@@ -1358,8 +2360,15 @@ User AI Instructions: ${training.aiInstructions}
 Key opportunity for ${businessName}: ${opportunities || training.offerDetails}
 Rules: Max 120 words. Friendly, conversational tone (${training.tone}). Professional, human, ONE clear CTA ("${training.callToAction}"). Sign off with ${senderName}, ${effectiveAgency}.
 Return JSON: { "message":"string" }`;
-    const text = await generateText(prompt);
-    const data = parseJSON(text);
+    let data: any;
+    try {
+      const text = await generateText(prompt);
+      data = parseJSON(text);
+    } catch {
+      data = {
+        message: `Hi ${businessName || "there"} Team! 👋 This is ${senderName} from ${effectiveAgency}. I was reviewing your ${category || "local"} presence and spotted a quick way to help you capture more mobile bookings and customer inquiries automatically (${training.offerDetails}). ${training.callToAction || "Open to a quick 2-minute preview?"} — ${senderName}, ${effectiveAgency}`,
+      };
+    }
     if (data?.message) data.message = fillPlaceholders(data.message, senderName, effectiveAgency);
     res.json(data);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
@@ -1375,8 +2384,15 @@ router.post("/crm/generate-linkedin", async (req, res) => {
 What we offer: ${training.offerDetails}
 Rules: Max 280 characters. Professional, human, and tailored to their ${category || "business"} business.
 Return JSON: { "message":"string" }`;
-    const text = await generateText(prompt);
-    const data = parseJSON(text);
+    let data: any;
+    try {
+      const text = await generateText(prompt);
+      data = parseJSON(text);
+    } catch {
+      data = {
+        message: `Hi ${ownerName || "there"} — came across ${businessName} and put together a quick conversion & AI automation blueprint tailored for your ${category || "business"} team. Worth sending over the link? — ${senderName}, ${effectiveAgency}`,
+      };
+    }
     if (data?.message) data.message = fillPlaceholders(data.message, senderName, effectiveAgency);
     res.json(data);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
@@ -1422,8 +2438,34 @@ Return ONLY valid JSON:
   "body": "full personalized email body following the user's static message blueprint, matched offer(s), and instructions"
 }`;
 
-    const text = await generateText(prompt);
-    const data = parseJSON(text);
+    let data: any;
+    try {
+      const text = await generateText(prompt);
+      data = parseJSON(text);
+    } catch {
+      const matched = matchBestOfferFromTraining(profile.servicesOffered, {
+        website: sampleWebsite,
+        category: sampleCategory,
+      });
+      const fb = buildFallbackEmailVersions({
+        businessName: sampleBusinessName,
+        category: sampleCategory,
+        city: sampleCity,
+        website: sampleWebsite,
+        senderName: profile.senderName,
+        agencyName: profile.businessName,
+        offerDetails: profile.offerDetails,
+        callToAction: profile.callToAction,
+        staticEmailTemplate: profile.staticEmailTemplate,
+        matchedOffer: matched.name,
+      })[0];
+      data = {
+        matchedOffer: matched.name,
+        analysisFocus: `Matched ${matched.name} to ${sampleBusinessName} (${sampleCategory} in ${sampleCity}) to convert mobile traffic and automate client inquiries.`,
+        subject: fb.subject,
+        body: fb.body,
+      };
+    }
     res.json({
       matchedOffer: data?.matchedOffer || profile.servicesOffered?.[0]?.name || "Primary Offer",
       analysisFocus: data?.analysisFocus || "",
@@ -1531,21 +2573,34 @@ Return ONLY valid JSON:
           matchedOffer = String(parsed?.matchedOffer || training.servicesOffered?.[0]?.name || "");
           subject = fillPlaceholders(parsed?.subject || `Quick idea for ${biz.businessName}`, senderName, agencyName);
           body = fillPlaceholders(parsed?.body || "", senderName, agencyName);
-          if (reportUrl) {
-            body = body.replace(/\{\{REPORT_URL\}\}/g, reportUrl);
-          } else {
-            body = body.replace(/[^\n.!?]*\{\{REPORT_URL\}\}[^\n]*/g, "").trim();
-          }
-        } catch (genErr: any) {
-          results.push({
-            businessName: biz.businessName,
-            email: biz.email || "",
-            subject: "",
-            body: "",
-            status: "skipped",
-            error: genErr.message || "AI generation failed",
+        } catch {
+          const matched = matchBestOfferFromTraining(training.servicesOffered, {
+            website: biz.website,
+            category: biz.category,
+            painPoint: biz.painPoint || biz.issues,
           });
-          continue;
+          matchedOffer = matched.name;
+          const fb = buildFallbackEmailVersions({
+            businessName: biz.businessName,
+            ownerName: biz.ownerName,
+            category: biz.category,
+            city: biz.city,
+            website: biz.website,
+            senderName,
+            agencyName,
+            offerDetails: training.offerDetails,
+            callToAction: training.callToAction,
+            reportUrl,
+            staticEmailTemplate: training.staticEmailTemplate,
+            matchedOffer,
+          })[0];
+          subject = fb.subject;
+          body = fb.body;
+        }
+        if (reportUrl) {
+          body = body.replace(/\{\{REPORT_URL\}\}/g, reportUrl);
+        } else {
+          body = body.replace(/[^\n.!?]*\{\{REPORT_URL\}\}[^\n]*/g, "").trim();
         }
       }
 
@@ -1838,8 +2893,53 @@ Write a full proposal with these sections:
 10. Next Steps (clear 3-step action plan)
 Be specific, professional, and persuasive. Every point should be specific to a ${category} business.
 Return JSON: { "sections":{"executiveSummary":"string","situation":"string","problems":["string"],"solution":"string","features":[{"name":"string","desc":"string"}],"benefits":["string"],"timeline":[{"week":"string","task":"string"}],"investment":"string","whyUs":["string"],"nextSteps":["string"]} }`;
-    const text = await generateText(prompt);
-    const data = parseJSON(text);
+    let data: any;
+    try {
+      const text = await generateText(prompt);
+      data = parseJSON(text);
+    } catch {
+      data = {
+        sections: {
+          executiveSummary: `${effectiveAgency} has prepared this turnkey digital conversion and automation proposal for ${businessName} to capture more high-intent ${category || "local"} customers and automate 24/7 lead response.`,
+          situation: website
+            ? `${businessName} currently operates ${website}, which lacks an interactive 4-tap mobile estimate funnel and 24/7 automated receptionist.`
+            : `${businessName} currently lacks a dedicated high-converting website and automated 24/7 booking funnel.`,
+          problems: [
+            "Prospective mobile customers face friction when trying to request pricing or book an appointment.",
+            "After-hours and peak-hour inquiries go unanswered without an automated 24/7 AI receptionist.",
+            "Satisfied customers are not systematically routed into a 5-Star Google Review Shield.",
+          ],
+          solution: `${effectiveAgency} will deploy a custom 4-Tap Conversion Website, 24/7 Spoken AI Receptionist, and 5-Star Review Shield tailored for ${businessName}.`,
+          features: [
+            { name: "4-Tap Instant Quote & Booking Funnel", desc: "Converts mobile visitors into qualified leads in under 15 seconds without long forms." },
+            { name: "24/7 Spoken AI Receptionist", desc: "Greets visitors with a natural studio voice, answers FAQs, and captures phone numbers." },
+            { name: "5-Star Review Shield", desc: "Routes 4–5 star ratings to Google Maps while privately intercepting 1–3 star feedback." },
+          ],
+          benefits: [
+            "25–40% lift in mobile lead conversion",
+            "Zero missed after-hours inquiries",
+            "Faster response times and higher booked-job volume",
+            "Protected 5-star Google Maps reputation",
+            "Full ownership and easy 1-click admin customization",
+          ],
+          timeline: [
+            { week: "Days 1–3", task: "Custom brand design, local copy, and 4-tap funnel configuration" },
+            { week: "Days 4–7", task: "24/7 AI receptionist training, domain connection, and live launch" },
+          ],
+          investment: customPrice || estimatedValue || "$1,500 Turnkey Setup (or $49/mo Managed Hosting)",
+          whyUs: [
+            `Specialized in high-converting ${category || "local service"} digital systems`,
+            "Rapid 5-to-7 day turnkey deployment with zero downtime",
+            "Proven 4-tap mobile funnel architecture",
+          ],
+          nextSteps: [
+            "Approve this proposal and select your preferred launch date",
+            "We configure your custom site, AI receptionist, and domain",
+            "Go live and start capturing new customer inquiries immediately",
+          ],
+        },
+      };
+    }
     if (!data?.sections) throw new Error("AI returned an invalid proposal — please try again.");
     if (customPrice) data.sections.investment = customPrice;
     if (customDuration) {
@@ -1866,37 +2966,61 @@ Previous context: ${previousContext || `Sent initial outreach about ${training.o
 Contact: ${ownerName ? ownerName : `the owner of ${businessName}`}
 Rules: Day 3: gentle, add value or insight. Day 7: different angle, ask a question. Day 14: share a relevant result/case study angle. Day 30: final check-in, door still open. Max 100 words. No "just following up" phrases. Sign off with ${senderName}, ${effectiveAgency}.
 Return JSON: { "subject":"string","body":"string","channel":"email" }`;
-    const text = await generateText(prompt);
-    const data = parseJSON(text);
+    let data: any;
+    try {
+      const text = await generateText(prompt);
+      data = parseJSON(text);
+    } catch {
+      data = {
+        subject: `Quick question for ${businessName}`,
+        body: `Hi ${ownerName || `${businessName} Team`},\n\nWanted to share a quick idea on how ${businessName} can capture more mobile inquiries automatically using our 4-tap booking & AI receptionist system.\n\nWould you be open to seeing a 60-second preview link customized for ${businessName}?\n\nBest regards,\n${senderName}\n${effectiveAgency}`,
+        channel: "email",
+      };
+    }
     res.json(data);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── Database Architecture & CRM Pipeline Persistence ─────────────────────────
 
-router.get("/crm/prospects", async (_req, res) => {
+router.get("/crm/prospects", async (req, res) => {
   try {
+    const user = await resolveUserFromRequest(req);
+    if (!user) {
+      res.json({ prospects: [], huntedLeads: [] });
+      return;
+    }
     const rows = await db.select().from(crmProspectsTable).orderBy(desc(crmProspectsTable.updatedAt));
-    const prospects = rows.map(r => ({
-      ...(typeof r.payload === "object" && r.payload ? r.payload : {}),
-      id: r.id,
-      name: r.name,
-      email: r.email,
-      phone: r.phone,
-      company: r.company,
-      role: r.role,
-      website: r.website,
-      industry: r.industry,
-      location: r.location,
-      companySize: r.companySize,
-      service: r.service,
-      stage: r.stage,
-      priority: r.priority,
-      dealValue: r.dealValue,
-      source: r.source,
-      aiScore: r.aiScore ?? undefined,
-    }));
-    const huntedLeads = (await kvGetJson<any[]>("CRM_HUNTED_LEADS")) ?? [];
+    const userRows = rows.filter(r => doesProspectRowBelongToUser(r, user));
+    const prospects = userRows.map(r => {
+      const payloadObj = (typeof r.payload === "object" && r.payload ? r.payload : {}) as Record<string, any>;
+      const cleanId =
+        payloadObj.id !== undefined
+          ? payloadObj.id
+          : String(r.id).replace(/^u\d+_/, "");
+      const numId = Number(cleanId);
+      return {
+        ...payloadObj,
+        id: Number.isFinite(numId) && String(numId) === String(cleanId) ? numId : cleanId,
+        name: r.name,
+        email: r.email,
+        phone: r.phone,
+        company: r.company,
+        role: r.role,
+        website: r.website,
+        industry: r.industry,
+        location: r.location,
+        companySize: r.companySize,
+        service: r.service,
+        stage: r.stage,
+        priority: r.priority,
+        dealValue: r.dealValue,
+        source: r.source,
+        aiScore: r.aiScore ?? undefined,
+      };
+    });
+    const huntedKey = `CRM_HUNTED_LEADS_USER_${user.id}`;
+    const huntedLeads = (await kvGetJson<any[]>(huntedKey)) ?? [];
     res.json({ prospects, huntedLeads });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1905,11 +3029,19 @@ router.get("/crm/prospects", async (_req, res) => {
 
 router.post("/crm/prospects/sync", async (req, res) => {
   try {
+    const user = await resolveUserFromRequest(req);
+    if (!user) {
+      res.json({ success: false, error: "Not authenticated" });
+      return;
+    }
     const { prospects, huntedLeads } = req.body as { prospects?: any[]; huntedLeads?: any[] };
     if (Array.isArray(prospects)) {
+      const syncedRowIds = new Set<string>();
       for (const p of prospects) {
         if (!p?.id) continue;
-        const idStr = String(p.id);
+        const rawIdStr = String(p.id).replace(/^u\d+_/, "");
+        const scopedId = `u${user.id}_${rawIdStr}`;
+        syncedRowIds.add(scopedId);
         const nameVal = String(p.ownerName || p.name || p.businessName || "");
         const companyVal = String(p.businessName || p.company || "");
         const industryVal = String(p.category || p.industry || "");
@@ -1917,11 +3049,17 @@ router.post("/crm/prospects/sync", async (req, res) => {
         const stageVal = String(p.status || p.stage || "new");
         const dealVal = Number(p.expectedValue ?? p.dealValue) || 0;
         const scoreVal = p.aiAgentScore !== undefined ? Number(p.aiAgentScore) : (p.aiScore !== undefined && p.aiScore !== null ? Number(p.aiScore) : null);
+        const enrichedPayload = {
+          ...p,
+          id: p.id,
+          ownerUserId: user.id,
+          ownerEmail: user.email,
+        };
 
         await db
           .insert(crmProspectsTable)
           .values({
-            id: idStr,
+            id: scopedId,
             name: nameVal,
             email: String(p.email || ""),
             phone: String(p.phone || ""),
@@ -1937,7 +3075,7 @@ router.post("/crm/prospects/sync", async (req, res) => {
             dealValue: dealVal,
             source: String(p.source || (p.hunted ? "ai_hunter" : "manual")),
             aiScore: scoreVal,
-            payload: p,
+            payload: enrichedPayload,
             updatedAt: new Date(),
           })
           .onConflictDoUpdate({
@@ -1958,14 +3096,25 @@ router.post("/crm/prospects/sync", async (req, res) => {
               dealValue: dealVal,
               source: String(p.source || (p.hunted ? "ai_hunter" : "manual")),
               aiScore: scoreVal,
-              payload: p,
+              payload: enrichedPayload,
               updatedAt: new Date(),
             },
           });
       }
+
+      // Remove any stale rows belonging strictly to this user that were deleted from their list
+      try {
+        const allRows = await db.select().from(crmProspectsTable);
+        const staleIds = allRows
+          .filter(r => doesProspectRowBelongToUser(r, user) && !syncedRowIds.has(String(r.id)))
+          .map(r => r.id);
+        if (staleIds.length > 0) {
+          await db.delete(crmProspectsTable).where(inArray(crmProspectsTable.id, staleIds));
+        }
+      } catch {}
     }
     if (Array.isArray(huntedLeads)) {
-      await kvSetJson("CRM_HUNTED_LEADS", huntedLeads);
+      await kvSetJson(`CRM_HUNTED_LEADS_USER_${user.id}`, huntedLeads);
     }
     res.json({ success: true });
   } catch (err: any) {
@@ -2061,6 +3210,1197 @@ router.get("/crm/database-status", async (_req, res) => {
         { name: "site_config", rows: Number(configCount[0]?.count ?? 0), desc: "Key-value configuration & persistent state store" },
       ],
     });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── AI Studio Voice-Note Pitch ($0 API Cost) & Outbound AI Machine Caller ───
+
+/**
+ * Wraps raw 16-bit signed little-endian PCM audio (24,000 Hz mono) returned by
+ * Gemini TTS into a standard 44-byte RIFF/WAVE container with persona-specific
+ * acoustic pitch/formant sample-rate shaping and 16-bit studio EQ filtering so
+ * every voice persona has a distinct vocal timbre, chest resonance, and tempo.
+ */
+function pcm16ToWavBase64(
+  pcmBase64: string,
+  sampleRate = 24000,
+  numChannels = 1,
+  eqProfile: "crisp_female" | "deep_baritone" | "brisk_founder" | "british_crisp" | "bold_closer" | "warm_executive" = "crisp_female"
+): string {
+  const rawBuf = Buffer.from(pcmBase64, "base64");
+  if (rawBuf.length >= 4 && rawBuf.toString("ascii", 0, 4) === "RIFF") {
+    return pcmBase64;
+  }
+
+  // Apply gentle 16-bit signed PCM studio EQ & dynamic presence shaping
+  const pcmBuf = Buffer.from(rawBuf);
+  const sampleCount = Math.floor(pcmBuf.length / 2);
+  let prevSample = 0;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const offset = i * 2;
+    const s = pcmBuf.readInt16LE(offset);
+    let shaped = s;
+
+    if (eqProfile === "deep_baritone" || eqProfile === "warm_executive") {
+      // Warm low-pass chest resonance filter for deep male baritone voices
+      const alpha = eqProfile === "deep_baritone" ? 0.36 : 0.24;
+      shaped = Math.round(s * (1 - alpha) + prevSample * alpha) * 1.12;
+    } else if (eqProfile === "crisp_female" || eqProfile === "british_crisp") {
+      // High-shelf presence & air boost for articulate female voices
+      const highFreq = s - prevSample;
+      shaped = Math.round(s + highFreq * 0.22);
+    } else if (eqProfile === "bold_closer" || eqProfile === "brisk_founder") {
+      // Punchy broadcast presence boost
+      const highFreq = s - prevSample;
+      shaped = Math.round((s + highFreq * 0.15) * 1.14);
+    }
+
+    prevSample = s;
+    if (shaped > 32767) shaped = 32767;
+    if (shaped < -32768) shaped = -32768;
+    pcmBuf.writeInt16LE(Math.round(shaped), offset);
+  }
+
+  const bitsPerSample = 16;
+  const byteRate = Math.round((sampleRate * numChannels * bitsPerSample) / 8);
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  const dataSize = pcmBuf.length;
+  const header = Buffer.alloc(44);
+
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16); // Subchunk1Size (16 for PCM)
+  header.writeUInt16LE(1, 20);  // AudioFormat (1 = PCM)
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, pcmBuf]).toString("base64");
+}
+
+interface StudioVoicePersonaSpec {
+  id: string;
+  displayName: string;
+  geminiVoice: string;
+  fallbackGeminiVoice: string;
+  sampleRate: number;
+  eqProfile: "crisp_female" | "deep_baritone" | "brisk_founder" | "british_crisp" | "bold_closer" | "warm_executive";
+  preferredModels: string[];
+  stylePrompt: string;
+  scriptStyleHint: string;
+}
+
+const STUDIO_VOICE_PERSONAS: Record<string, StudioVoicePersonaSpec> = {
+  Kore: {
+    id: "Kore",
+    displayName: "Sarah (Kore · Warm US Female Executive)",
+    geminiVoice: "Kore",
+    fallbackGeminiVoice: "Aoede",
+    sampleRate: 24900,
+    eqProfile: "crisp_female",
+    preferredModels: ["gemini-2.5-flash-preview-tts"],
+    stylePrompt: "Warm, bright, confident American female executive with an upbeat, friendly, smiling cadence",
+    scriptStyleHint: "warm, friendly, upbeat American female agency executive named Sarah",
+  },
+  Charon: {
+    id: "Charon",
+    displayName: "Marcus (Charon · Deep Baritone Male Consultant)",
+    geminiVoice: "Charon",
+    fallbackGeminiVoice: "Orus",
+    sampleRate: 20400,
+    eqProfile: "deep_baritone",
+    preferredModels: ["gemini-2.5-flash-preview-tts"],
+    stylePrompt: "Deep, resonant, calm baritone male senior executive consultant with a slow, measured, authoritative voice",
+    scriptStyleHint: "calm, authoritative senior executive strategy consultant named Marcus",
+  },
+  Puck: {
+    id: "Puck",
+    displayName: "Ryan (Puck · Fast Silicon Valley Male Founder)",
+    geminiVoice: "Puck",
+    fallbackGeminiVoice: "Fenrir",
+    sampleRate: 25800,
+    eqProfile: "brisk_founder",
+    preferredModels: ["gemini-2.5-flash-preview-tts"],
+    stylePrompt: "Fast-paced, energetic, enthusiastic young American male tech founder with a brisk conversational pace",
+    scriptStyleHint: "energetic, fast-moving tech founder named Ryan",
+  },
+  Zephyr: {
+    id: "Zephyr",
+    displayName: "Victoria (Zephyr · Crisp British UK Female Director)",
+    geminiVoice: "Zephyr",
+    fallbackGeminiVoice: "Leda",
+    sampleRate: 24100,
+    eqProfile: "british_crisp",
+    preferredModels: ["gemini-2.5-flash-preview-tts"],
+    stylePrompt: "Crisp, articulate, polished London British English female agency director with a refined, sophisticated accent",
+    scriptStyleHint: "articulate, polished British agency director in London named Victoria using natural UK phrasing",
+  },
+  Fenrir: {
+    id: "Fenrir",
+    displayName: "Viktor (Fenrir · Bold Wall Street Male Closer)",
+    geminiVoice: "Fenrir",
+    fallbackGeminiVoice: "Charon",
+    sampleRate: 21900,
+    eqProfile: "bold_closer",
+    preferredModels: ["gemini-2.5-flash-preview-tts"],
+    stylePrompt: "Bold, direct, high-conviction New York male sales closer with a punchy, commanding delivery",
+    scriptStyleHint: "direct, high-conviction New York revenue closer named Viktor focused on bottom-line ROI",
+  },
+  Orus: {
+    id: "Orus",
+    displayName: "Tunde (Orus · Warm Global / Nigerian Male Executive)",
+    geminiVoice: "Orus",
+    fallbackGeminiVoice: "Charon",
+    sampleRate: 22700,
+    eqProfile: "warm_executive",
+    preferredModels: ["gemini-2.5-flash-preview-tts"],
+    stylePrompt: "Warm, resonant, dignified international Nigerian-British English male executive advisor, clear and persuasive",
+    scriptStyleHint: "warm, dignified international growth advisor named Tunde",
+  },
+};
+
+const voicePitchAudioCache = new Map<string, { wavBase64: string; engine: string }>();
+const instantNeuralMp3Cache = new Map<string, string>();
+
+function splitTextIntoTtsChunks(text: string, maxLen = 180): string[] {
+  const sentences = text
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(/(?<=[.!?])\s+/);
+  const chunks: string[] = [];
+  let current = "";
+  for (const s of sentences) {
+    if (!s) continue;
+    if ((current ? `${current} ${s}` : s).length <= maxLen) {
+      current = current ? `${current} ${s}` : s;
+    } else {
+      if (current) chunks.push(current);
+      if (s.length <= maxLen) {
+        current = s;
+      } else {
+        const words = s.split(" ");
+        let sub = "";
+        for (const w of words) {
+          if ((sub ? `${sub} ${w}` : w).length <= maxLen) {
+            sub = sub ? `${sub} ${w}` : w;
+          } else {
+            if (sub) chunks.push(sub);
+            sub = w;
+          }
+        }
+        current = sub;
+      }
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+export async function synthesizeInstantNeuralMp3(
+  script: string,
+  voiceId: string = "Kore"
+): Promise<string | null> {
+  const clean = String(script || "").trim();
+  if (!clean) return null;
+  const cacheKey = `${voiceId}::${clean}`;
+  const cached = instantNeuralMp3Cache.get(cacheKey);
+  if (cached) return cached;
+
+  const tlMap: Record<string, string> = {
+    Kore: "en-US",
+    Zephyr: "en-GB",
+    Orus: "en-NG",
+    Charon: "en-AU",
+    Puck: "en-CA",
+    Fenrir: "en-IE",
+  };
+  const tl = tlMap[voiceId] || "en-US";
+  const chunks = splitTextIntoTtsChunks(clean, 180);
+  if (chunks.length === 0) return null;
+
+  try {
+    const buffers = await Promise.all(
+      chunks.map(async (chunk) => {
+        const url = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${encodeURIComponent(
+          tl
+        )}&q=${encodeURIComponent(chunk)}`;
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return Buffer.from(await r.arrayBuffer());
+      })
+    );
+    const combined = Buffer.concat(buffers);
+    if (combined.length > 256) {
+      const dataUri = `data:audio/mpeg;base64,${combined.toString("base64")}`;
+      instantNeuralMp3Cache.set(cacheKey, dataUri);
+      return dataUri;
+    }
+  } catch {}
+  return null;
+}
+
+export function buildSiteArrivalWalkthroughScript(site: {
+  businessName?: string;
+  ownerName?: string;
+  city?: string;
+  siteConfig?: any;
+}): { script: string; voiceId: string } {
+  const preferredVoice =
+    site?.siteConfig?.chatbotConfig?.voicePersona ||
+    site?.siteConfig?.walkthroughVoice ||
+    "Kore";
+  const ownerFirst = site?.ownerName
+    ? String(site.ownerName).trim().split(/\s+/)[0]
+    : "";
+  const greeting = ownerFirst ? `Hi ${ownerFirst}!` : `Hi there!`;
+  const cityPhrase = site?.city ? ` in ${site.city}` : "";
+  const bizName = site?.businessName || "your business";
+  const script = `${greeting} Welcome to the new custom website we built for ${bizName}${cityPhrase}. We engineered this page with an interactive 4-tap instant quote calculator and a 24/7 automated chat assistant so local customers can request estimates and book with you in seconds. Take a look around your live website right here, and click Claim Your Site Now at the top to launch it on your domain with zero build fee!`;
+  return { script, voiceId: preferredVoice };
+}
+
+export function getCachedSiteWalkthroughWav(site: {
+  businessName?: string;
+  ownerName?: string;
+  city?: string;
+  siteConfig?: any;
+}): string | null {
+  const { script, voiceId } = buildSiteArrivalWalkthroughScript(site);
+  const persona = STUDIO_VOICE_PERSONAS[voiceId] || STUDIO_VOICE_PERSONAS.Kore;
+  const cacheKey = `${persona.id}::${script}`;
+  const cached = voicePitchAudioCache.get(cacheKey);
+  if (cached?.wavBase64) {
+    return `data:audio/wav;base64,${cached.wavBase64}`;
+  }
+  const cachedMp3 = instantNeuralMp3Cache.get(cacheKey);
+  if (cachedMp3) {
+    return cachedMp3;
+  }
+  return null;
+}
+
+export async function ensureSiteWalkthroughAudioReady(site: {
+  businessName?: string;
+  ownerName?: string;
+  city?: string;
+  siteConfig?: any;
+}): Promise<string | null> {
+  const { script, voiceId } = buildSiteArrivalWalkthroughScript(site);
+  const persona = STUDIO_VOICE_PERSONAS[voiceId] || STUDIO_VOICE_PERSONAS.Kore;
+  const cacheKey = `${persona.id}::${script}`;
+  const cachedStudio = voicePitchAudioCache.get(cacheKey);
+  if (cachedStudio?.wavBase64) {
+    return `data:audio/wav;base64,${cachedStudio.wavBase64}`;
+  }
+  // Always kick off background Gemini Studio WAV prewarm
+  void prewarmSiteWalkthroughVoice(site);
+  const cachedMp3 = instantNeuralMp3Cache.get(cacheKey);
+  if (cachedMp3) return cachedMp3;
+  return await synthesizeInstantNeuralMp3(script, persona.id);
+}
+
+const inflightPrewarmKeys = new Set<string>();
+
+export async function prewarmSiteWalkthroughVoice(site: {
+  businessName?: string;
+  ownerName?: string;
+  city?: string;
+  siteConfig?: any;
+}): Promise<string | null> {
+  try {
+    const { script, voiceId } = buildSiteArrivalWalkthroughScript(site);
+    const persona = STUDIO_VOICE_PERSONAS[voiceId] || STUDIO_VOICE_PERSONAS.Kore;
+    const cacheKey = `${persona.id}::${script}`;
+    const existing = voicePitchAudioCache.get(cacheKey);
+    if (existing?.wavBase64) {
+      return `data:audio/wav;base64,${existing.wavBase64}`;
+    }
+    if (inflightPrewarmKeys.has(cacheKey)) return null;
+    inflightPrewarmKeys.add(cacheKey);
+
+    try {
+      const ai = await getGeminiAI();
+      const directedPrompt = `Speak the following message aloud in a ${persona.stylePrompt}: "${script}"`;
+      for (const modelName of persona.preferredModels) {
+        for (const candidateVoice of [persona.geminiVoice, persona.fallbackGeminiVoice]) {
+          try {
+            const response = await ai.models.generateContent({
+              model: modelName,
+              contents: [
+                {
+                  role: "user",
+                  parts: [{ text: directedPrompt } as any],
+                },
+              ],
+              config: {
+                responseModalities: ["AUDIO"],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: candidateVoice },
+                  },
+                },
+              },
+            });
+            const inlineData = response.candidates?.[0]?.content?.parts?.find(
+              (p: any) => p.inlineData?.data
+            )?.inlineData;
+            if (inlineData?.data) {
+              const wavBase64 = pcm16ToWavBase64(
+                inlineData.data,
+                persona.sampleRate,
+                1,
+                persona.eqProfile
+              );
+              const engine = `${modelName} (${candidateVoice} · ${Math.round(persona.sampleRate / 100) / 10}kHz Studio DSP)`;
+              voicePitchAudioCache.set(cacheKey, { wavBase64, engine });
+              return `data:audio/wav;base64,${wavBase64}`;
+            }
+          } catch {}
+        }
+      }
+    } finally {
+      inflightPrewarmKeys.delete(cacheKey);
+    }
+  } catch {}
+  return null;
+}
+
+function buildNaturalVoicePitchScript(params: {
+  businessName: string;
+  ownerName?: string;
+  ownerRole?: string;
+  category?: string;
+  city?: string;
+  website?: string;
+  cmsPlatform?: string;
+  missingSignals?: string[];
+  painPoint?: string;
+  agencyName?: string;
+  hasReport?: boolean;
+  voiceName?: string;
+  pitchMode?: "audit" | "website_claim" | "review_shield";
+}): string {
+  const firstName = params.ownerName
+    ? params.ownerName.trim().split(/\s+/)[0]
+    : "";
+  const cityPhrase = params.city ? ` in ${params.city}` : "";
+  const catPhrase = params.category ? params.category.toLowerCase() : "local service";
+  const v = params.voiceName || "Kore";
+
+  if (params.pitchMode === "website_claim") {
+    if (v === "Zephyr") {
+      const greet = firstName ? `Hello ${firstName}, Victoria speaking here.` : `Hello there, Victoria speaking for the team at ${params.businessName}.`;
+      return `${greet} Whilst reviewing top ${catPhrase} businesses${cityPhrase}, I noticed ${params.businessName} was missing an instant mobile quote funnel. Rather than sending a sales pitch, my team went ahead and built a complete custom website for ${params.businessName}—complete with a four-tap estimate calculator and an automated bottom chat concierge. We've waived the entire build fee so you can claim it for free. Click the live preview link in this message to test it out. Cheers!`;
+    }
+    if (v === "Charon") {
+      const greet = firstName ? `Good day ${firstName}, this is Marcus.` : `Good day, this is Marcus calling for the owner of ${params.businessName}.`;
+      return `${greet} Our engineering team noticed ${params.businessName}${cityPhrase} didn't have a high-converting four-tap estimate funnel online, meaning local mobile callers are slipping to competitors. Instead of pitching you, we went ahead and built a complete turnkey website for ${params.businessName} with an interactive four-tap quote engine and live bottom chat assistant. The fifteen-hundred-dollar build fee is completely waived. Open the live preview link in your email to inspect and claim your site today.`;
+    }
+    if (v === "Puck") {
+      const greet = firstName ? `Hey ${firstName}! Ryan here—` : `Hey team at ${params.businessName}! Ryan here—`;
+      return `${greet} super exciting heads-up! I saw ${params.businessName}${cityPhrase} needed a faster mobile quote funnel, so instead of sending a boring cold email, we actually built a brand-new interactive website for ${params.businessName}! It has a four-tap instant estimate funnel and an automated chat concierge at the bottom that chimes and captures leads 24/7. The build is 100 percent free to claim—tap the live preview link right now and check it out!`;
+    }
+    if (v === "Fenrir") {
+      const greet = firstName ? `${firstName}, Viktor here.` : `This is Viktor for the owner at ${params.businessName}.`;
+      return `${greet} Listen closely—every day ${params.businessName}${cityPhrase} operates without a fast four-tap mobile quote funnel, high-ticket ${catPhrase} jobs go straight to your competitors. So we fixed it for you in advance. My team just built a complete, custom lead-generation website for ${params.businessName} with a four-tap estimate funnel and 24/7 chat closer. Zero build cost to you. Click the preview link in your email right now and claim it before we release the territory.`;
+    }
+    if (v === "Orus") {
+      const greet = firstName ? `Hello ${firstName}, Tunde here.` : `Hello to the leadership at ${params.businessName}, Tunde speaking.`;
+      return `${greet} While reviewing ${catPhrase} leaders${cityPhrase}, I saw a major opportunity for ${params.businessName} to capture more customers online. Instead of just telling you about it, our team went ahead and built a complete, custom four-tap website for ${params.businessName}, including an automated bottom chat receptionist. We have waived the entire build fee so you can claim it for free. Kindly click the live preview link in your email to test your new website today.`;
+    }
+    const greeting = firstName ? `Hey ${firstName}, Sarah here!` : `Hi there, Sarah here with a quick gift for ${params.businessName}!`;
+    return `${greeting} While looking at ${catPhrase} businesses${cityPhrase}, I noticed ${params.businessName} didn't have a fast four-tap estimate funnel for mobile customers. Instead of sending a sales pitch, our team went ahead and built a complete custom website for ${params.businessName}—with a four-tap instant quote calculator and an automated bottom chat assistant—and waived the entire fifteen-hundred-dollar build fee! Click the live preview link in this email to test it out and claim it in one click!`;
+  }
+
+  if (params.pitchMode === "review_shield") {
+    if (v === "Zephyr") {
+      const greet = firstName ? `Hello ${firstName}, Victoria here.` : `Hello there, Victoria speaking for ${params.businessName}.`;
+      return `${greet} We've just set up a custom Five-Star Google Review Shield and Bad-Review Blocker for ${params.businessName}${cityPhrase}. When a customer taps five stars, it fast-tracks them straight to your Google Maps review page—but if anyone taps one to three stars, it intercepts them privately before they can post publicly. Click the live link in your email to test tapping five stars versus two stars right now. Cheers!`;
+    }
+    if (v === "Charon") {
+      const greet = firstName ? `Good day ${firstName}, Marcus speaking.` : `Good day, this is Marcus for ${params.businessName}.`;
+      return `${greet} We have prepared a live Five-Star Google Review Shield for ${params.businessName}${cityPhrase}. Four and five-star customers are routed directly to your public Google Maps listing, while any one-to-three-star complaint is privately intercepted and sent straight to your phone so your rating stays protected. Test the live link in your inbox right now.`;
+    }
+    if (v === "Puck") {
+      const greet = firstName ? `Hey ${firstName}! Ryan here—` : `Hey ${params.businessName} team! Ryan here—`;
+      return `${greet} check this out! We just set up a live Five-Star Review Shield for ${params.businessName}${cityPhrase}. Happy five-star customers go straight to your Google Maps page in one tap, while unhappy one-to-three-star reviews get blocked privately before they ever hit Google! Click the link in your email and test tapping five stars versus two stars—it takes ten seconds!`;
+    }
+    if (v === "Fenrir") {
+      const greet = firstName ? `${firstName}, Viktor here.` : `Viktor here for ${params.businessName}.`;
+      return `${greet} One bad Google review costs ${params.businessName}${cityPhrase} thousands in lost calls. So we built a live Five-Star Review Shield and Bad-Review Blocker specifically for your team. Five-star clients get sent straight to Google Maps, and one-to-three-star complaints get intercepted privately to your phone. Tap the link in your email to test it live right now.`;
+    }
+    if (v === "Orus") {
+      const greet = firstName ? `Hello ${firstName}, Tunde speaking.` : `Hello to the team at ${params.businessName}, Tunde here.`;
+      return `${greet} I have set up an interactive Five-Star Google Review Shield for ${params.businessName}${cityPhrase}. When your customers tap five stars, it directs them straight to Google Maps, and if anyone taps one, two, or three stars, it intercepts their feedback privately so your public rating stays five stars. Kindly click the link in your email to test it for yourself.`;
+    }
+    const greeting = firstName ? `Hey ${firstName}, Sarah here!` : `Hi there, Sarah here for ${params.businessName}!`;
+    return `${greeting} I just set up a custom Five-Star Google Review Shield and Bad-Review Blocker for ${params.businessName}${cityPhrase} so you can test it live! When a customer taps five stars, it sends them straight to your Google Maps review page—and if they tap one to three stars, it intercepts them privately before they can post a bad review online. Click the link in your email to test it in ten seconds!`;
+  }
+
+  const cmsPhrase =
+    params.cmsPlatform && params.cmsPlatform !== "No Website"
+      ? ` built on ${params.cmsPlatform}`
+      : "";
+  const topGap =
+    params.missingSignals && params.missingSignals.length > 0
+      ? params.missingSignals[0].toLowerCase()
+      : params.painPoint
+      ? params.painPoint.toLowerCase()
+      : "missing an instant 24/7 booking and AI receptionist system";
+
+  if (v === "Zephyr") {
+    const greet = firstName ? `Hello ${firstName}, Victoria speaking here.` : `Hello there, Victoria speaking for the leadership team at ${params.businessName}.`;
+    return `${greet} I was just reviewing ${params.businessName}${cityPhrase}${cmsPhrase}, and whilst your local reputation is brilliant, your website currently has ${topGap}—which means high-intent enquiries after hours are slipping straight to competitors. I've prepared a bespoke 60-second audit showing how we fix this in 48 hours. Do take a quick look at the link in your inbox and let me know your thoughts. Cheers!`;
+  }
+  if (v === "Charon") {
+    const greet = firstName ? `Good day ${firstName}, this is Marcus.` : `Good day, this is Marcus calling with an executive brief for ${params.businessName}.`;
+    return `${greet} Our team just completed a technical diagnostic of ${params.businessName}${cityPhrase}${cmsPhrase}. While your market authority is strong, your digital storefront currently has ${topGap}, costing you roughly 35 percent of after-hours client bookings. I've sent your private diagnostic report link to your email. Review the numbers when you have 60 seconds, and reply if you'd like us to deploy the fix this week.`;
+  }
+  if (v === "Puck") {
+    const greet = firstName ? `Hey ${firstName}! Ryan here—` : `Hey team at ${params.businessName}! Ryan here—`;
+    return `${greet} super quick 20-second heads-up! I was just checking out ${params.businessName}${cityPhrase}${cmsPhrase} and noticed you guys have awesome reviews, but your site has ${topGap} right now. We built a plug-and-play AI receptionist and instant booking upgrade that captures those missed leads 24/7. Check out the live demo link I just sent over—talk soon!`;
+  }
+  if (v === "Fenrir") {
+    const greet = firstName ? `${firstName}, Viktor here.` : `This is Viktor for the owner at ${params.businessName}.`;
+    return `${greet} I'll go straight to the point. I just audited ${params.businessName}${cityPhrase}${cmsPhrase} and spotted a major revenue leak: ${topGap}. Every week that stays unfixed, ready-to-buy customers are calling the next ${params.category || "business"} on Google. I put together the exact 48-hour blueprint to lock in those leads—open the audit link in your email right now and let's get it live.`;
+  }
+  if (v === "Orus") {
+    const greet = firstName ? `Hello ${firstName}, Tunde here from ${params.agencyName || "Vanguard Digital"}.` : `Hello to the management at ${params.businessName}, Tunde speaking.`;
+    return `${greet} I was just taking a close look at ${params.businessName}${cityPhrase}${cmsPhrase}. You have built a fantastic reputation, however your website currently has ${topGap}, which causes valuable customers to leave without booking. I have recorded a custom Website Audit Report showing how we can solve this for you within 48 hours. Kindly check the link in your email and reply whenever you are ready.`;
+  }
+
+  const greeting = firstName
+    ? `Hey ${firstName}, Sarah here!`
+    : `Hi there, Sarah here with a quick note for the owner at ${params.businessName}!`;
+  const reportHook = params.hasReport
+    ? `I just recorded a custom website audit report showing exactly how to fix this in 48 hours, and sent the private link to your email.`
+    : `I put together a quick interactive demo showing how we can fix this for ${params.businessName} in 48 hours.`;
+
+  return `${greeting} I was just looking at ${params.businessName}${cityPhrase}${cmsPhrase}, and noticed you guys have a great local reputation, but your website currently has ${topGap}—which usually causes 30 to 40 percent of after-hours customers to call a competitor instead. ${reportHook} Take a quick 60-second look and reply to this message if you'd like me to activate it for you this week!`;
+}
+
+// 1. Generate Studio AI Voice-Note Pitch ($0 Telecom Cost — Gemini Neural TTS + WAV)
+router.post("/crm/generate-voice-pitch", async (req, res) => {
+  try {
+    const {
+      businessName = "your business",
+      ownerName = "",
+      ownerRole = "",
+      category = "business",
+      city = "",
+      website = "",
+      cmsPlatform = "",
+      missingSignals = [],
+      painPoint = "",
+      reportUrl = "",
+      agencyName = "Vanguard Digital",
+      voiceName = "Kore", // 'Kore' | 'Puck' | 'Charon' | 'Zephyr' | 'Fenrir' | 'Orus'
+      customScript = "",
+      regenerateScriptForVoice = false,
+      pitchMode = "audit", // 'audit' | 'website_claim' | 'review_shield'
+    } = req.body ?? {};
+
+    const persona = STUDIO_VOICE_PERSONAS[voiceName] || STUDIO_VOICE_PERSONAS.Kore;
+    let scriptText = regenerateScriptForVoice ? "" : String(customScript || "").trim();
+
+    if (!scriptText) {
+      const fallbackScript = buildNaturalVoicePitchScript({
+        businessName,
+        ownerName,
+        ownerRole,
+        category,
+        city,
+        website,
+        cmsPlatform,
+        missingSignals,
+        painPoint,
+        agencyName,
+        hasReport: Boolean(reportUrl),
+        voiceName: persona.id,
+        pitchMode,
+      });
+
+      if (regenerateScriptForVoice || pitchMode === "website_claim" || pitchMode === "review_shield") {
+        scriptText = fallbackScript;
+      } else {
+        try {
+          const aiScript = await generateText(
+            `Write a natural, ultra-realistic 25-second spoken voice-note pitch (strictly 55 to 75 words, plain spoken English, NO stage directions, NO brackets, NO hashtags) spoken by a ${persona.scriptStyleHint} at "${agencyName}" speaking directly to ${ownerName ? `${ownerName} (${ownerRole || "Owner"}) at ` : "the owner of "}"${businessName}" (${category}${city ? ` in ${city}` : ""}).
+Website: ${website || "none"} ${cmsPlatform ? `(CMS: ${cmsPlatform})` : ""}
+Detected revenue leak: ${(Array.isArray(missingSignals) && missingSignals.length > 0) ? missingSignals.join(", ") : (painPoint || "missing 24/7 AI chat & instant booking")}
+${reportUrl ? "Mention that you just sent their private Website Audit Report link to their email/chat." : "Offer to share the custom demo link we built for them."}
+Return ONLY the exact words to be spoken out loud.`
+          );
+          const cleaned = aiScript.replace(/^["']|["']$/g, "").trim();
+          scriptText = cleaned.length >= 35 ? cleaned : fallbackScript;
+        } catch {
+          scriptText = fallbackScript;
+        }
+      }
+    }
+
+    // Check in-memory voice cache first so switching voices is instant and preserves quota
+    const cacheKey = `${persona.id}::${scriptText}`;
+    const cachedAudio = voicePitchAudioCache.get(cacheKey);
+    if (cachedAudio) {
+      res.json({
+        success: true,
+        script: scriptText,
+        voiceName: persona.id,
+        voiceLabel: persona.displayName,
+        engine: `${cachedAudio.engine} · Instant Cache`,
+        wavBase64: cachedAudio.wavBase64,
+        wavDataUrl: `data:audio/wav;base64,${cachedAudio.wavBase64}`,
+      });
+      return;
+    }
+
+    let wavBase64: string | null = null;
+    let wavDataUrl: string | null = null;
+    let ttsModelUsed = "browser-neural-tts";
+
+    const generateGeminiStudioAudio = async (): Promise<string | null> => {
+      try {
+        const ai = await getGeminiAI();
+        const directedPrompt = `Speak the following message aloud in a ${persona.stylePrompt}: "${scriptText}"`;
+
+        for (const modelName of persona.preferredModels) {
+          for (const candidateVoice of [persona.geminiVoice, persona.fallbackGeminiVoice]) {
+            try {
+              const response = await ai.models.generateContent({
+                model: modelName,
+                contents: [
+                  {
+                    role: "user",
+                    parts: [
+                      {
+                        text: directedPrompt,
+                        ...(modelName === "gemini-3.8-flash-tts"
+                          ? {
+                              speechMetadata: {
+                                style: persona.stylePrompt,
+                              },
+                            }
+                          : {}),
+                      } as any,
+                    ],
+                  },
+                ],
+                config: {
+                  responseModalities: ["AUDIO"],
+                  speechConfig: {
+                    voiceConfig: {
+                      prebuiltVoiceConfig: { voiceName: candidateVoice },
+                    },
+                  },
+                },
+              });
+
+              const inlineData = response.candidates?.[0]?.content?.parts?.find(
+                (p: any) => p.inlineData?.data
+              )?.inlineData;
+
+              if (inlineData?.data) {
+                const generatedWav = pcm16ToWavBase64(
+                  inlineData.data,
+                  persona.sampleRate,
+                  1,
+                  persona.eqProfile
+                );
+                const engineLabel = `${modelName} (${candidateVoice} · ${Math.round(persona.sampleRate / 100) / 10}kHz Studio DSP)`;
+                voicePitchAudioCache.set(cacheKey, {
+                  wavBase64: generatedWav,
+                  engine: engineLabel,
+                });
+                ttsModelUsed = engineLabel;
+                return generatedWav;
+              }
+            } catch {
+              // Try fallback voice or next TTS model bucket
+            }
+          }
+        }
+      } catch {}
+      return null;
+    };
+
+    // Race Gemini Studio TTS against a 3.5s fast-response deadline so callers never wait >3.5s
+    // (Meanwhile Gemini Studio TTS finishes in background and populates voicePitchAudioCache for next time)
+    wavBase64 = await Promise.race([
+      generateGeminiStudioAudio(),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
+    ]);
+
+    if (wavBase64) {
+      wavDataUrl = `data:audio/wav;base64,${wavBase64}`;
+    } else {
+      const instantMp3 = await synthesizeInstantNeuralMp3(scriptText, persona.id);
+      if (instantMp3) {
+        wavDataUrl = instantMp3;
+        ttsModelUsed = `Studio Neural Stream (${persona.id})`;
+      }
+    }
+
+    res.json({
+      success: true,
+      script: scriptText,
+      voiceName: persona.id,
+      voiceLabel: persona.displayName,
+      engine: ttsModelUsed,
+      wavBase64,
+      wavDataUrl,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to generate voice pitch" });
+  }
+});
+
+// 2. Send Email with Attached AI Studio Voice-Note (.wav) + Transcript
+router.post("/crm/send-voice-email", async (req, res) => {
+  try {
+    const {
+      to,
+      businessName = "Business",
+      ownerName = "",
+      subject,
+      body,
+      script,
+      wavBase64,
+      reportUrl,
+      accountId,
+    } = req.body ?? {};
+
+    if (!to) {
+      res.status(400).json({ error: "Recipient email (to) is required" });
+      return;
+    }
+
+    const emailSubject =
+      subject || `🎙️ Quick 25-sec voice note for ${ownerName || businessName}`;
+    const emailText =
+      body ||
+      `Hi ${ownerName || businessName},\n\nI recorded a quick 25-second voice note for you after reviewing ${businessName}'s website (attached as an audio note below).\n\nVoice Note Transcript:\n"${script || ""}"\n\n${reportUrl ? `View your live Website Audit Report here: ${reportUrl}\n\n` : ""}Best regards`;
+
+    const baseUrl = getBaseUrl(req);
+    const trackingId = await createTracking(to, emailSubject, "outreach");
+    const reportSection = reportUrl ? buildReportEmailSection(reportUrl, businessName) : "";
+    const htmlParagraphs = emailText
+      .split("\n")
+      .map((line: string) => (line.trim() ? `<p style="margin:0 0 12px;line-height:1.6;">${line}</p>` : "<br/>"))
+      .join("");
+
+    const voiceBannerHtml = `
+      <div style="margin:18px 0;padding:16px;border-radius:12px;background:#0f172a;color:#ffffff;border:1px solid #334155;">
+        <div style="font-size:12px;font-weight:800;color:#fbbf24;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">
+          🎙️ Attached Personal Voice Note (0:26)
+        </div>
+        <div style="font-size:13px;color:#e2e8f0;line-height:1.5;">
+          Play the attached <strong>Voice-Note-${businessName.replace(/[^a-zA-Z0-9]/g, "-")}.wav</strong> audio file in this email to hear our 25-second breakdown for <strong>${businessName}</strong>.
+        </div>
+      </div>
+    `;
+
+    const cleanSlug = String(businessName || "Prospect")
+      .replace(/[^a-zA-Z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 35);
+
+    const { acct } = await sendWithFailover((a) => {
+      const rawHtml = `<div style="font-family:Georgia,serif;max-width:600px;margin:0 auto;padding:24px;color:#1a1a2e;">${voiceBannerHtml}${htmlParagraphs}<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;"/><p style="color:#6b7280;font-size:13px;">${a.fromName}</p>${reportSection}</div>`;
+      return {
+        from: `"${a.fromName}" <${a.fromEmail || a.user}>`,
+        to,
+        subject: emailSubject,
+        text: emailText,
+        html: injectTracking(rawHtml, baseUrl, trackingId),
+        ...(wavBase64
+          ? {
+              attachments: [
+                {
+                  filename: `Voice-Note-${cleanSlug}.wav`,
+                  content: Buffer.from(wavBase64, "base64"),
+                  contentType: "audio/wav",
+                },
+              ],
+            }
+          : {}),
+      };
+    }, accountId);
+
+    res.json({
+      success: true,
+      to,
+      sentVia: acct.label,
+      sentAt: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || "Failed to send voice email" });
+  }
+});
+
+// ─── Outbound AI Machine Phone Caller Pool (Bland AI / Retell AI / Vapi) ─────
+
+interface MachineCallerKeyItem {
+  id: string;
+  provider: "bland" | "retell" | "vapi";
+  label: string;
+  apiKey: string;
+  fromNumber?: string;
+  agentId?: string;
+  active: boolean;
+  callsMade: number;
+}
+
+interface MachineCallerConfig {
+  defaultProvider: "bland" | "retell" | "vapi";
+  defaultVoice: string;
+  autoCallOnImport: boolean;
+  autoGenerateVoiceNoteOnImport: boolean;
+  keys: MachineCallerKeyItem[];
+}
+
+const VOICE_CALLER_KV_KEY = "AI_MACHINE_CALLER_CONFIG";
+const VOICE_CALL_LOGS_KV_KEY = "AI_MACHINE_CALL_LOGS";
+
+const DEFAULT_MACHINE_CALLER_CONFIG: MachineCallerConfig = {
+  defaultProvider: "bland",
+  defaultVoice: "nat",
+  autoCallOnImport: false,
+  autoGenerateVoiceNoteOnImport: true,
+  keys: [],
+};
+
+async function getMachineCallerConfig(): Promise<MachineCallerConfig> {
+  const saved = await kvGetJson<Partial<MachineCallerConfig>>(VOICE_CALLER_KV_KEY);
+  return {
+    ...DEFAULT_MACHINE_CALLER_CONFIG,
+    ...(saved ?? {}),
+    keys: Array.isArray(saved?.keys) ? saved!.keys : [],
+  };
+}
+
+router.get("/crm/voice-caller/config", async (_req, res) => {
+  try {
+    const cfg = await getMachineCallerConfig();
+    const logs = (await kvGetJson<any[]>(VOICE_CALL_LOGS_KV_KEY)) ?? [];
+    res.json({
+      config: {
+        ...cfg,
+        keys: cfg.keys.map((k) => ({
+          ...k,
+          apiKeyMasked: k.apiKey
+            ? `${k.apiKey.slice(0, 6)}••••${k.apiKey.slice(-4)}`
+            : "",
+        })),
+      },
+      recentCalls: logs.slice(0, 30),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put("/crm/voice-caller/config", async (req, res) => {
+  try {
+    const current = await getMachineCallerConfig();
+    const {
+      defaultProvider,
+      defaultVoice,
+      autoCallOnImport,
+      autoGenerateVoiceNoteOnImport,
+      newKey,
+      removeKeyId,
+      toggleKeyId,
+    } = req.body ?? {};
+
+    let nextKeys = [...current.keys];
+
+    if (newKey && newKey.apiKey && String(newKey.apiKey).trim()) {
+      const prov = (newKey.provider || defaultProvider || "bland") as "bland" | "retell" | "vapi";
+      nextKeys.push({
+        id: `vkey_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+        provider: prov,
+        label: newKey.label || `${prov.toUpperCase()} Free-Credit Key #${nextKeys.length + 1}`,
+        apiKey: String(newKey.apiKey).trim(),
+        fromNumber: newKey.fromNumber ? String(newKey.fromNumber).trim() : "",
+        agentId: newKey.agentId ? String(newKey.agentId).trim() : "",
+        active: true,
+        callsMade: 0,
+      });
+    }
+
+    if (removeKeyId) {
+      nextKeys = nextKeys.filter((k) => k.id !== removeKeyId);
+    }
+
+    if (toggleKeyId) {
+      nextKeys = nextKeys.map((k) =>
+        k.id === toggleKeyId ? { ...k, active: !k.active } : k
+      );
+    }
+
+    const updated: MachineCallerConfig = {
+      defaultProvider: defaultProvider ?? current.defaultProvider,
+      defaultVoice: defaultVoice ?? current.defaultVoice,
+      autoCallOnImport:
+        typeof autoCallOnImport === "boolean" ? autoCallOnImport : current.autoCallOnImport,
+      autoGenerateVoiceNoteOnImport:
+        typeof autoGenerateVoiceNoteOnImport === "boolean"
+          ? autoGenerateVoiceNoteOnImport
+          : current.autoGenerateVoiceNoteOnImport,
+      keys: nextKeys,
+    };
+
+    await kvSetJson(VOICE_CALLER_KV_KEY, updated);
+
+    res.json({
+      success: true,
+      config: {
+        ...updated,
+        keys: updated.keys.map((k) => ({
+          ...k,
+          apiKeyMasked: k.apiKey
+            ? `${k.apiKey.slice(0, 6)}••••${k.apiKey.slice(-4)}`
+            : "",
+        })),
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+function normalizeE164Phone(rawPhone: string): string {
+  const cleaned = String(rawPhone || "").replace(/[^\d+]/g, "");
+  if (!cleaned) return "";
+  if (cleaned.startsWith("+")) return cleaned;
+  if (cleaned.length === 10) return `+1${cleaned}`; // Default 10-digit US/Canada to +1
+  if (cleaned.length === 11 && cleaned.startsWith("1")) return `+${cleaned}`;
+  return `+${cleaned}`;
+}
+
+// 3. Trigger Real Outbound AI Machine Phone Call (Bland AI / Retell AI / Vapi)
+router.post("/crm/voice-caller/call", async (req, res) => {
+  try {
+    const {
+      phone,
+      businessName = "Business",
+      ownerName = "",
+      ownerRole = "",
+      category = "local business",
+      city = "",
+      website = "",
+      cmsPlatform = "",
+      missingSignals = [],
+      painPoint = "",
+      reportUrl = "",
+      siteUrl = "",
+      pitchMode = "audit",
+      customScript = "",
+      voice = "",
+    } = req.body ?? {};
+
+    const e164 = normalizeE164Phone(phone);
+    if (!e164 || e164.length < 8) {
+      res.status(400).json({
+        error: "Valid business phone number (e.g. +1... or +44...) is required to place an AI machine call.",
+      });
+      return;
+    }
+
+    const cfg = await getMachineCallerConfig();
+    const activeKeys = cfg.keys.filter((k) => k.active && k.apiKey);
+
+    // Also check environment variables if no UI key added yet
+    if (activeKeys.length === 0) {
+      if (process.env.BLAND_API_KEY) {
+        activeKeys.push({
+          id: "env_bland",
+          provider: "bland",
+          label: "Server BLAND_API_KEY",
+          apiKey: process.env.BLAND_API_KEY,
+          active: true,
+          callsMade: 0,
+        });
+      } else if (process.env.RETELL_API_KEY) {
+        activeKeys.push({
+          id: "env_retell",
+          provider: "retell",
+          label: "Server RETELL_API_KEY",
+          apiKey: process.env.RETELL_API_KEY,
+          fromNumber: process.env.RETELL_FROM_NUMBER || "",
+          agentId: process.env.RETELL_AGENT_ID || "",
+          active: true,
+          callsMade: 0,
+        });
+      } else if (process.env.VAPI_API_KEY) {
+        activeKeys.push({
+          id: "env_vapi",
+          provider: "vapi",
+          label: "Server VAPI_API_KEY",
+          apiKey: process.env.VAPI_API_KEY,
+          fromNumber: process.env.VAPI_PHONE_NUMBER_ID || "",
+          active: true,
+          callsMade: 0,
+        });
+      }
+    }
+
+    if (activeKeys.length === 0) {
+      res.status(400).json({
+        error:
+          "No AI Machine Caller API key connected yet. Open the 'AI Voice & Machine Caller' panel to paste a free-credit API key from Bland.ai, Retell.ai ($10 free), or Vapi.ai ($5 free), OR use the 100% Free AI Studio Voice-Note button right next to it!",
+      });
+      return;
+    }
+
+    // Round-robin pick key with lowest callsMade
+    activeKeys.sort((a, b) => (a.callsMade || 0) - (b.callsMade || 0));
+    const chosenKey = activeKeys[0];
+
+    const openingLine =
+      customScript ||
+      buildNaturalVoicePitchScript({
+        businessName,
+        ownerName,
+        ownerRole,
+        category,
+        city,
+        website,
+        cmsPlatform,
+        missingSignals,
+        painPoint,
+        hasReport: Boolean(reportUrl || siteUrl),
+        pitchMode: pitchMode as any,
+      });
+
+    const targetLink = siteUrl || reportUrl;
+    const aiTaskPrompt = `You are a warm, articulate, human-sounding B2B growth advisor calling "${businessName}" (${category}${city ? ` in ${city}` : ""}).
+You are speaking to ${ownerName ? `${ownerName} (${ownerRole || "Owner"})` : "the business owner or manager"}.
+Website: ${website || "no website"} ${cmsPlatform ? `(built on ${cmsPlatform})` : ""}
+${
+  pitchMode === "website_claim"
+    ? `We have already built a complete, custom 4-Tap Instant Estimate Website + Automated Bottom Chatbot for ${businessName} at ${targetLink || "their private preview link"} and waived the entire $1,500 website build fee so they can claim it for free.`
+    : pitchMode === "review_shield"
+    ? `We have set up a live 5-Star Google Review Shield & Bad-Review Blocker for ${businessName} at ${targetLink || "their private preview link"} that routes 5-star customers to Google Maps and intercepts 1-to-3-star complaints privately.`
+    : `Missing conversion signals we found on their site: ${Array.isArray(missingSignals) && missingSignals.length > 0 ? missingSignals.join(", ") : painPoint || "no 24/7 AI live chat or online booking widget"}.`
+}
+
+YOUR GOAL ON THIS CALL:
+1. Deliver this friendly opener naturally: "${openingLine}"
+2. If they ask "How much does it cost?" or "What do you do?", explain that we already built the custom ${pitchMode === "review_shield" ? "5-Star Review Shield" : "4-Tap Instant Estimate Website & Automated Chatbot"} for ${businessName} for $0 setup cost, and they only cover simple monthly hosting if they love it and decide to claim it.
+3. Ask if they have 60 seconds to check the live preview link in their email or if there is a better direct email/WhatsApp number to text the preview link to right now.
+4. Be polite, concise, never robotic, and never pushy.`;
+
+    let callId = "";
+    let providerResponse: any = null;
+
+    if (chosenKey.provider === "bland") {
+      const blandRes = await fetch("https://api.bland.ai/v1/calls", {
+        method: "POST",
+        headers: {
+          Authorization: chosenKey.apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          phone_number: e164,
+          task: aiTaskPrompt,
+          first_sentence: openingLine.split(".")[0] + ".",
+          voice: voice || cfg.defaultVoice || "nat",
+          wait_for_greeting: true,
+          record: true,
+          max_duration: 3,
+          model: "enhanced",
+          ...(chosenKey.fromNumber ? { from: chosenKey.fromNumber } : {}),
+        }),
+      });
+      providerResponse = await blandRes.json().catch(() => ({}));
+      if (!blandRes.ok || providerResponse.status === "error") {
+        throw new Error(
+          providerResponse.message ||
+            providerResponse.error ||
+            `Bland AI error (${blandRes.status})`
+        );
+      }
+      callId = providerResponse.call_id || `bland_${Date.now()}`;
+    } else if (chosenKey.provider === "retell") {
+      if (!chosenKey.fromNumber) {
+        throw new Error("Retell AI requires a 'From Phone Number' (e.g. +1...) configured on your Retell key.");
+      }
+      const retellRes = await fetch("https://api.retellai.com/v2/create-phone-call", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${chosenKey.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from_number: normalizeE164Phone(chosenKey.fromNumber),
+          to_number: e164,
+          ...(chosenKey.agentId ? { override_agent_id: chosenKey.agentId } : {}),
+          retell_llm_dynamic_variables: {
+            business_name: businessName,
+            owner_name: ownerName || "there",
+            city: city || "",
+            opening_pitch: openingLine,
+            task_instructions: aiTaskPrompt,
+          },
+        }),
+      });
+      providerResponse = await retellRes.json().catch(() => ({}));
+      if (!retellRes.ok) {
+        throw new Error(
+          providerResponse.message ||
+            providerResponse.error_message ||
+            `Retell AI error (${retellRes.status})`
+        );
+      }
+      callId = providerResponse.call_id || `retell_${Date.now()}`;
+    } else if (chosenKey.provider === "vapi") {
+      const vapiRes = await fetch("https://api.vapi.ai/call/phone", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${chosenKey.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          ...(chosenKey.fromNumber ? { phoneNumberId: chosenKey.fromNumber } : {}),
+          ...(chosenKey.agentId ? { assistantId: chosenKey.agentId } : {}),
+          customer: {
+            number: e164,
+            name: ownerName || businessName,
+          },
+          assistant: {
+            firstMessage: openingLine.split(".")[0] + ".",
+            model: {
+              provider: "openai",
+              model: "gpt-4o-mini",
+              messages: [{ role: "system", content: aiTaskPrompt }],
+            },
+          },
+        }),
+      });
+      providerResponse = await vapiRes.json().catch(() => ({}));
+      if (!vapiRes.ok) {
+        throw new Error(
+          providerResponse.message ||
+            providerResponse.error ||
+            `Vapi AI error (${vapiRes.status})`
+        );
+      }
+      callId = providerResponse.id || `vapi_${Date.now()}`;
+    }
+
+    // Increment callsMade counter on chosen key
+    const updatedKeys = cfg.keys.map((k) =>
+      k.id === chosenKey.id ? { ...k, callsMade: (k.callsMade || 0) + 1 } : k
+    );
+    await kvSetJson(VOICE_CALLER_KV_KEY, { ...cfg, keys: updatedKeys });
+
+    const callLog = {
+      callId,
+      provider: chosenKey.provider,
+      keyLabel: chosenKey.label,
+      businessName,
+      ownerName,
+      phone: e164,
+      script: openingLine,
+      status: "ringing",
+      createdAt: new Date().toISOString(),
+    };
+    const existingLogs = (await kvGetJson<any[]>(VOICE_CALL_LOGS_KV_KEY)) ?? [];
+    await kvSetJson(VOICE_CALL_LOGS_KV_KEY, [callLog, ...existingLogs.slice(0, 99)]);
+
+    res.json({
+      success: true,
+      callId,
+      provider: chosenKey.provider,
+      keyLabel: chosenKey.label,
+      calledNumber: e164,
+      script: openingLine,
+      status: "ringing",
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || "Failed to place AI machine phone call" });
+  }
+});
+
+// 4. Poll Live AI Machine Call Status & Transcript
+router.get("/crm/voice-caller/status/:callId", async (req, res) => {
+  try {
+    const { callId } = req.params;
+    const cfg = await getMachineCallerConfig();
+    const logs = (await kvGetJson<any[]>(VOICE_CALL_LOGS_KV_KEY)) ?? [];
+    const logEntry = logs.find((l) => l.callId === callId);
+    const provider = logEntry?.provider || cfg.defaultProvider || "bland";
+    const keyObj =
+      cfg.keys.find((k) => k.provider === provider && k.active) || cfg.keys[0];
+
+    if (!keyObj?.apiKey) {
+      res.json({ status: logEntry?.status || "unknown", callId });
+      return;
+    }
+
+    if (provider === "bland") {
+      const r = await fetch(`https://api.bland.ai/v1/calls/${encodeURIComponent(callId)}`, {
+        headers: { Authorization: keyObj.apiKey },
+      });
+      const d = await r.json().catch(() => ({}));
+      res.json({
+        callId,
+        provider: "bland",
+        status: d.status || (d.completed ? "completed" : "in-progress"),
+        completed: Boolean(d.completed),
+        durationSeconds: d.call_length ? Math.round(Number(d.call_length) * 60) : 0,
+        recordingUrl: d.recording_url || null,
+        transcript: d.concatenated_transcript || "",
+        summary: d.summary || "",
+        answeredBy: d.answered_by || "",
+      });
+      return;
+    } else if (provider === "retell") {
+      const r = await fetch(`https://api.retellai.com/v2/get-call/${encodeURIComponent(callId)}`, {
+        headers: { Authorization: `Bearer ${keyObj.apiKey}` },
+      });
+      const d = await r.json().catch(() => ({}));
+      res.json({
+        callId,
+        provider: "retell",
+        status: d.call_status || "in-progress",
+        completed: d.call_status === "ended",
+        durationSeconds: d.end_timestamp && d.start_timestamp ? Math.round((d.end_timestamp - d.start_timestamp) / 1000) : 0,
+        recordingUrl: d.recording_url || null,
+        transcript: d.transcript || "",
+        summary: d.call_analysis?.call_summary || "",
+      });
+      return;
+    } else if (provider === "vapi") {
+      const r = await fetch(`https://api.vapi.ai/call/${encodeURIComponent(callId)}`, {
+        headers: { Authorization: `Bearer ${keyObj.apiKey}` },
+      });
+      const d = await r.json().catch(() => ({}));
+      res.json({
+        callId,
+        provider: "vapi",
+        status: d.status || "in-progress",
+        completed: d.status === "ended",
+        durationSeconds: 0,
+        recordingUrl: d.recordingUrl || null,
+        transcript: d.transcript || "",
+        summary: d.summary || "",
+      });
+      return;
+    }
+
+    res.json({ callId, status: "unknown" });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

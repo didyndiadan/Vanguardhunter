@@ -40,10 +40,14 @@ import {
   Sparkles,
 } from "lucide-react";
 import OwnerWebsiteBuilderPanel from "@/components/OwnerWebsiteBuilderPanel";
+import MultiSmtpManagerPanel from "@/components/MultiSmtpManagerPanel";
+import AdminApolloVoiceCockpit from "@/components/AdminApolloVoiceCockpit";
 
 type AdminTab =
   | "overview"
+  | "apollo-voice"
   | "website-builder"
+  | "smtp"
   | "multipools"
   | "users"
   | "support"
@@ -223,11 +227,10 @@ export default function AdminPanel() {
 
   // Admin Owner Access Gate state
   const [isAuthorizedAdmin, setIsAuthorizedAdmin] = useState<boolean>(() => {
+    if (localStorage.getItem("vh_logged_out") === "true") return false;
     const cached = getCachedSaasUser();
     if (isUserAdmin(cached)) return true;
     if (localStorage.getItem("vh_admin_unlocked") === "true") return true;
-    // If no regular user session is active, allow owner in preview to access or unlock
-    if (!cached) return true;
     return false;
   });
   const [gateEmail, setGateEmail] = useState("jwandersonar@gmail.com");
@@ -345,6 +348,15 @@ export default function AdminPanel() {
     allowPublicRegistration: true,
     maintenanceMode: false,
     globalRateLimitPerMin: 120,
+    apolloEnrichmentEnabled: true,
+    apolloDecisionMaker: true,
+    apolloTechStackSignals: true,
+    apolloBuyerIntentScore: true,
+    apolloSmartFilters: true,
+    apolloMultiChannelCockpit: true,
+    apolloVoiceNoteEnabled: true,
+    apolloMachineCallerEnabled: true,
+    apolloAccessMode: "all_plans" as "all_plans" | "growth_and_above" | "owner_only",
   });
 
   // Activity filter
@@ -982,10 +994,24 @@ export default function AdminPanel() {
         method: "PUT",
         body: JSON.stringify(systemSettings),
       });
-      showToast("success", "Updated global engine & security parameters.");
+      showToast("success", "Updated global engine & Intelligence parameters.");
       await loadAllAdminData();
     } catch (err: any) {
       showToast("error", err.message || "Failed to save system settings");
+    }
+  };
+
+  const handleToggleApolloModule = async (patch: Partial<typeof systemSettings>, label: string) => {
+    const next = { ...systemSettings, ...patch };
+    setSystemSettings(next);
+    try {
+      await adminFetch("/api/saas/admin/system-settings", {
+        method: "PUT",
+        body: JSON.stringify(next),
+      });
+      showToast("success", `Saved Module Setting: ${label}`);
+    } catch (err: any) {
+      showToast("error", err.message || "Failed to save module toggle");
     }
   };
 
@@ -1163,6 +1189,24 @@ export default function AdminPanel() {
             >
               <Shield className="w-4 h-4 shrink-0" />
               <span className="truncate">1. Executive Telemetry</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleSelectTab("apollo-voice")}
+              className={`w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-semibold rounded-lg transition-colors cursor-pointer ${
+                activeTab === "apollo-voice"
+                  ? "bg-emerald-500 text-slate-950 font-bold"
+                  : "text-emerald-300 hover:text-white bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30"
+              }`}
+            >
+              <span className="flex items-center gap-2.5 truncate">
+                <Crosshair className="w-4 h-4 shrink-0" />
+                <span className="truncate">🎙️ AI Caller</span>
+              </span>
+              <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-slate-950 text-emerald-400 shrink-0">
+                NEW
+              </span>
             </button>
 
             <button
@@ -1395,11 +1439,27 @@ export default function AdminPanel() {
           <div className="flex items-center gap-2">
             <button
               type="button"
+              onClick={() => handleSelectTab("apollo-voice")}
+              className="px-3 sm:px-3.5 py-1.5 text-xs font-bold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-lg whitespace-nowrap inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
+            >
+              <Crosshair className="w-3.5 h-3.5" />
+              <span>🎙️ AI Caller</span>
+            </button>
+            <button
+              type="button"
               onClick={loadAllAdminData}
               className="px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 hover:text-slate-950 border border-slate-200 rounded-lg flex items-center gap-1.5 cursor-pointer"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
               <span className="hidden sm:inline">Sync Data</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectTab("smtp")}
+              className="px-3 sm:px-3.5 py-1.5 text-xs font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg whitespace-nowrap inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <Mail className="w-3.5 h-3.5" />
+              <span>Multi-SMTP &amp; Gmails</span>
             </button>
             <button
               type="button"
@@ -1416,7 +1476,9 @@ export default function AdminPanel() {
           {(
             [
               { id: "overview", label: "1. Overview" },
+              { id: "apollo-voice", label: "🎙️ AI Voice/Caller (NEW)" },
               { id: "website-builder", label: "✨ AI Website Builder (Owner Only)" },
+              { id: "smtp", label: "📧 Multi-SMTP & Gmails" },
               { id: "multipools", label: "2. API Multipools" },
               { id: "users", label: "3. Users & Quotas" },
               {
@@ -1463,8 +1525,27 @@ export default function AdminPanel() {
             </div>
           )}
 
+          {/* MODULE: APOLLO+ B2B INTELLIGENCE, $0 AI VOICE STUDIO & OUTBOUND MACHINE CALLER */}
+          {activeTab === "apollo-voice" && (
+            <AdminApolloVoiceCockpit
+              systemSettings={systemSettings}
+              onToggleModule={handleToggleApolloModule}
+              onLaunchCrm={() => setLocation("/crm")}
+            />
+          )}
+
           {/* MODULE: OWNER-ONLY AI AUTO-WEBSITE BUILDER */}
           {activeTab === "website-builder" && <OwnerWebsiteBuilderPanel />}
+
+          {/* MODULE: MULTI-SMTP & MULTIPLE GMAILS ROTATIONAL POOL + APP PASSWORD GUIDE */}
+          {activeTab === "smtp" && (
+            <MultiSmtpManagerPanel
+              mode="admin"
+              onAccountsChanged={(count) =>
+                setMetrics((prev) => ({ ...prev, totalSmtpAccounts: count }))
+              }
+            />
+          )}
 
           {/* MODULE 1: EXECUTIVE TELEMETRY OVERVIEW */}
           {activeTab === "overview" && (
@@ -1512,7 +1593,21 @@ export default function AdminPanel() {
               </div>
 
               {/* Quick Edit Shortcuts Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
+                <button
+                  type="button"
+                  onClick={() => handleSelectTab("smtp")}
+                  className="p-4 bg-emerald-50/60 hover:bg-emerald-50 rounded-xl border border-emerald-300 hover:border-emerald-600 text-left transition-colors cursor-pointer"
+                >
+                  <div className="text-xs font-bold text-emerald-800 flex items-center justify-between">
+                    <span>Multi-SMTP &amp; Gmails</span>
+                    <Mail className="w-3.5 h-3.5" />
+                  </div>
+                  <p className="text-[11px] text-slate-600 mt-1">
+                    Connect multiple Gmails (with App Password guide) &amp; wire all sending activities
+                  </p>
+                </button>
+
                 <button
                   type="button"
                   onClick={() => handleSelectTab("multipools")}
@@ -1582,6 +1677,151 @@ export default function AdminPanel() {
                     Edit USDT, USDC, BTC, ETH & SOL receiving wallets & approve on-chain TXs
                   </p>
                 </button>
+              </div>
+
+              {/* Apollo+ Intelligence Modules & Master Kill-Switch Control Center */}
+              <div className="bg-white rounded-xl border border-slate-200 p-5 sm:p-6 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-4">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h2 className="text-sm font-bold text-slate-950">
+                        B2B Intelligence Modules &amp; Master Kill-Switches
+                      </h2>
+                      <span
+                        className={`text-[11px] font-semibold px-2 py-0.5 rounded ${
+                          systemSettings.apolloEnrichmentEnabled
+                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                            : "bg-slate-100 text-slate-600 border border-slate-300"
+                        }`}
+                      >
+                        {systemSettings.apolloEnrichmentEnabled ? "ACTIVE IN CRM" : "DISABLED BY ADMIN"}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Toggle any capability ON or OFF in 1 click. Turning a module OFF immediately hides it from the Lead Hunter &amp; CRM without affecting your core system.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectTab("apollo-voice")}
+                      className="px-3.5 py-1.5 text-xs font-extrabold rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 transition-colors cursor-pointer"
+                    >
+                      🎙️ Open Live AI Voice &amp; Machine Caller Studio →
+                    </button>
+
+                    <select
+                      value={systemSettings.apolloAccessMode || "all_plans"}
+                      onChange={(e) =>
+                        handleToggleApolloModule(
+                          { apolloAccessMode: e.target.value as any },
+                          `Plan Access (${e.target.value})`
+                        )
+                      }
+                      className="px-3 py-1.5 text-xs font-semibold border border-slate-300 rounded-lg bg-slate-50 text-slate-900"
+                    >
+                      <option value="all_plans">Available to All Plans (Starter+)</option>
+                      <option value="growth_and_above">Growth ($149) &amp; Scale ($349) Only</option>
+                      <option value="owner_only">Owner Admin Only</option>
+                    </select>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleToggleApolloModule(
+                          { apolloEnrichmentEnabled: !systemSettings.apolloEnrichmentEnabled },
+                          systemSettings.apolloEnrichmentEnabled ? "All Modules OFF" : "All Modules ON"
+                        )
+                      }
+                      className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors cursor-pointer ${
+                        systemSettings.apolloEnrichmentEnabled
+                          ? "bg-red-50 hover:bg-red-100 text-red-700 border border-red-200"
+                          : "bg-emerald-600 hover:bg-emerald-700 text-white"
+                      }`}
+                    >
+                      {systemSettings.apolloEnrichmentEnabled ? "Disable All Modules" : "Enable All Modules"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                  {[
+                    {
+                      key: "apolloDecisionMaker" as const,
+                      title: "1. Decision-Maker & LinkedIn",
+                      desc: "Extracts Owner/Doctor/CEO name, role, executive email & 1-click LinkedIn X-Ray lookup.",
+                    },
+                    {
+                      key: "apolloTechStackSignals" as const,
+                      title: "2. Tech-Stack & Pixel Scanner",
+                      desc: "Detects WordPress, Shopify, Wix, Meta Pixel, GA4 & missing AI chat/booking widgets.",
+                    },
+                    {
+                      key: "apolloBuyerIntentScore" as const,
+                      title: "3. Buyer Intent Score (0–100)",
+                      desc: "Ranks leads into Hot Buyers (80+), Warm (55–79), and Cold with revenue-leak reasons.",
+                    },
+                    {
+                      key: "apolloSmartFilters" as const,
+                      title: "4. Smart Signal Filter Bar",
+                      desc: "1-click filter buttons in Hunter & CRM for Hot Buyers, Missing Pixels, No Chat & Owner Found.",
+                    },
+                    {
+                      key: "apolloMultiChannelCockpit" as const,
+                      title: "5. Multi-Channel & Call Scripts",
+                      desc: "30-sec Cold Call Opener, Gatekeeper Bypass, SMS, LinkedIn DM & {{tech_gap}} variables.",
+                    },
+                    {
+                      key: "apolloVoiceNoteEnabled" as const,
+                      title: "6. 🎙️ Free AI Voice-Note Pitch ($0 API)",
+                      desc: "Generates studio human AI voice-note pitches (.wav) for WhatsApp, Email & Audit Reports using built-in neural voices.",
+                    },
+                    {
+                      key: "apolloMachineCallerEnabled" as const,
+                      title: "7. 📞 Outbound AI Machine Caller",
+                      desc: "Automated outbound AI phone caller pool (Bland AI / Retell AI / Vapi) that rings business phones and speaks for you.",
+                    },
+                  ].map((mod) => {
+                    const isOn = Boolean(systemSettings.apolloEnrichmentEnabled && systemSettings[mod.key]);
+                    return (
+                      <div
+                        key={mod.key}
+                        className={`p-3.5 rounded-xl border transition-colors flex flex-col justify-between gap-3 ${
+                          isOn
+                            ? "border-blue-200 bg-blue-50/30"
+                            : "border-slate-200 bg-slate-50 opacity-75"
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold text-slate-950">{mod.title}</span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleToggleApolloModule(
+                                  {
+                                    apolloEnrichmentEnabled: true,
+                                    [mod.key]: !systemSettings[mod.key],
+                                  },
+                                  `${mod.title}: ${!systemSettings[mod.key] ? "ON" : "OFF"}`
+                                )
+                              }
+                              className={`px-2 py-0.5 text-[10px] font-bold rounded transition-colors cursor-pointer shrink-0 ${
+                                isOn
+                                  ? "bg-emerald-600 text-white hover:bg-emerald-700"
+                                  : "bg-slate-200 text-slate-700 hover:bg-slate-300"
+                              }`}
+                            >
+                              {isOn ? "ON" : "OFF"}
+                            </button>
+                          </div>
+                          <p className="text-[11px] text-slate-500 mt-1.5 leading-relaxed">{mod.desc}</p>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
 
               {/* Multipool Cluster Status Summary Bar */}
@@ -1968,6 +2208,14 @@ export default function AdminPanel() {
                   ))}
                 </div>
               </form>
+
+              {/* Multi-SMTP & Multiple Gmails Rotational Manager + App Password Setup Guide */}
+              <MultiSmtpManagerPanel
+                mode="admin"
+                onAccountsChanged={(count) =>
+                  setMetrics((prev) => ({ ...prev, totalSmtpAccounts: count }))
+                }
+              />
             </div>
           )}
 
@@ -2296,7 +2544,18 @@ export default function AdminPanel() {
                               />
                             </td>
                             <td className="py-3.5 px-3">
-                              <div className="font-semibold text-slate-950">{u.fullName}</div>
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="font-semibold text-slate-950">{u.fullName}</span>
+                                {u.status === "pending_verification" ? (
+                                  <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-[10px] font-semibold text-amber-800">
+                                    ⏳ Pending Email Link
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-[10px] font-semibold text-emerald-700">
+                                    ✓ Verified
+                                  </span>
+                                )}
+                              </div>
                               <div className="text-[11px] text-slate-500">
                                 {u.companyName} · {u.email}
                               </div>
@@ -2354,13 +2613,26 @@ export default function AdminPanel() {
                               {u.creditsBalance.toLocaleString()}
                             </td>
                             <td className="py-3.5 px-3 whitespace-nowrap">
-                              <span
-                                className={`font-semibold ${
-                                  u.status === "active" ? "text-emerald-700" : "text-red-700"
-                                }`}
-                              >
-                                {u.status.toUpperCase()}
-                              </span>
+                              {u.status === "pending_verification" ? (
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-semibold text-amber-700 text-[11px]">PENDING LINK</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleUpdateUser(u.id, { status: "active" })}
+                                    className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold cursor-pointer"
+                                  >
+                                    Verify Now
+                                  </button>
+                                </div>
+                              ) : (
+                                <span
+                                  className={`font-semibold ${
+                                    u.status === "active" ? "text-emerald-700" : "text-red-700"
+                                  }`}
+                                >
+                                  {u.status.toUpperCase()}
+                                </span>
+                              )}
                             </td>
                             <td className="py-3.5 px-5 text-right space-x-1.5 whitespace-nowrap">
                               <button
@@ -2456,6 +2728,21 @@ export default function AdminPanel() {
           {/* MODULE 3B: ADMIN SUPPORT DESK & MULTI-USER BROADCAST MESSAGING */}
           {activeTab === "support" && (
             <div className="space-y-6">
+              {/* Multi-SMTP Wiring Status Bar for Admin Messaging */}
+              <div className="p-4 rounded-xl bg-emerald-50/80 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="text-xs text-emerald-950">
+                  <span className="font-bold">✓ Wired to Multi-SMTP &amp; Gmail Rotational Pool:</span>{" "}
+                  Messages sent below are delivered to the user&apos;s workspace inbox AND automatically dispatched via your active Gmail / SMTP rotation pool.
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleSelectTab("smtp")}
+                  className="px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-lg whitespace-nowrap self-start sm:self-auto cursor-pointer"
+                >
+                  Configure Multi-SMTP &amp; Gmails →
+                </button>
+              </div>
+
               {/* Multi-User / Selected Users Broadcast Composer */}
               <form
                 onSubmit={handleBroadcastMessage}

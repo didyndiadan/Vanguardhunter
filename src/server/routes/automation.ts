@@ -58,14 +58,14 @@ async function generateText(prompt: string): Promise<string> {
   const ai = await getGeminiAI();
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model: "gemini-3.1-flash-lite",
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       config: { maxOutputTokens: 8192 },
     });
     return response.text ?? "";
   } catch {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-3.8-flash",
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       config: { maxOutputTokens: 8192 },
     });
@@ -505,17 +505,67 @@ export async function runAutomationCycle(overrides?: {
   category?: string; city?: string; country?: string; count?: number; extraContext?: string;
 }) {
   const settings = await getOrCreateSettings();
+  const prevStats: Record<string, any> =
+    settings.runStats && typeof settings.runStats === "object" ? (settings.runStats as any) : {};
+
+  // Support comma- or newline-separated rotation queues for both cities and categories
+  const rawCityInput = overrides?.city ?? settings.huntCity ?? "";
+  const rawCategoryInput = overrides?.category ?? settings.huntCategory ?? "business";
+
+  const cityQueue = rawCityInput
+    .split(/[\n,]+/)
+    .map(c => c.trim())
+    .filter(Boolean);
+  const categoryQueue = rawCategoryInput
+    .split(/[\n,]+/)
+    .map(c => c.trim())
+    .filter(Boolean);
+
+  if (cityQueue.length === 0) return;
+
+  const rotationIndex = typeof prevStats.rotationIndex === "number" ? prevStats.rotationIndex : 0;
+  const activeCity = cityQueue[rotationIndex % cityQueue.length];
+  const activeCategory =
+    categoryQueue.length > 0
+      ? categoryQueue[Math.floor(rotationIndex / Math.max(1, cityQueue.length)) % categoryQueue.length]
+      : "business";
+  const nextCity = cityQueue[(rotationIndex + 1) % cityQueue.length];
+
   const cfg = {
-    category: overrides?.category ?? settings.huntCategory,
-    city: overrides?.city ?? settings.huntCity,
+    category: activeCategory,
+    city: activeCity,
     country: overrides?.country ?? settings.huntCountry,
     count: overrides?.count ?? settings.huntCount,
     extraContext: overrides?.extraContext ?? settings.huntExtraContext,
   };
 
-  if (!cfg.city) return;
+  // Load previously emailed addresses so we never double-email a prospect across rotation cycles
+  const previouslyEmailed = new Set<string>(
+    Array.isArray(prevStats.emailedHistory)
+      ? prevStats.emailedHistory.map((e: string) => String(e).toLowerCase())
+      : []
+  );
+  try {
+    const existingQueue = await db.select().from(followUpQueueTable);
+    for (const row of existingQueue) {
+      if (row.prospectEmail) previouslyEmailed.add(row.prospectEmail.toLowerCase());
+    }
+  } catch { /* ignore if DB unavailable */ }
 
-  const runStats: Record<string, number> = { hunted: 0, scored: 0, emailed: 0, followUps: 0, errors: 0 };
+  const runStats: Record<string, any> = {
+    hunted: 0,
+    scored: 0,
+    emailed: 0,
+    followUps: 0,
+    skippedDuplicates: 0,
+    errors: 0,
+    rotationIndex: rotationIndex + 1,
+    activeTargetCity: activeCity,
+    activeTargetCategory: activeCategory,
+    nextTargetCity: nextCity,
+    cityQueueSize: cityQueue.length,
+    categoryQueueSize: categoryQueue.length,
+  };
 
   // 0. Process pending follow-ups first (non-openers past their follow-up date)
   if (settings.followUpEnabled) {
@@ -617,6 +667,14 @@ export async function runAutomationCycle(overrides?: {
     // avoid saturating Node's libuv threadpool and timing out valid leads.
     businesses = await filterLiveProspects(businesses);
     runStats.filtered = (runStats.hunted as number) - businesses.length;
+
+    // Deduplicate against previously emailed prospects so recurring 24/7 hunts never spam the same lead
+    const beforeDedup = businesses.length;
+    businesses = businesses.filter(b => {
+      if (!b.email) return true;
+      return !previouslyEmailed.has(String(b.email).toLowerCase());
+    });
+    runStats.skippedDuplicates = beforeDedup - businesses.length;
   } catch { runStats.errors++; }
 
   // 2. Auto-score + generate email content for each, then send
@@ -808,8 +866,15 @@ Return ONLY valid JSON: { "emailVersions":[{"version":"A","subject":"string","bo
     }
 
     prospectsSummary.push({
-      businessName: biz.businessName, email: biz.email, city: biz.city,
-      score: biz.softwareNeedScore, scored: !!analysis, emailed: false,
+      businessName: biz.businessName,
+      email: biz.email,
+      website: biz.website || "",
+      category: biz.category || cfg.category,
+      city: biz.city,
+      score: biz.softwareNeedScore,
+      scored: !!analysis,
+      reportUrl: reportUrl || "",
+      emailed: false,
     });
 
     // 3. Send email — use DB accounts if available, otherwise fall back to Brevo
@@ -856,6 +921,9 @@ Return ONLY valid JSON: { "emailVersions":[{"version":"A","subject":"string","bo
         }
         runStats.emailed++;
         prospectsSummary[prospectsSummary.length - 1].emailed = true;
+        if (biz.email) {
+          previouslyEmailed.add(String(biz.email).toLowerCase());
+        }
 
         // Queue a follow-up if enabled
         if (settings.followUpEnabled && biz.email) {
@@ -870,9 +938,10 @@ Return ONLY valid JSON: { "emailVersions":[{"version":"A","subject":"string","bo
           }).onConflictDoNothing();
         }
 
-        // Delay before next email (convert minutes to ms)
+        // Delay before next email with natural human jitter (+15s to +45s) to protect inbox reputation
         if (i < businesses.length - 1 && settings.emailDelayMinutes > 0) {
-          await new Promise(r => setTimeout(r, settings.emailDelayMinutes * 60 * 1000));
+          const jitterMs = Math.floor(15000 + Math.random() * 30000);
+          await new Promise(r => setTimeout(r, settings.emailDelayMinutes * 60 * 1000 + jitterMs));
         }
       } catch { runStats.errors++; }
     }
@@ -884,10 +953,17 @@ Return ONLY valid JSON: { "emailVersions":[{"version":"A","subject":"string","bo
     ? new Date(now.getTime() + settings.huntIntervalHours * 60 * 60 * 1000)
     : null;
 
+  const emailedHistory = Array.from(previouslyEmailed).slice(-500);
+
   await db.update(automationSettingsTable).set({
     lastRunAt: now,
     nextRunAt: nextRun,
-    runStats: { ...runStats, lastProspects: prospectsSummary.slice(0, 20), lastRunAt: now.toISOString() },
+    runStats: {
+      ...runStats,
+      emailedHistory,
+      lastProspects: prospectsSummary.slice(0, 25),
+      lastRunAt: now.toISOString(),
+    },
   }).where(eq(automationSettingsTable.id, settings.id));
 }
 
@@ -980,7 +1056,7 @@ Return ONLY JSON: { "classification": "...", "response": "..." }`;
   try {
     const ai = await getGeminiAI();
     const result = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-3.1-flash-lite",
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       config: { maxOutputTokens: 512 },
     });

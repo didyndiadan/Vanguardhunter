@@ -177,6 +177,12 @@ export async function getActiveTrainingProfile(req?: Request): Promise<AiTrainin
         userId: user.id,
       };
     }
+    const emailLower = (user.email || "").trim().toLowerCase();
+    const isOwner =
+      emailLower === "jwandersonar@gmail.com" || emailLower === "admin@vanguardhunter.io";
+    if (!isOwner) {
+      return getDefaultTrainingProfile(user);
+    }
   }
 
   const activeGlobal = await readSiteConfigJson<AiTrainingProfile>(KV_ACTIVE_KEY);
@@ -243,8 +249,13 @@ export async function saveTrainingProfile(
 
   if (user?.id) {
     await writeSiteConfigJson(userConfigKey(user.id), merged);
+    const emailLower = (user.email || "").trim().toLowerCase();
+    if (emailLower === "jwandersonar@gmail.com" || emailLower === "admin@vanguardhunter.io") {
+      await writeSiteConfigJson(KV_ACTIVE_KEY, merged);
+    }
+  } else {
+    await writeSiteConfigJson(KV_ACTIVE_KEY, merged);
   }
-  await writeSiteConfigJson(KV_ACTIVE_KEY, merged);
 
   try {
     await db.insert(userActivitiesTable).values({

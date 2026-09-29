@@ -12,7 +12,23 @@
 
 import { getAllKeys } from "./api-key-pools";
 
-export interface ScrapedBusiness {
+export interface ApolloEnrichmentData {
+  ownerName?: string;
+  ownerRole?: string;
+  linkedin?: string;
+  facebook?: string;
+  instagram?: string;
+  cmsPlatform?: string;
+  techStack?: string[];
+  missingSignals?: string[];
+  intentScore?: number;
+  intentTier?: "hot" | "warm" | "cold";
+  intentReasons?: string[];
+  emailType?: "direct_executive" | "generic_role" | "unknown";
+  executiveEmails?: string[];
+}
+
+export interface ScrapedBusiness extends ApolloEnrichmentData {
   businessName: string;
   phone: string;
   website: string;
@@ -31,7 +47,7 @@ export interface ScrapedBusiness {
 // ─── Shared HTTP fetch ────────────────────────────────────────────────────────
 
 /** Fetch a URL with realistic browser headers; throws on timeout or non-2xx. */
-async function browserFetch(url: string, timeoutMs = 14000): Promise<string> {
+async function browserFetch(url: string, timeoutMs = 5000): Promise<string> {
   const res = await Promise.race([
     fetch(url, {
       headers: {
@@ -145,7 +161,7 @@ function normalizeName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 40);
 }
 
-function dedup(list: ScrapedBusiness[]): ScrapedBusiness[] {
+function dedup(list: ScrapedBusiness[], preferNoWebsite = false): ScrapedBusiness[] {
   const byKey = new Map<string, ScrapedBusiness>();
   for (const b of list) {
     const key = normalizeName(b.businessName);
@@ -161,11 +177,30 @@ function dedup(list: ScrapedBusiness[]): ScrapedBusiness[] {
       if (!existing.address && b.address) existing.address = b.address;
     }
   }
-  return Array.from(byKey.values()).sort((a, b) => {
-    const scoreA = (a.email ? 4 : 0) + (a.website ? 2 : 0) + (a.phone ? 1 : 0);
-    const scoreB = (b.email ? 4 : 0) + (b.website ? 2 : 0) + (b.phone ? 1 : 0);
-    return scoreB - scoreA;
-  });
+  const allUnique = Array.from(byKey.values());
+  if (preferNoWebsite) {
+    return allUnique.sort((a, b) => {
+      const scoreA = (!a.website ? 5 : 0) + (a.phone ? 2 : 0) + (a.address ? 1 : 0);
+      const scoreB = (!b.website ? 5 : 0) + (b.phone ? 2 : 0) + (b.address ? 1 : 0);
+      return scoreB - scoreA;
+    });
+  }
+  // Keep a balanced mix so businesses without websites are never truncated away
+  const withSite = allUnique
+    .filter(b => Boolean(b.website))
+    .sort((a, b) => ((b.email ? 4 : 0) + (b.phone ? 2 : 0)) - ((a.email ? 4 : 0) + (a.phone ? 2 : 0)));
+  const withoutSite = allUnique
+    .filter(b => !b.website)
+    .sort((a, b) => ((b.phone ? 2 : 0) + (b.address ? 1 : 0)) - ((a.phone ? 2 : 0) + (a.address ? 1 : 0)));
+  const interleaved: ScrapedBusiness[] = [];
+  let wi = 0;
+  let ni = 0;
+  while (wi < withSite.length || ni < withoutSite.length) {
+    if (wi < withSite.length) interleaved.push(withSite[wi++]);
+    if (wi < withSite.length) interleaved.push(withSite[wi++]);
+    if (ni < withoutSite.length) interleaved.push(withoutSite[ni++]);
+  }
+  return interleaved;
 }
 
 // ─── SCRAPER 1: Yelp ─────────────────────────────────────────────────────────
@@ -256,19 +291,19 @@ async function scrapeYellowPages(category: string, city: string, country: string
     }
   }
 
-  // Scrape up to 5 pages in parallel
-  const pages = Math.min(Math.max(Math.ceil(count / 10), 2), 5);
+  // Scrape up to 3 pages in parallel for fast response
+  const pages = Math.min(Math.max(Math.ceil(count / 20), 2), 3);
   const urls = Array.from({ length: pages }, (_, i) => {
     const base = `https://www.${domain}/search?search_terms=${encodeURIComponent(category)}&geo_location_terms=${encodeURIComponent(city)}`;
     return i === 0 ? base : `${base}&page=${i + 1}`;
   });
 
-  const results = await Promise.allSettled(urls.map(u => browserFetch(u)));
+  const results = await Promise.allSettled(urls.map(u => browserFetch(u, 4800)));
   for (const r of results) {
     if (r.status === "fulfilled") parseYPHtml(r.value);
   }
 
-  return dedup(businesses).slice(0, Math.max(count * 3, 45));
+  return dedup(businesses).slice(0, Math.max(count * 4, 80));
 }
 
 // ─── SCRAPER 3: Google Local / GMB (tbm=lcl gives the My Business results tab) ─
@@ -744,19 +779,6 @@ async function scrapeTripAdvisor(category: string, city: string, country: string
     }
   }
 
-  // Also try: restaurant/attraction listing pages for the city
-  const cityUrl = `https://www.tripadvisor.com/Search?q=${encodeURIComponent(`${category} in ${city}`)}&geo=1`;
-  try {
-    const html2 = await browserFetch(cityUrl);
-    businesses.push(...schemasToBusinesses(extractJsonLd(html2), category, city, country, "tripadvisor"));
-    let m2: RegExpExecArray | null;
-    const re2 = /<a[^>]+class="[^"]*(?:BMQDV|property_title|listing_title)[^"]*"[^>]*>([^<]{2,80})<\/a>/gi;
-    while ((m2 = re2.exec(html2)) !== null) {
-      const name = m2[1].trim().replace(/^\d+\.\s*/, "");
-      if (name.length >= 2) businesses.push({ businessName: name, phone: "", website: "", address: "", city, country, category, source: "tripadvisor", email: "" });
-    }
-  } catch {}
-
   return dedup(businesses).slice(0, count);
 }
 
@@ -885,17 +907,17 @@ async function scrapeSuperPages(category: string, city: string, country: string,
     }
   }
 
-  const pages = Math.min(Math.max(Math.ceil(count / 15), 2), 4);
+  const pages = Math.min(Math.max(Math.ceil(count / 20), 2), 3);
   const urls = Array.from({ length: pages }, (_, i) => {
     const base = `https://www.superpages.com/search?search_terms=${encodeURIComponent(category)}&geo_location_terms=${encodeURIComponent(city)}`;
     return i === 0 ? base : `${base}&page=${i + 1}`;
   });
-  const results = await Promise.allSettled(urls.map(u => browserFetch(u)));
+  const results = await Promise.allSettled(urls.map(u => browserFetch(u, 4800)));
   for (const r of results) {
     if (r.status === "fulfilled") parseSPHtml(r.value);
   }
 
-  return dedup(businesses).slice(0, Math.max(count * 3, 45));
+  return dedup(businesses).slice(0, Math.max(count * 4, 80));
 }
 
 // ─── SCRAPER 14: Bark.com (global service marketplace) ───────────────────────
@@ -987,6 +1009,420 @@ function analyzeAIOpportunity(html: string): { score: number; note: string } {
   return { score: 7, note: "Has a basic contact form but no chat, booking, or AI assistant — good AI agent opportunity." };
 }
 
+// ─── Apollo+ Tech-Stack, Decision-Maker & Buyer Intent Scanner ────────────────
+
+const NON_HUMAN_NAME_WORDS = new Set([
+  "our", "the", "your", "about", "contact", "home", "read", "more", "view", "all",
+  "privacy", "policy", "terms", "service", "services", "team", "staff", "office",
+  "welcome", "local", "locally", "family", "owned", "operated", "customer", "care",
+  "client", "support", "monday", "tuesday", "wednesday", "thursday", "friday",
+  "saturday", "sunday", "new", "york", "los", "angeles", "san", "francisco",
+  "chicago", "miami", "austin", "dallas", "houston", "london", "toronto", "sydney",
+  "free", "estimate", "quote", "call", "today", "book", "now", "online", "schedule",
+  "years", "experience", "certified", "licensed", "insured", "best", "top", "rated",
+  "general", "manager", "managing", "partner", "medical", "director", "dental",
+  "clinic", "center", "group", "associates", "solutions", "company", "inc", "llc",
+]);
+
+function isValidPersonName(candidate: string): boolean {
+  const clean = candidate.replace(/\s+/g, " ").trim();
+  if (clean.length < 5 || clean.length > 38) return false;
+  const parts = clean.replace(/^Dr\.\s+/i, "").split(" ");
+  if (parts.length < 2 || parts.length > 3) return false;
+  for (const p of parts) {
+    const bare = p.replace(/[^A-Za-z]/g, "");
+    if (bare.length < 2) return false;
+    if (!/^[A-Z][a-z]+$/.test(bare)) return false;
+    if (NON_HUMAN_NAME_WORDS.has(bare.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function extractDecisionMakerFromBusinessName(businessName: string, email = ""): {
+  ownerName: string;
+  ownerRole: string;
+} {
+  const cleanBiz = (businessName || "").replace(/\s+/g, " ").trim();
+  if (cleanBiz) {
+    // 1. "Dr. First Last" in business name
+    const drMatch = cleanBiz.match(/\b(Dr\.?\s+[A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,18})\b/);
+    if (drMatch && isValidPersonName(drMatch[1].replace(/^Dr\.?\s+/i, "Dr. "))) {
+      return {
+        ownerName: drMatch[1].replace(/^Dr\.?\s+/i, "Dr. ").trim(),
+        ownerRole: "Principal Doctor / Owner",
+      };
+    }
+    // 2. "First Last, DDS / DMD / MD / DO / DC / CPA / Esq" in business name
+    const credMatch = cleanBiz.match(/\b([A-Z][a-z]{2,15}(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]{2,18})\s*[,\-]?\s*\b(DDS|DMD|MD|DO|DC|Esq\.?|CPA|OD|DPM|NP|PA)\b/);
+    if (credMatch) {
+      const bareName = credMatch[1].replace(/\s+[A-Z]\.?\s+/, " ").trim();
+      if (isValidPersonName(bareName)) {
+        return {
+          ownerName: `${bareName}, ${credMatch[2]}`,
+          ownerRole: `Principal (${credMatch[2]})`,
+        };
+      }
+    }
+    // 3. "Law Office(s) of First Last" or "First Last Law / Dental / Chiropractic / Plumbing / CPA"
+    const lawOfMatch = cleanBiz.match(/(?:Law\s+Offices?\s+of|Offices?\s+of|Practice\s+of)\s+([A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,18})\b/i);
+    if (lawOfMatch && isValidPersonName(lawOfMatch[1])) {
+      return {
+        ownerName: lawOfMatch[1].trim(),
+        ownerRole: "Principal / Managing Partner",
+      };
+    }
+    const prefixMatch = cleanBiz.match(/^([A-Z][a-z]{2,14}\s+[A-Z][a-z]{2,16})\s+(?:Dental|Dentistry|Orthodontics|Chiropractic|Law|Legal|Accounting|CPA|Plumbing|Heating|Roofing|Electric|Construction|Realty|Real Estate|Insurance|Agency|Associates|Studio|Clinic)\b/);
+    if (prefixMatch && isValidPersonName(prefixMatch[1])) {
+      return {
+        ownerName: prefixMatch[1].trim(),
+        ownerRole: "Founder / Owner",
+      };
+    }
+  }
+  // 4. Derive from direct firstname.lastname@ email if present
+  if (email && email.includes("@")) {
+    const local = email.split("@")[0].toLowerCase();
+    const parts = local.split(/[._\-]/).filter(p => /^[a-z]{3,14}$/.test(p));
+    if (parts.length === 2 && !NON_HUMAN_NAME_WORDS.has(parts[0]) && !NON_HUMAN_NAME_WORDS.has(parts[1])) {
+      const candidate = `${parts[0][0].toUpperCase()}${parts[0].slice(1)} ${parts[1][0].toUpperCase()}${parts[1].slice(1)}`;
+      if (isValidPersonName(candidate)) {
+        return {
+          ownerName: candidate,
+          ownerRole: "Executive / Owner",
+        };
+      }
+    }
+  }
+  return { ownerName: "", ownerRole: "" };
+}
+
+function extractDecisionMakerFromHtml(combinedHtml: string): {
+  ownerName: string;
+  ownerRole: string;
+  linkedin: string;
+  facebook: string;
+  instagram: string;
+} {
+  let ownerName = "";
+  let ownerRole = "";
+  let linkedin = "";
+  let facebook = "";
+  let instagram = "";
+
+  // 1. Extract Social & LinkedIn links from anchor hrefs
+  const liPersonalMatch = combinedHtml.match(/https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/in\/[a-zA-Z0-9\-_%]+/i);
+  const liCompanyMatch = combinedHtml.match(/https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/company\/[a-zA-Z0-9\-_%]+/i);
+  linkedin = liPersonalMatch?.[0] || liCompanyMatch?.[0] || "";
+
+  const fbMatch = combinedHtml.match(/https?:\/\/(?:www\.)?facebook\.com\/(?!sharer|share|dialog|plugins|tr\?)[a-zA-Z0-9.\-_]{3,60}/i);
+  if (fbMatch) facebook = fbMatch[0];
+
+  const igMatch = combinedHtml.match(/https?:\/\/(?:www\.)?instagram\.com\/(?!p\/|reel\/|explore\/)[a-zA-Z0-9._]{3,45}/i);
+  if (igMatch) instagram = igMatch[0];
+
+  // 2. Check JSON-LD Schema.org for founder / employee / author / member
+  const schemas = extractJsonLd(combinedHtml);
+  for (const s of schemas) {
+    if (!s || typeof s !== "object") continue;
+    const candidates = [
+      s.founder,
+      ...(Array.isArray(s.founders) ? s.founders : []),
+      s.employee,
+      ...(Array.isArray(s.employees) ? s.employees : []),
+      s.member,
+      ...(Array.isArray(s.members) ? s.members : []),
+      s.author,
+    ].filter(Boolean);
+
+    for (const c of candidates) {
+      const rawName = typeof c === "string" ? c : c?.name;
+      if (typeof rawName === "string" && isValidPersonName(rawName)) {
+        ownerName = rawName.trim();
+        ownerRole = (typeof c === "object" && c?.jobTitle) ? String(c.jobTitle).trim() : "Founder / Owner";
+        break;
+      }
+    }
+    if (ownerName) break;
+  }
+
+  // 3. Scan plain text for Dr. / Credentials / Founder / Owner / CEO / Principal patterns
+  const plain = combinedHtml
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&[a-z#0-9]+;/gi, " ")
+    .replace(/\s+/g, " ");
+
+  if (!ownerName) {
+    // Pattern A: "Dr. First Last"
+    const drRe = /\b(Dr\.\s+[A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,18})\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = drRe.exec(plain)) !== null) {
+      if (isValidPersonName(m[1])) {
+        ownerName = m[1].trim();
+        ownerRole = "Principal Doctor / Owner";
+        break;
+      }
+    }
+  }
+
+  if (!ownerName) {
+    // Pattern B: "First Last, DDS / DMD / MD / Esq / CPA"
+    const credRe = /\b([A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,18})\s*,\s*(DDS|DMD|MD|DO|DC|Esq\.?|CPA|PE|AIA)\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = credRe.exec(plain)) !== null) {
+      if (isValidPersonName(m[1])) {
+        ownerName = `${m[1].trim()}, ${m[2]}`;
+        ownerRole = `Principal (${m[2]})`;
+        break;
+      }
+    }
+  }
+
+  if (!ownerName) {
+    // Pattern C: "Owner/Founder/CEO/President: First Last" or "Founded by First Last"
+    const roleFirstRe = /\b(Founder|Co-Founder|Owner|Practice Owner|Agency Owner|CEO|President|Managing Partner|Principal|General Manager)\s*(?:&amp;|&|and)?\s*(?:CEO|Owner|Founder)?\s*[:\-–,]\s*([A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,18})\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = roleFirstRe.exec(plain)) !== null) {
+      if (isValidPersonName(m[2])) {
+        ownerName = m[2].trim();
+        ownerRole = m[1].trim();
+        break;
+      }
+    }
+  }
+
+  if (!ownerName) {
+    // Pattern D: "First Last - Owner / Founder / CEO / President"
+    const nameFirstRe = /\b([A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,18})\s*[\-–|,]\s*(Founder|Co-Founder|Owner|CEO|President|Managing Partner|Principal|Medical Director)\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = nameFirstRe.exec(plain)) !== null) {
+      if (isValidPersonName(m[1])) {
+        ownerName = m[1].trim();
+        ownerRole = m[2].trim();
+        break;
+      }
+    }
+  }
+
+  if (!ownerName) {
+    // Pattern E: "Meet Dr. First Last" / "Meet First Last" / "Attorney First Last"
+    const meetRe = /\b(?:Meet|About|Welcome\s+to\s+the\s+office\s+of|Led\s+by|Attorney|Dr\.)\s+([A-Z][a-z]{2,15}\s+[A-Z][a-z]{2,18})\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = meetRe.exec(plain)) !== null) {
+      if (isValidPersonName(m[1])) {
+        ownerName = m[1].trim();
+        ownerRole = "Principal / Owner";
+        break;
+      }
+    }
+  }
+
+  return { ownerName, ownerRole, linkedin, facebook, instagram };
+}
+
+function detectTechStackFromHtml(html: string, url: string): {
+  cmsPlatform: string;
+  techStack: string[];
+  missingSignals: string[];
+} {
+  if (!html) {
+    return {
+      cmsPlatform: url ? "Unreachable / Parked" : "No Website",
+      techStack: [],
+      missingSignals: url
+        ? ["Website Unreachable", "No AI Chat / Receptionist", "No Online Booking Widget", "No Retargeting Pixels"]
+        : ["No Website Built", "No AI Chat / Receptionist", "No Online Booking Widget", "No Lead Capture Funnel"],
+    };
+  }
+
+  let cmsPlatform = "Custom HTML";
+  if (/\/wp-content\/|\/wp-includes\/|wp-json/i.test(html)) cmsPlatform = "WordPress";
+  else if (/cdn\.shopify\.com|Shopify\.theme/i.test(html)) cmsPlatform = "Shopify";
+  else if (/wix\.com|wixstatic\.com|X-Wix-/i.test(html)) cmsPlatform = "Wix";
+  else if (/squarespace\.com|static1\.squarespace/i.test(html)) cmsPlatform = "Squarespace";
+  else if (/webflow\.com|data-wf-site/i.test(html)) cmsPlatform = "Webflow";
+  else if (/wsimg\.com|godaddy/i.test(html)) cmsPlatform = "GoDaddy Builder";
+  else if (/weebly\.com|editmysite\.com/i.test(html)) cmsPlatform = "Weebly";
+  else if (/hs-scripts\.com|hubspotusercontent/i.test(html)) cmsPlatform = "HubSpot CMS";
+  else if (/__NEXT_DATA__|_next\/static/i.test(html)) cmsPlatform = "Next.js";
+
+  const techStack: string[] = [cmsPlatform];
+  const missingSignals: string[] = [];
+
+  const hasMetaPixel = /connect\.facebook\.net|fbq\s*\(|facebook\.com\/tr\?/i.test(html);
+  const hasGA4 = /googletagmanager\.com|gtag\s*\(|google-analytics\.com|G-[A-Z0-9]{6,}/i.test(html);
+  const hasGoogleAds = /googleadservices\.com|AW-[0-9]{6,}/i.test(html);
+  const hasTikTokPixel = /analytics\.tiktok\.com/i.test(html);
+  const hasChat = CHAT_WIDGET_RE.test(html);
+  const hasBooking = BOOKING_WIDGET_RE.test(html);
+  const hasOrdering = ORDER_WIDGET_RE.test(html);
+  const hasForm = FORM_RE.test(html);
+  const hasSsl = /^https:\/\//i.test(url);
+  const hasSchema = /application\/ld\+json/i.test(html);
+  const hasReviews = /google\s*reviews?|trustpilot|birdeye|podium|nicejob|embedsocial|elfsight|aggregaterating|testimonials?|customer\s*reviews?|5-star|★★★★★/i.test(html);
+
+  if (hasMetaPixel) techStack.push("Meta Pixel");
+  if (hasGA4) techStack.push("Google Analytics");
+  if (hasGoogleAds) techStack.push("Google Ads");
+  if (hasTikTokPixel) techStack.push("TikTok Pixel");
+  if (hasChat) techStack.push("Live Chat");
+  if (hasBooking) techStack.push("Online Booking");
+  if (hasOrdering) techStack.push("Online Ordering");
+  if (hasForm) techStack.push("Contact Form");
+  if (hasSsl) techStack.push("SSL");
+  if (hasSchema) techStack.push("Schema SEO");
+  if (hasReviews) techStack.push("Customer Reviews");
+
+  if (!hasChat) missingSignals.push("No AI Chat / Receptionist");
+  if (!hasBooking && !hasOrdering) missingSignals.push("No Online Booking");
+  if (!hasMetaPixel && !hasGoogleAds) missingSignals.push("No Ad Pixels (FB/Google)");
+  if (!hasGA4) missingSignals.push("No Google Analytics");
+  if (!hasForm) missingSignals.push("No Lead Capture Form");
+  if (!hasReviews) missingSignals.push("No Review Funnel");
+  if (cmsPlatform === "Wix" || cmsPlatform === "GoDaddy Builder" || cmsPlatform === "Weebly") {
+    missingSignals.push(`DIY Site (${cmsPlatform})`);
+  }
+  if (!hasSsl && url) missingSignals.push("No HTTPS / SSL");
+
+  return { cmsPlatform, techStack, missingSignals };
+}
+
+function classifyEmailAndPermutations(
+  email: string,
+  ownerName: string,
+  website: string
+): {
+  emailType: "direct_executive" | "generic_role" | "unknown";
+  executiveEmails: string[];
+} {
+  const genericPrefixes = /^(info|contact|hello|support|office|admin|sales|team|help|enquiries|inquiries|mail|reception|frontdesk|appointments|booking|service|billing|careers|hr|press)@/i;
+  let emailType: "direct_executive" | "generic_role" | "unknown" = "unknown";
+  if (email && email.includes("@")) {
+    emailType = genericPrefixes.test(email.trim()) ? "generic_role" : "direct_executive";
+  }
+
+  const executiveEmails: string[] = [];
+  if (email && emailType === "direct_executive") {
+    executiveEmails.push(email.toLowerCase());
+  }
+
+  // Derive bare domain from email or website
+  let domain = "";
+  if (email && email.includes("@")) {
+    const d = email.split("@")[1]?.toLowerCase().trim() || "";
+    if (d && !/^(gmail|yahoo|hotmail|outlook|icloud|aol|protonmail|live|msn)\./i.test(d)) {
+      domain = d;
+    }
+  }
+  if (!domain && website) {
+    try {
+      const u = new URL(website.startsWith("http") ? website : `https://${website}`);
+      domain = u.hostname.replace(/^www\./i, "").toLowerCase();
+    } catch {}
+  }
+
+  if (domain && ownerName) {
+    const cleanParts = ownerName
+      .replace(/^Dr\.\s+/i, "")
+      .replace(/,.*$/, "")
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .map((s) => s.replace(/[^a-z]/g, ""))
+      .filter(Boolean);
+    if (cleanParts.length >= 2) {
+      const [first, last] = cleanParts;
+      const candidates = [
+        `${first}@${domain}`,
+        `${first}.${last}@${domain}`,
+        `${first[0]}${last}@${domain}`,
+      ];
+      for (const c of candidates) {
+        if (!executiveEmails.includes(c) && c !== email?.toLowerCase()) {
+          executiveEmails.push(c);
+        }
+      }
+    }
+  }
+
+  return { emailType, executiveEmails: executiveEmails.slice(0, 3) };
+}
+
+export function computeApolloIntentScore(params: {
+  email?: string;
+  emailType?: "direct_executive" | "generic_role" | "unknown";
+  phone?: string;
+  website?: string;
+  ownerName?: string;
+  linkedin?: string;
+  cmsPlatform?: string;
+  techStack?: string[];
+  missingSignals?: string[];
+}): {
+  intentScore: number;
+  intentTier: "hot" | "warm" | "cold";
+  intentReasons: string[];
+} {
+  let score = 20;
+  const reasons: string[] = [];
+
+  if (params.email) {
+    score += 20;
+    if (params.emailType === "direct_executive") {
+      score += 8;
+      reasons.push("Direct decision-maker email verified");
+    } else {
+      reasons.push("Verified MX business email");
+    }
+  }
+  if (params.phone) {
+    score += 10;
+  }
+  if (params.ownerName || params.linkedin) {
+    score += 10;
+    if (params.ownerName) reasons.push(`Decision maker identified (${params.ownerName})`);
+  }
+
+  const missing = params.missingSignals || [];
+  const tech = params.techStack || [];
+
+  if (!params.website) {
+    score += 26;
+    reasons.push("No website — immediate high-ticket Website + AI build candidate");
+  } else {
+    if (missing.some((m) => m.includes("No AI Chat"))) {
+      score += 14;
+      reasons.push("Missing 24/7 AI chat / receptionist widget");
+    }
+    if (missing.some((m) => m.includes("No Online Booking"))) {
+      score += 10;
+      reasons.push("No automated online booking system");
+    }
+    if (missing.some((m) => m.includes("No Ad Pixels"))) {
+      score += 12;
+      reasons.push("No Meta/Google retargeting pixels installed");
+    } else if (tech.includes("Google Ads") || tech.includes("Meta Pixel")) {
+      score += 14;
+      reasons.push("Actively spending on ads — high conversion optimization intent");
+    }
+    if (missing.some((m) => m.includes("DIY Site") || m.includes("No Lead Capture"))) {
+      score += 8;
+      reasons.push("Outdated lead capture funnel");
+    }
+  }
+
+  const clamped = Math.max(18, Math.min(98, score));
+  const intentTier: "hot" | "warm" | "cold" =
+    clamped >= 80 ? "hot" : clamped >= 55 ? "warm" : "cold";
+
+  return {
+    intentScore: clamped,
+    intentTier,
+    intentReasons: reasons.slice(0, 4),
+  };
+}
+
 function decodeCfEmail(hex: string): string {
   try {
     const key = parseInt(hex.slice(0, 2), 16);
@@ -1036,13 +1472,32 @@ function extractEmailFromHtml(rawHtml: string): string {
   return "";
 }
 
-async function scrapeEmailFromSiteInner(rawUrl: string): Promise<{ email: string; aiOpportunityScore: number; aiOpportunityNote: string }> {
-  const fallback = { email: "", aiOpportunityScore: 5, aiOpportunityNote: "Website could not be scanned — need unverified." };
+interface SiteScrapeEnrichment extends ApolloEnrichmentData {
+  email: string;
+  aiOpportunityScore: number;
+  aiOpportunityNote: string;
+}
+
+async function scrapeEmailFromSiteInner(rawUrl: string, existingEmail = "", existingPhone = ""): Promise<SiteScrapeEnrichment> {
+  const emptyTech = detectTechStackFromHtml("", rawUrl);
+  const emptyIntent = computeApolloIntentScore({
+    email: existingEmail,
+    phone: existingPhone,
+    website: rawUrl,
+    ...emptyTech,
+  });
+  const fallback: SiteScrapeEnrichment = {
+    email: existingEmail,
+    aiOpportunityScore: 5,
+    aiOpportunityNote: "Website could not be scanned — need unverified.",
+    ...emptyTech,
+    ...emptyIntent,
+  };
   const cleaned = cleanWebsiteUrl(rawUrl);
   if (!cleaned || SKIP_WEBSITE.test(cleaned)) return fallback;
   const fullUrl = cleaned.startsWith("http") ? cleaned : `https://${cleaned}`;
 
-  const fetchWithBrowserHeaders = async (u: string): Promise<Response | null> => {
+  const fetchWithBrowserHeaders = async (u: string, timeoutMs = 2800): Promise<Response | null> => {
     try {
       const r = await Promise.race([
         fetch(u, {
@@ -1053,19 +1508,17 @@ async function scrapeEmailFromSiteInner(rawUrl: string): Promise<{ email: string
           },
           redirect: "follow",
         }),
-        new Promise<never>((_, rj) => setTimeout(() => rj(new Error("timeout")), 5500)),
+        new Promise<never>((_, rj) => setTimeout(() => rj(new Error("timeout")), timeoutMs)),
       ]) as Response;
       if (r.ok) return r;
     } catch {}
     return null;
   };
 
-  const tryFetch = async (u: string): Promise<{ email: string; html: string } | null> => {
-    let r = await fetchWithBrowserHeaders(u);
+  const tryFetch = async (u: string, timeoutMs = 2800): Promise<{ email: string; html: string } | null> => {
+    let r = await fetchWithBrowserHeaders(u, timeoutMs);
     if (!r && u.startsWith("http://")) {
-      r = await fetchWithBrowserHeaders(u.replace(/^http:\/\//i, "https://"));
-    } else if (!r && u.startsWith("https://")) {
-      r = await fetchWithBrowserHeaders(u.replace(/^https:\/\//i, "http://"));
+      r = await fetchWithBrowserHeaders(u.replace(/^http:\/\//i, "https://"), 2000);
     }
     if (!r) return null;
     try {
@@ -1075,44 +1528,87 @@ async function scrapeEmailFromSiteInner(rawUrl: string): Promise<{ email: string
     } catch { return null; }
   };
 
-  // Try main page first — this is also what we analyze for AI-opportunity signals.
-  const main = await tryFetch(fullUrl);
+  // Try main page first — this is also what we analyze for AI-opportunity & Apollo tech/intent signals.
+  const main = await tryFetch(fullUrl, 2800);
   if (main) {
     const { score, note } = analyzeAIOpportunity(main.html);
-    if (main.email) return { email: main.email, aiOpportunityScore: score, aiOpportunityNote: note };
+    const techInfo = detectTechStackFromHtml(main.html, fullUrl);
+    let combinedHtml = main.html;
+    let resolvedEmail = main.email || existingEmail;
 
-    // Discover real contact/about links from homepage HTML + standard paths
-    try {
-      const base = new URL(fullUrl.startsWith("http://") ? fullUrl.replace(/^http:\/\//i, "https://") : fullUrl);
-      const origin = base.origin;
-      const candidateUrls = new Set<string>();
+    // Discover real contact/about/team links from homepage HTML + standard paths if email or ownerName is missing
+    let dm = extractDecisionMakerFromHtml(combinedHtml);
+    if (!resolvedEmail || !dm.ownerName) {
+      try {
+        const base = new URL(fullUrl.startsWith("http://") ? fullUrl.replace(/^http:\/\//i, "https://") : fullUrl);
+        const origin = base.origin;
+        const candidateUrls = new Set<string>();
 
-      const linkRe = /<a[^>]+href=["']([^"'#]+)["'][^>]*>([\s\S]{0,80}?)<\/a>/gi;
-      let lm: RegExpExecArray | null;
-      while ((lm = linkRe.exec(main.html)) !== null) {
-        const href = lm[1].trim();
-        const label = lm[2].replace(/<[^>]+>/g, "").trim();
-        if (/(contact|about|connect|touch|reach|location|office|team)/i.test(href + " " + label)) {
-          try {
-            const resolved = new URL(href, origin);
-            if (resolved.hostname.replace(/^www\./, "") === base.hostname.replace(/^www\./, "")) {
-              candidateUrls.add(resolved.toString());
-            }
-          } catch {}
+        const linkRe = /<a[^>]+href=["']([^"'#]+)["'][^>]*>([\s\S]{0,80}?)<\/a>/gi;
+        let lm: RegExpExecArray | null;
+        while ((lm = linkRe.exec(main.html)) !== null) {
+          const href = lm[1].trim();
+          const label = lm[2].replace(/<[^>]+>/g, "").trim();
+          if (/(contact|about|team|founder|doctor|staff)/i.test(href + " " + label)) {
+            try {
+              const resolved = new URL(href, origin);
+              if (resolved.hostname.replace(/^www\./, "") === base.hostname.replace(/^www\./, "")) {
+                candidateUrls.add(resolved.toString());
+              }
+            } catch {}
+          }
         }
-      }
 
-      for (const path of ["/contact", "/contact-us", "/about", "/about-us"]) {
-        candidateUrls.add(`${origin}${path}`);
-      }
+        for (const path of ["/contact", "/about"]) {
+          candidateUrls.add(`${origin}${path}`);
+        }
 
-      for (const subUrl of Array.from(candidateUrls).slice(0, 4)) {
-        const found = await tryFetch(subUrl);
-        if (found?.email) return { email: found.email, aiOpportunityScore: score, aiOpportunityNote: note };
-      }
-    } catch {}
+        const subPages = await Promise.all(
+          Array.from(candidateUrls)
+            .slice(0, 2)
+            .map(subUrl => tryFetch(subUrl, 1800))
+        );
+        for (const found of subPages) {
+          if (found) {
+            combinedHtml += "\n" + found.html;
+            if (!resolvedEmail && found.email) resolvedEmail = found.email;
+          }
+        }
+        dm = extractDecisionMakerFromHtml(combinedHtml);
+      } catch {}
+    }
 
-    return { email: "", aiOpportunityScore: score, aiOpportunityNote: note };
+    const emailMeta = classifyEmailAndPermutations(resolvedEmail, dm.ownerName, fullUrl);
+    const intent = computeApolloIntentScore({
+      email: resolvedEmail,
+      emailType: emailMeta.emailType,
+      phone: existingPhone,
+      website: fullUrl,
+      ownerName: dm.ownerName,
+      linkedin: dm.linkedin,
+      cmsPlatform: techInfo.cmsPlatform,
+      techStack: techInfo.techStack,
+      missingSignals: techInfo.missingSignals,
+    });
+
+    return {
+      email: resolvedEmail,
+      aiOpportunityScore: score,
+      aiOpportunityNote: note,
+      ownerName: dm.ownerName,
+      ownerRole: dm.ownerRole,
+      linkedin: dm.linkedin,
+      facebook: dm.facebook,
+      instagram: dm.instagram,
+      cmsPlatform: techInfo.cmsPlatform,
+      techStack: techInfo.techStack,
+      missingSignals: techInfo.missingSignals,
+      emailType: emailMeta.emailType,
+      executiveEmails: emailMeta.executiveEmails,
+      intentScore: intent.intentScore,
+      intentTier: intent.intentTier,
+      intentReasons: intent.intentReasons,
+    };
   }
 
   return fallback;
@@ -1124,16 +1620,38 @@ async function scrapeEmailFromSiteInner(rawUrl: string): Promise<{ email: string
  * each — this caps the worst case per business so one bad domain can't stall an
  * entire hunt batch.
  */
-async function scrapeEmailFromSite(rawUrl: string): Promise<{ email: string; aiOpportunityScore: number; aiOpportunityNote: string }> {
-  const fallback = { email: "", aiOpportunityScore: 5, aiOpportunityNote: "Website could not be scanned — need unverified." };
+async function scrapeEmailFromSite(rawUrl: string, existingEmail = "", existingPhone = ""): Promise<SiteScrapeEnrichment> {
+  const emptyTech = detectTechStackFromHtml("", rawUrl);
+  const emptyIntent = computeApolloIntentScore({
+    email: existingEmail,
+    phone: existingPhone,
+    website: rawUrl,
+    ...emptyTech,
+  });
+  const fallback: SiteScrapeEnrichment = {
+    email: existingEmail,
+    aiOpportunityScore: 5,
+    aiOpportunityNote: "Website could not be scanned — need unverified.",
+    ...emptyTech,
+    ...emptyIntent,
+  };
   try {
     return await Promise.race([
-      scrapeEmailFromSiteInner(rawUrl),
-      new Promise<typeof fallback>(resolve => setTimeout(() => resolve(fallback), 12000)),
+      scrapeEmailFromSiteInner(rawUrl, existingEmail, existingPhone),
+      new Promise<SiteScrapeEnrichment>(resolve => setTimeout(() => resolve(fallback), 3800)),
     ]);
   } catch {
     return fallback;
   }
+}
+
+export async function enrichWebsiteApolloSignals(params: {
+  website?: string;
+  businessName?: string;
+  email?: string;
+  phone?: string;
+}): Promise<SiteScrapeEnrichment> {
+  return scrapeEmailFromSite(params.website || "", params.email || "", params.phone || "");
 }
 
 // ─── SCRAPER 15: Google Maps (free — parses embedded place data) ──────────────
@@ -1203,7 +1721,7 @@ async function scrapeGoogleMaps(category: string, city: string, country: string,
 
   try {
     const url = `https://www.google.com/maps/search/${encodeURIComponent(q)}?hl=en`;
-    const html = await browserFetch(url, 22000);
+    const html = await browserFetch(url, 4500);
 
     // JSON-LD structured data (sometimes present in Maps pages)
     businesses.push(...schemasToBusinesses(extractJsonLd(html), category, city, country, "google_maps"));
@@ -1255,138 +1773,348 @@ async function scrapeGoogleMaps(category: string, city: string, country: string,
   return dedup(businesses).slice(0, count);
 }
 
-// ─── SCRAPER 16: OpenStreetMap (free, public API — not subject to anti-bot blocking) ──
+// ─── SCRAPER 16: OpenStreetMap Overpass (Multi-Mirror Free No-Card Maps API) ──
+
+const OVERPASS_MIRRORS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+];
+
+async function queryOverpassWithFailover(query: string, timeoutMs = 5500): Promise<any> {
+  try {
+    return await Promise.any(
+      OVERPASS_MIRRORS.map(async (endpoint) => {
+        const res = (await Promise.race([
+          fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "text/plain",
+              "User-Agent": "VanguardHunter-B2BDiscovery/2.0",
+            },
+            body: query,
+          }),
+          new Promise<never>((_, rj) => setTimeout(() => rj(new Error("timeout")), timeoutMs)),
+        ])) as Response;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        if (!json || !Array.isArray(json.elements)) throw new Error("empty");
+        return json;
+      })
+    );
+  } catch {
+    return null;
+  }
+}
 
 /**
  * OpenStreetMap's Nominatim (geocoding) + Overpass (POI query) are public,
- * script-friendly APIs meant for programmatic use — unlike the directory sites
- * above, they don't 403/429 requests from cloud IPs. This is real business data
- * (name, phone, website, address) contributed by OSM mappers, so coverage varies
- * by area, but it's a reliable, unblockable source to add to the mix.
+ * script-friendly APIs meant for programmatic use — 100% free with NO billing
+ * card or API key required.
  */
 async function scrapeOpenStreetMap(category: string, city: string, country: string, count: number): Promise<ScrapedBusiness[]> {
   try {
     // 1. Geocode the city to a bounding box via Nominatim (free, no key).
     const geoUrl = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(`${city}, ${country}`)}`;
     const geoRes = await Promise.race([
-      fetch(geoUrl, { headers: { "User-Agent": "DevStudio-BusinessHunter/1.0 (contact via app)" } }),
-      new Promise<never>((_, rj) => setTimeout(() => rj(new Error("timeout")), 12000)),
+      fetch(geoUrl, { headers: { "User-Agent": "VanguardHunter-B2BDiscovery/2.0 (contact via app)" } }),
+      new Promise<never>((_, rj) => setTimeout(() => rj(new Error("timeout")), 4500)),
     ]) as Response;
     if (!geoRes.ok) return [];
-    const geoData = await geoRes.json() as Array<{ boundingbox: [string, string, string, string] }>;
+    const geoData = await geoRes.json() as Array<{ lat?: string; lon?: string; boundingbox: [string, string, string, string] }>;
     if (!geoData.length) return [];
-    const [south, north, west, east] = geoData[0].boundingbox.map(Number);
+    let [south, north, west, east] = geoData[0].boundingbox.map(Number);
+    // Clamp bounding box to max ±0.14 deg (~15km) around center so large metros resolve in <1.5s
+    const centerLat = Number(geoData[0].lat) || (south + north) / 2;
+    const centerLon = Number(geoData[0].lon) || (west + east) / 2;
+    const maxSpan = 0.14;
+    if (north - south > maxSpan * 2) {
+      south = centerLat - maxSpan;
+      north = centerLat + maxSpan;
+    }
+    if (east - west > maxSpan * 2) {
+      west = centerLon - maxSpan;
+      east = centerLon + maxSpan;
+    }
 
-    // 2. Map the free-text category to multiple OSM tag filters — nwr covers
-    //    node (point POI), way (building footprint), relation (compound venue).
-    //    Using multiple filters for the same category improves recall significantly.
+    // 2. Map free-text category to indexed OSM tag filters (avoiding unindexed full-city name regex scans)
     const cat = category.toLowerCase();
     const tagMap: Array<[RegExp, string[]]> = [
-      [/restaurant|food|dining|eatery|fast.?food|takeaway/,
-        [`nwr["amenity"="restaurant"]`, `nwr["amenity"="fast_food"]`, `nwr["amenity"="food_court"]`, `nwr["cuisine"]`]],
-      [/cafe|coffee/, [`nwr["amenity"="cafe"]`, `nwr["shop"="coffee"]`]],
-      [/bar|pub|lounge|nightclub/,
-        [`nwr["amenity"="bar"]`, `nwr["amenity"="pub"]`, `nwr["amenity"="nightclub"]`, `nwr["amenity"="biergarten"]`]],
+      [/roof|roofer|roofing|gutter|siding/,
+        [`nwr["craft"="roofer"]`, `nwr["craft"="tiler"]`, `nwr["office"="construction_company"]`]],
+      [/hvac|heating|cooling|air.?condition|furnace/,
+        [`nwr["craft"="hvac"]`, `nwr["craft"="heating_engineer"]`, `nwr["shop"="hvac"]`]],
+      [/plumb|plumber|drain|sewer|water.?heater/,
+        [`nwr["craft"="plumber"]`, `nwr["shop"="bathroom_furnishing"]`]],
+      [/electr|electrician|wiring|solar/,
+        [`nwr["craft"="electrician"]`, `nwr["office"="energy_supplier"]`, `nwr["craft"="photovoltaic"]`]],
+      [/construct|remodel|renovat|contractor|builder|handyman|deck|kitchen|bath/,
+        [`nwr["office"="construction_company"]`, `nwr["craft"="builder"]`, `nwr["craft"="carpenter"]`, `nwr["shop"="kitchen"]`]],
+      [/landscap|lawn|tree|garden|paver|hardscap|irrigation/,
+        [`nwr["craft"="gardener"]`, `nwr["shop"="garden_centre"]`]],
+      [/pest|exterminat|termite|wildlife/,
+        [`nwr["craft"="pest_control"]`]],
+      [/clean|maid|janitor|carpet|pressure.?wash|window.?wash|laundry|dry.?clean/,
+        [`nwr["craft"="cleaning"]`, `nwr["shop"="laundry"]`, `nwr["shop"="dry_cleaning"]`]],
+      [/locksmith|security|alarm|garage.?door/,
+        [`nwr["craft"="locksmith"]`, `nwr["shop"="locksmith"]`, `nwr["shop"="security"]`]],
+      [/moving|mover|storage|hauling|junk/,
+        [`nwr["office"="moving_company"]`, `nwr["shop"="storage_rental"]`]],
+      [/paint|painter|flooring|carpet|tile|window|door|fence/,
+        [`nwr["craft"="painter"]`, `nwr["craft"="floorer"]`, `nwr["craft"="glaziery"]`, `nwr["shop"="flooring"]`, `nwr["shop"="paint"]`]],
+      [/restaurant|food|dining|eatery|fast.?food|takeaway|bistro|steak|pizza|sushi/,
+        [`nwr["amenity"="restaurant"]`, `nwr["amenity"="fast_food"]`]],
+      [/cafe|coffee|bakery|bread|pastry/,
+        [`nwr["amenity"="cafe"]`, `nwr["shop"="coffee"]`, `nwr["shop"="bakery"]`]],
+      [/bar|pub|lounge|nightclub|brewery/,
+        [`nwr["amenity"="bar"]`, `nwr["amenity"="pub"]`, `nwr["amenity"="nightclub"]`, `nwr["craft"="brewery"]`]],
       [/salon|hair|barber|barbershop/,
         [`nwr["shop"="hairdresser"]`, `nwr["shop"="barber"]`, `nwr["amenity"="hairdresser"]`]],
-      [/beauty|spa|nail|wellness|massage|wax/,
-        [`nwr["shop"="beauty"]`, `nwr["leisure"="spa"]`, `nwr["shop"="massage"]`, `nwr["shop"="nail_salon"]`]],
-      [/dentist|dental/,
-        [`nwr["amenity"="dentist"]`, `nwr["healthcare"="dentist"]`]],
-      [/doctor|clinic|medical|health|gp\b|physician|hospital/,
-        [`nwr["amenity"="clinic"]`, `nwr["amenity"="doctors"]`, `nwr["amenity"="hospital"]`, `nwr["healthcare"]`]],
+      [/medspa|med.?spa|aesthetic|botox|laser|beauty|spa|nail|wellness|massage|wax|dermatol/,
+        [`nwr["shop"="beauty"]`, `nwr["leisure"="spa"]`, `nwr["shop"="massage"]`, `nwr["healthcare"="dermatologist"]`]],
+      [/dentist|dental|orthodont|implant/,
+        [`nwr["amenity"="dentist"]`, `nwr["healthcare"="dentist"]`, `nwr["healthcare"="orthodontist"]`]],
+      [/doctor|clinic|medical|health|gp\b|physician|hospital|urgent.?care|pediatr/,
+        [`nwr["amenity"="clinic"]`, `nwr["amenity"="doctors"]`, `nwr["healthcare"="clinic"]`, `nwr["healthcare"="doctor"]`]],
       [/pharmacy|chemist|drug/,
         [`nwr["amenity"="pharmacy"]`, `nwr["shop"="chemist"]`]],
       [/optician|optometrist|eye|vision/,
         [`nwr["shop"="optician"]`, `nwr["healthcare"="optometrist"]`]],
-      [/physiotherapy|chiro|chiropract/,
+      [/physiotherapy|chiro|chiropract|physical.?therap|rehab/,
         [`nwr["healthcare"="physiotherapist"]`, `nwr["healthcare"="chiropractor"]`]],
-      [/veterinar|vet\b|animal/,
-        [`nwr["amenity"="veterinary"]`, `nwr["shop"="pet"]`]],
-      [/gym|fitness|crossfit|yoga|pilates|martial|karate/,
-        [`nwr["leisure"="fitness_centre"]`, `nwr["leisure"="sports_centre"]`, `nwr["leisure"="yoga"]`, `nwr["sport"="yoga"]`]],
-      [/hotel|motel|lodg|hostel/,
-        [`nwr["tourism"="hotel"]`, `nwr["tourism"="motel"]`, `nwr["tourism"="hostel"]`, `nwr["tourism"="guest_house"]`]],
-      [/auto|car.?repair|mechanic|garage|tyre|tire/,
-        [`nwr["shop"="car_repair"]`, `nwr["shop"="tyres"]`, `nwr["amenity"="car_repair"]`]],
-      [/car.?dealer|car.?sale|car.?show/,
+      [/veterinar|vet\b|animal|pet|groom/,
+        [`nwr["amenity"="veterinary"]`, `nwr["shop"="pet"]`, `nwr["shop"="pet_grooming"]`]],
+      [/gym|fitness|crossfit|yoga|pilates|martial|karate|boxing|personal.?train/,
+        [`nwr["leisure"="fitness_centre"]`, `nwr["leisure"="sports_centre"]`, `nwr["sport"="fitness"]`, `nwr["sport"="yoga"]`]],
+      [/hotel|motel|lodg|hostel|resort/,
+        [`nwr["tourism"="hotel"]`, `nwr["tourism"="motel"]`, `nwr["tourism"="guest_house"]`]],
+      [/auto|car.?repair|mechanic|garage|tyre|tire|body.?shop|collision|detailing/,
+        [`nwr["shop"="car_repair"]`, `nwr["shop"="tyres"]`, `nwr["amenity"="car_repair"]`, `nwr["amenity"="car_wash"]`]],
+      [/car.?dealer|car.?sale|car.?show|dealership/,
         [`nwr["shop"="car"]`, `nwr["shop"="car_dealer"]`]],
-      [/car.?wash/, [`nwr["amenity"="car_wash"]`, `nwr["shop"="car_wash"]`]],
-      [/real.?estate|estate.?agent|property|mortgage|realtor/,
-        [`nwr["office"="estate_agent"]`, `nwr["office"="real_estate_agent"]`]],
-      [/lawyer|attorney|legal|solicitor/,
-        [`nwr["office"="lawyer"]`, `nwr["office"="solicitor"]`]],
-      [/accountant|accounting|cpa\b|bookkeeping/,
+      [/real.?estate|estate.?agent|property|mortgage|realtor|broker/,
+        [`nwr["office"="estate_agent"]`, `nwr["office"="property_management"]`, `nwr["office"="mortgage"]`]],
+      [/lawyer|attorney|legal|solicitor|law.?firm/,
+        [`nwr["office"="lawyer"]`, `nwr["office"="notary"]`]],
+      [/accountant|accounting|cpa\b|bookkeeping|tax/,
         [`nwr["office"="accountant"]`, `nwr["office"="tax_advisor"]`]],
       [/insurance/, [`nwr["office"="insurance"]`]],
-      [/consultant|consulting/, [`nwr["office"="consulting"]`, `nwr["office"="company"]`]],
+      [/marketing|agency|advertising|seo|web.?design|software|it.?service|consulting/,
+        [`nwr["office"="advertising_agency"]`, `nwr["office"="it"]`, `nwr["office"="consulting"]`, `nwr["office"="company"]`]],
       [/financial|finance|investment|wealth/,
-        [`nwr["office"="financial_advisor"]`, `nwr["amenity"="bank"]`]],
-      [/bakery|bread|pastry/, [`nwr["shop"="bakery"]`, `nwr["amenity"="bakery"]`]],
+        [`nwr["office"="financial"]`, `nwr["office"="financial_advisor"]`, `nwr["amenity"="bank"]`]],
       [/florist|flower/, [`nwr["shop"="florist"]`]],
-      [/grocery|supermarket|convenience/, [`nwr["shop"="supermarket"]`, `nwr["shop"="convenience"]`, `nwr["shop"="grocery"]`]],
-      [/clothing|fashion|boutique|tailor/,
-        [`nwr["shop"="clothes"]`, `nwr["shop"="fashion"]`, `nwr["shop"="tailor"]`]],
-      [/catering|event|wedding/, [`nwr["shop"="catering"]`, `nwr["amenity"="event_venue"]`]],
-      [/school|tutor|education/, [`nwr["amenity"="school"]`, `nwr["office"="educational_institution"]`]],
-      [/childcare|nursery|daycare/, [`nwr["amenity"="childcare"]`, `nwr["amenity"="kindergarten"]`]],
-      [/hotel|accommodation/, [`nwr["tourism"="hotel"]`, `nwr["tourism"="guest_house"]`]],
-      [/plumber|plumbing/, [`nwr["craft"="plumber"]`]],
-      [/electrician|electrical/, [`nwr["craft"="electrician"]`]],
-      [/tattoo/, [`nwr["shop"="tattoo"]`]],
-      [/photog|studio/, [`nwr["shop"="photo"]`, `nwr["leisure"="dance"]`]],
-      [/cleaning|laundry|dry.?clean/,
-        [`nwr["shop"="laundry"]`, `nwr["shop"="dry_cleaning"]`, `nwr["shop"="cleaning"]`]],
-      [/restaurant|cafe|bar|food|coffee/, [`nwr["amenity"~"^(restaurant|cafe|bar|pub|fast_food|food_court)$"]`]],
+      [/catering|event|wedding|photog|studio/,
+        [`nwr["craft"="caterer"]`, `nwr["craft"="photographer"]`, `nwr["shop"="photo"]`, `nwr["amenity"="events_venue"]`]],
+      [/school|tutor|education|childcare|nursery|daycare/,
+        [`nwr["amenity"="childcare"]`, `nwr["amenity"="kindergarten"]`, `nwr["amenity"="driving_school"]`, `nwr["amenity"="music_school"]`]],
     ];
 
-    // Collect all matching tag filters (may be multiple for broad categories)
     let tags: string[] = [];
     for (const [re, t] of tagMap) {
       if (re.test(cat)) { tags = t; break; }
     }
-    // Fallback: generic local business / shop
-    if (!tags.length) tags = [`nwr["shop"]`, `nwr["office"]`, `nwr["amenity"~"^(restaurant|cafe|bar|pub|shop)$"]`];
+    if (!tags.length) {
+      tags = [`nwr["craft"]`, `nwr["office"]`, `nwr["shop"]`];
+    }
 
-    // 3. Run one Overpass query per tag filter in parallel, then merge.
-    //    Each query uses nwr (node+way+relation) with a generous element limit.
-    const limit = Math.min(Math.max(count * 5, 300), 1000);
-    const overpassQueries = tags.slice(0, 4).map(tag =>
-      `[out:json][timeout:30];(${tag}(${south},${west},${north},${east}););out body ${limit};`
-    );
+    const limit = Math.min(Math.max(count * 5, 200), 500);
+    const unionBody = tags
+      .slice(0, 4)
+      .map(tag => `${tag}(${south},${west},${north},${east});`)
+      .join("");
+    const combinedQuery = `[out:json][timeout:6];(${unionBody});out center ${limit};`;
 
-    const overpassResults = await Promise.allSettled(
-      overpassQueries.map(q =>
+    const data = await queryOverpassWithFailover(combinedQuery, 5800);
+    const allElements: ScrapedBusiness[] = [];
+    if (data && Array.isArray(data.elements)) {
+      for (const el of data.elements) {
+        const t = el.tags ?? {};
+        const name = t.name || t["brand"];
+        if (!name || name.length < 2) continue;
+        const website = cleanWebsiteUrl(t.website ?? t["contact:website"] ?? t["url"] ?? "");
+        const phone   = t.phone ?? t["contact:phone"] ?? t["contact:mobile"] ?? t["telephone"] ?? "";
+        const email   = t.email ?? t["contact:email"] ?? "";
+        const address = [t["addr:housenumber"], t["addr:street"], t["addr:city"] || city].filter(Boolean).join(" ");
+        allElements.push({
+          businessName: String(name).trim(),
+          phone: String(phone).trim(),
+          website,
+          address,
+          city,
+          country,
+          category,
+          source: "openstreetmap",
+          email: String(email).trim(),
+        });
+      }
+    }
+
+    return dedup(allElements).slice(0, Math.max(count * 4, 80));
+  } catch {
+    return [];
+  }
+}
+
+// ─── SCRAPER 17: OpenStreetMap Nominatim Deep POI Search (Free, No Key/Card) ─
+
+async function scrapeOsmNominatimPlaces(
+  category: string,
+  city: string,
+  country: string,
+  count: number
+): Promise<ScrapedBusiness[]> {
+  try {
+    const queries = [
+      `${category} in ${city}, ${country}`,
+      `${category} ${city}`,
+    ];
+    const businesses: ScrapedBusiness[] = [];
+
+    const responses = await Promise.allSettled(
+      queries.map((q) =>
         Promise.race([
-          fetch("https://overpass-api.de/api/interpreter", {
-            method: "POST",
-            headers: { "Content-Type": "text/plain", "User-Agent": "DevStudio-BusinessHunter/1.0" },
-            body: q,
-          }),
-          new Promise<never>((_, rj) => setTimeout(() => rj(new Error("timeout")), 30000)),
+          fetch(
+            `https://nominatim.openstreetmap.org/search?format=jsonv2&extratags=1&addressdetails=1&namedetails=1&limit=40&q=${encodeURIComponent(
+              q
+            )}`,
+            {
+              headers: {
+                "User-Agent": "VanguardHunter-NominatimPOI/2.1 (contact via app)",
+                "Accept-Language": "en-US,en;q=0.9",
+              },
+            }
+          ),
+          new Promise<never>((_, rj) => setTimeout(() => rj(new Error("timeout")), 4800)),
         ]) as Promise<Response>
       )
     );
 
-    const allElements: ScrapedBusiness[] = [];
-    for (const r of overpassResults) {
+    for (const r of responses) {
       if (r.status !== "fulfilled" || !r.value.ok) continue;
-      try {
-        const data = await r.value.json() as { elements: Array<{ tags?: Record<string, string> }> };
-        for (const el of data.elements ?? []) {
-          const t = el.tags ?? {};
-          const name = t.name;
-          if (!name || name.length < 2) continue;
-          const website = t.website ?? t["contact:website"] ?? t["url"] ?? "";
-          const phone   = t.phone   ?? t["contact:phone"]   ?? t["contact:mobile"] ?? "";
-          const email   = t.email   ?? t["contact:email"]   ?? "";
-          const address = [t["addr:housenumber"], t["addr:street"], t["addr:city"]].filter(Boolean).join(" ");
-          allElements.push({ businessName: name, phone, website, address, city, country, category, source: "openstreetmap", email });
+      const items = (await r.value.json().catch(() => [])) as any[];
+      for (const item of items) {
+        if (!item || item.category === "boundary" || item.category === "place" || item.category === "highway") {
+          continue;
         }
-      } catch {}
+        const name =
+          item.name ||
+          item.namedetails?.name ||
+          (typeof item.display_name === "string" ? item.display_name.split(",")[0]?.trim() : "");
+        if (!name || name.length < 2 || name.toLowerCase() === city.toLowerCase()) continue;
+
+        const extra = item.extratags || {};
+        const phone =
+          extra.phone ||
+          extra["contact:phone"] ||
+          extra["contact:mobile"] ||
+          extra.telephone ||
+          "";
+        const rawWeb =
+          extra.website ||
+          extra["contact:website"] ||
+          extra.url ||
+          extra["contact:url"] ||
+          "";
+        const email = extra.email || extra["contact:email"] || "";
+        const addrObj = item.address || {};
+        const street = [addrObj.house_number, addrObj.road].filter(Boolean).join(" ");
+        const locality = addrObj.city || addrObj.town || addrObj.suburb || city;
+
+        businesses.push({
+          businessName: String(name).trim(),
+          phone: String(phone).trim(),
+          website: cleanWebsiteUrl(String(rawWeb)),
+          address: [street, locality].filter(Boolean).join(", "),
+          city,
+          country,
+          category,
+          source: "osm_places",
+          email: String(email).trim(),
+        });
+      }
     }
 
-    return dedup(allElements).slice(0, Math.max(count * 3, 45));
+    return dedup(businesses).slice(0, Math.max(count * 3, 60));
+  } catch {
+    return [];
+  }
+}
+
+// ─── SCRAPER 18: Photon Komoot OSM Global POI Search (Ultra-Fast <500ms) ─────
+
+async function scrapePhotonOsm(
+  category: string,
+  city: string,
+  country: string,
+  count: number
+): Promise<ScrapedBusiness[]> {
+  try {
+    const queries = [
+      `${category} ${city} ${country}`.trim(),
+      `${category} ${city}`.trim(),
+    ];
+    const businesses: ScrapedBusiness[] = [];
+
+    const responses = await Promise.allSettled(
+      queries.map((q) =>
+        Promise.race([
+          fetch(
+            `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=50&lang=en`,
+            {
+              headers: {
+                "User-Agent": "VanguardHunter-PhotonPOI/2.0",
+                "Accept": "application/json",
+              },
+            }
+          ),
+          new Promise<never>((_, rj) => setTimeout(() => rj(new Error("timeout")), 4000)),
+        ]) as Promise<Response>
+      )
+    );
+
+    const cityLower = city.toLowerCase().trim();
+    for (const r of responses) {
+      if (r.status !== "fulfilled" || !r.value.ok) continue;
+      const data = (await r.value.json().catch(() => ({}))) as { features?: any[] };
+      for (const feat of data.features || []) {
+        const p = feat?.properties;
+        if (!p || !p.name) continue;
+        if (p.osm_key === "boundary" || p.osm_key === "place" || p.osm_key === "highway") continue;
+        const name = String(p.name).trim();
+        if (name.length < 2 || name.toLowerCase() === cityLower) continue;
+
+        // Verify locality matches target city/state/country reasonably when city is specified
+        const propCity = String(p.city || p.town || p.county || p.state || p.district || "").toLowerCase();
+        if (propCity && cityLower && !propCity.includes(cityLower) && !cityLower.includes(propCity)) {
+          // Allow if country matches or if propCity wasn't strict
+          const propCountry = String(p.country || "").toLowerCase();
+          if (country && propCountry && !propCountry.includes(country.toLowerCase()) && !country.toLowerCase().includes(propCountry)) {
+            continue;
+          }
+        }
+
+        const extra = p.extra || {};
+        const phone = String(extra.phone || extra["contact:phone"] || p.phone || "").trim();
+        const website = cleanWebsiteUrl(String(extra.website || extra["contact:website"] || p.website || ""));
+        const email = String(extra.email || extra["contact:email"] || "").trim();
+        const address = [p.housenumber, p.street, p.city || city].filter(Boolean).join(" ");
+
+        businesses.push({
+          businessName: name,
+          phone,
+          website,
+          address,
+          city: p.city || city,
+          country: p.country || country,
+          category,
+          source: "photon_osm",
+          email,
+        });
+      }
+    }
+
+    return dedup(businesses).slice(0, Math.max(count * 3, 60));
   } catch {
     return [];
   }
@@ -1402,54 +2130,54 @@ export interface ScrapeResult {
   errors: Record<string, string>;
 }
 
-/**
- * Run all 8 directory scrapers in parallel, merge + deduplicate results,
- * then enrich each business with a real contact email scraped from its website.
- */
-/**
- * Run all 14 directory scrapers in parallel, merge + deduplicate results,
- * then enrich each business with a real contact email scraped from its website.
- *
- * Sources:
- *  1  Yelp              6  Yell.com (UK)      11 Thumbtack (US)
- *  2  Yellow Pages      7  Foursquare API*    12 Cylex (intl)
- *  3  Google GMB        8  Bing Local         13 SuperPages (US)
- *  4  Manta             9  TripAdvisor        14 Bark.com (global)
- *  5  Hotfrog          10  BBB (US/CA)        15 OpenStreetMap
- *                                             16 TomTom API*
- * * API-backed sources (key optional, huge volume when set)
- */
 export async function scrapeBusinessDirectories(
   category: string,
   city: string,
   country: string,
-  count: number
+  count: number,
+  preFilters?: string[]
 ): Promise<ScrapeResult> {
-  // No artificial cap — caller decides how many it wants
   const needed = count;
+  const activeFilters = Array.isArray(preFilters)
+    ? preFilters.map(f => String(f).trim().toLowerCase()).filter(f => f && f !== "all")
+    : [];
+  const onlyNoWebsite = activeFilters.length === 1 && activeFilters[0] === "no_website";
+  const preferNoWebsite = activeFilters.includes("no_website") && !activeFilters.includes("bad_website") && !activeFilters.includes("verified_email");
 
   const scrapers: Array<[string, () => Promise<ScrapedBusiness[]>]> = [
-    ["yelp",         () => scrapeYelp(category, city, country, needed)],
-    ["yellowpages",  () => scrapeYellowPages(category, city, country, needed)],
-    ["google",       () => scrapeGoogleLocal(category, city, country, needed)],
-    ["google_maps",  () => scrapeGoogleMaps(category, city, country, needed)],
-    ["manta",        () => scrapeManta(category, city, country, needed)],
-    ["hotfrog",      () => scrapeHotfrog(category, city, country, needed)],
-    ["yell",         () => scrapeYell(category, city, country, needed)],
-    ["foursquare",   () => scrapeFoursquare(category, city, country, needed)],
-    ["tomtom",       () => scrapeTomTom(category, city, country, needed)],
-    ["here",         () => scrapeHere(category, city, country, needed)],
-    ["bing",         () => scrapeBingLocal(category, city, country, needed)],
-    ["tripadvisor",  () => scrapeTripAdvisor(category, city, country, needed)],
-    ["bbb",          () => scrapeBBB(category, city, country, needed)],
-    ["thumbtack",    () => scrapeThumbtrack(category, city, country, needed)],
-    ["cylex",        () => scrapeCylex(category, city, country, needed)],
-    ["superpages",   () => scrapeSuperPages(category, city, country, needed)],
-    ["bark",         () => scrapeBark(category, city, country, needed)],
+    ["yellowpages",   () => scrapeYellowPages(category, city, country, needed)],
+    ["superpages",    () => scrapeSuperPages(category, city, country, needed)],
     ["openstreetmap", () => scrapeOpenStreetMap(category, city, country, needed)],
+    ["osm_places",    () => scrapeOsmNominatimPlaces(category, city, country, needed)],
+    ["photon_osm",    () => scrapePhotonOsm(category, city, country, needed)],
+    ["google_maps",   () => scrapeGoogleMaps(category, city, country, needed)],
+    ["google",        () => scrapeGoogleLocal(category, city, country, needed)],
+    ["foursquare",    () => scrapeFoursquare(category, city, country, needed)],
+    ["tomtom",        () => scrapeTomTom(category, city, country, needed)],
+    ["here",          () => scrapeHere(category, city, country, needed)],
+    ["yelp",          () => scrapeYelp(category, city, country, needed)],
+    ["manta",         () => scrapeManta(category, city, country, needed)],
+    ["hotfrog",       () => scrapeHotfrog(category, city, country, needed)],
+    ["yell",          () => scrapeYell(category, city, country, needed)],
+    ["bing",          () => scrapeBingLocal(category, city, country, needed)],
+    ["tripadvisor",   () => scrapeTripAdvisor(category, city, country, needed)],
+    ["bbb",           () => scrapeBBB(category, city, country, needed)],
+    ["thumbtack",     () => scrapeThumbtrack(category, city, country, needed)],
+    ["cylex",         () => scrapeCylex(category, city, country, needed)],
+    ["bark",          () => scrapeBark(category, city, country, needed)],
   ];
 
-  const settled = await Promise.allSettled(scrapers.map(([, fn]) => fn()));
+  // Hard 6.5s timeout per scraper so no slow directory can ever stall Step 1
+  const settled = await Promise.allSettled(
+    scrapers.map(([, fn]) =>
+      Promise.race([
+        fn(),
+        new Promise<ScrapedBusiness[]>((_, reject) =>
+          setTimeout(() => reject(new Error("scraper timeout")), 6500)
+        ),
+      ])
+    )
+  );
 
   const all: ScrapedBusiness[] = [];
   const sources: string[] = [];
@@ -1467,45 +2195,95 @@ export async function scrapeBusinessDirectories(
     }
   });
 
-  // Cross-source dedup by name, then also by email to avoid duplicate outreach
-  const nameDeduped = dedup(all);
+  // Cross-source dedup by name, preserving both website and no-website businesses
+  const nameDeduped = dedup(all, preferNoWebsite);
   const emailSeen = new Set<string>();
   const deduped = nameDeduped.filter(b => {
-    if (!b.email) return true; // keep — email will be found during enrichment
+    if (!b.email) return true;
     const key = b.email.toLowerCase();
     if (emailSeen.has(key)) return false;
     emailSeen.add(key);
     return true;
   });
 
-  // With 18 sources each contributing up to `needed` results, `deduped` can run
-  // to hundreds of entries even for a small request (e.g. count=10 × 18 sources
-  // ≈ up to 180 candidates before dedup shrinks it). Every one of those gets a
-  // real website fetch below, so scraping ALL of them for one city/category is
-  // what actually produces the "endless hunting" — cap the enrichment work to a
-  // generous multiple of what was asked for instead of the full candidate pool.
-  // Entries that already have an email from their source (no fetch needed) are
-  // prioritized first so we never do wasted network work to keep a business
-  // that would have been free.
-  const withEmail = deduped.filter(b => b.email);
-  const withoutEmailWithSite = deduped.filter(b => !b.email && b.website);
-  const enrichCap = Math.max(needed * 5, 60);
-  const toEnrich = withoutEmailWithSite.slice(0, Math.max(enrichCap - withEmail.length, 0));
-  const workingSet = [...withEmail, ...toEnrich];
+  // Step 2: Fast parallel website enrichment (skipped if user only wants "No Website" leads)
+  if (!onlyNoWebsite) {
+    const withEmail = deduped.filter(b => b.email && b.website);
+    const withoutEmailWithSite = deduped.filter(b => !b.email && b.website);
+    const enrichCap = Math.min(Math.max(needed, 20), 28);
+    const toEnrich = withoutEmailWithSite.slice(0, Math.max(enrichCap - withEmail.length, 0));
+    const workingSet = [...withEmail.slice(0, enrichCap), ...toEnrich].slice(0, enrichCap);
 
-  // Enrich with emails + AI-opportunity scan — 20 concurrent for speed
-  const CONCURRENCY = 20;
-  for (let i = 0; i < workingSet.length; i += CONCURRENCY) {
-    await Promise.all(
-      workingSet.slice(i, i + CONCURRENCY).map(async biz => {
-        if (biz.website) {
-          const result = await scrapeEmailFromSite(biz.website);
-          if (!biz.email && result.email) biz.email = result.email;
-          biz.aiOpportunityScore = result.aiOpportunityScore;
-          biz.aiOpportunityNote = result.aiOpportunityNote;
-        }
-      })
-    );
+    await Promise.race([
+      Promise.allSettled(
+        workingSet.map(async biz => {
+          if (biz.website) {
+            const result = await scrapeEmailFromSite(biz.website, biz.email, biz.phone);
+            if (!biz.email && result.email) biz.email = result.email;
+            biz.aiOpportunityScore = result.aiOpportunityScore;
+            biz.aiOpportunityNote = result.aiOpportunityNote;
+            biz.ownerName = result.ownerName || biz.ownerName || "";
+            biz.ownerRole = result.ownerRole || biz.ownerRole || "";
+            biz.linkedin = result.linkedin || "";
+            biz.facebook = result.facebook || "";
+            biz.instagram = result.instagram || "";
+            biz.cmsPlatform = result.cmsPlatform || "Custom HTML";
+            biz.techStack = result.techStack || [];
+            biz.missingSignals = result.missingSignals || [];
+            biz.emailType = result.emailType || "unknown";
+            biz.executiveEmails = result.executiveEmails || [];
+            biz.intentScore = result.intentScore ?? 60;
+            biz.intentTier = result.intentTier || "warm";
+            biz.intentReasons = result.intentReasons || [];
+          }
+        })
+      ),
+      new Promise<void>(resolve => setTimeout(resolve, 4500)),
+    ]);
+  }
+
+  // Step 3: Ensure every business has decision-maker extraction (from business name/email if not on site) & deterministic Apollo signals
+  for (const biz of deduped) {
+    if (!biz.ownerName) {
+      const dmFromName = extractDecisionMakerFromBusinessName(biz.businessName, biz.email);
+      if (dmFromName.ownerName) {
+        biz.ownerName = dmFromName.ownerName;
+        biz.ownerRole = dmFromName.ownerRole;
+      }
+    }
+    if (biz.intentScore === undefined) {
+      const noSiteTech = detectTechStackFromHtml(biz.website ? "<html></html>" : "", biz.website);
+      const emailMeta = classifyEmailAndPermutations(biz.email, biz.ownerName || "", biz.website);
+      const intent = computeApolloIntentScore({
+        email: biz.email,
+        emailType: emailMeta.emailType,
+        phone: biz.phone,
+        website: biz.website,
+        ownerName: biz.ownerName,
+        linkedin: biz.linkedin,
+        cmsPlatform: biz.website ? "Custom HTML" : "No Website",
+        techStack: noSiteTech.techStack,
+        missingSignals: noSiteTech.missingSignals,
+      });
+      biz.cmsPlatform = biz.website ? "Custom HTML" : "No Website";
+      biz.techStack = noSiteTech.techStack;
+      biz.missingSignals = noSiteTech.missingSignals;
+      biz.emailType = emailMeta.emailType;
+      biz.executiveEmails = emailMeta.executiveEmails;
+      biz.intentScore = intent.intentScore;
+      biz.intentTier = intent.intentTier;
+      biz.intentReasons = intent.intentReasons;
+      if (!biz.aiOpportunityScore) {
+        biz.aiOpportunityScore = biz.website ? 6 : 9;
+        biz.aiOpportunityNote = biz.website
+          ? "Website lacking automated AI chat & instant booking — prime candidate for conversion upgrade."
+          : "No website listed — prime candidate for instant AI 4-Tap Website + Review Shield.";
+      }
+    } else if (biz.ownerName && (!biz.executiveEmails || biz.executiveEmails.length === 0)) {
+      const emailMeta = classifyEmailAndPermutations(biz.email, biz.ownerName, biz.website);
+      biz.emailType = emailMeta.emailType;
+      biz.executiveEmails = emailMeta.executiveEmails;
+    }
   }
 
   // Final dedup by email after enrichment (multiple businesses may share a domain)

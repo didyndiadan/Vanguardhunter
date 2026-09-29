@@ -16,10 +16,19 @@ import { getGeminiAI } from "./api-keys";
 import { getAgencyBaseUrl } from "./reports";
 import { sendMail } from "../lib/brevo-mailer";
 import {
+  ensureSiteWalkthroughAudioReady,
+  getCachedSiteWalkthroughWav,
+  prewarmSiteWalkthroughVoice,
+} from "./crm-ai";
+import {
   scrapeBusinessWebsiteIntel,
   buildAccurateBusinessBlueprint,
   synthesizeWebsiteWithAI,
   exportStandaloneHtmlBundle,
+  assignUniqueOfferingImageTypes,
+  regenerateWebsiteShowcaseImages,
+  buildIntelligentSmartModules,
+  generateAiBlogPostForWebsite,
 } from "../lib/website-intelligence";
 
 const router = Router();
@@ -27,6 +36,54 @@ const router = Router();
 const OWNER_EMAIL = "jwandersonar@gmail.com";
 const ACCESS_CONFIG_KEY = "WEBSITE_BUILDER_ACCESS_CONFIG";
 const PAYMENT_CONFIG_KEY = "WEBSITE_BUILDER_PAYMENT_CONFIG";
+
+// ─── High-Scale Concurrency Limiter & Bounded Queue Protection ───────────────
+// Protects Node.js event loop, outbound sockets, and Gemini API quotas when
+// thousands of users generate websites simultaneously. If concurrent AI jobs
+// exceed MAX_CONCURRENT_AI_BUILDS, requests wait up to AI_QUEUE_WAIT_TIMEOUT_MS
+// and then seamlessly fall back to the deterministic <5ms blueprint engine.
+const MAX_CONCURRENT_AI_BUILDS = 25;
+const AI_QUEUE_WAIT_TIMEOUT_MS = 6000;
+let activeAiBuilds = 0;
+const waitingResolvers: Array<(acquired: boolean) => void> = [];
+
+function acquireAiBuildSlot(): Promise<boolean> {
+  if (activeAiBuilds < MAX_CONCURRENT_AI_BUILDS) {
+    activeAiBuilds++;
+    return Promise.resolve(true);
+  }
+  if (waitingResolvers.length >= 250) {
+    // Queue saturated under extreme burst — use instant deterministic engine immediately
+    return Promise.resolve(false);
+  }
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const idx = waitingResolvers.indexOf(onRelease);
+      if (idx !== -1) waitingResolvers.splice(idx, 1);
+      resolve(false);
+    }, AI_QUEUE_WAIT_TIMEOUT_MS);
+
+    const onRelease = (acquired: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(acquired);
+    };
+    waitingResolvers.push(onRelease);
+  });
+}
+
+function releaseAiBuildSlot(): void {
+  const next = waitingResolvers.shift();
+  if (next) {
+    next(true);
+  } else {
+    activeAiBuilds = Math.max(0, activeAiBuilds - 1);
+  }
+}
 
 export interface WebsitePaymentConfig {
   autoSendInvoiceOnClaim: boolean;
@@ -133,6 +190,8 @@ export function buildClaimedPaymentEmail(params: {
   ownerName?: string;
   siteUrl: string;
   selectedPlan: string;
+  billingMonths?: number;
+  dueTodayOverride?: number;
   selectedAddons: string[];
   monthlyTotal: number;
   oneTimeTotal: number;
@@ -142,19 +201,24 @@ export function buildClaimedPaymentEmail(params: {
     params.ownerName && !/unknown|owner|manager|n\/a/i.test(params.ownerName)
       ? params.ownerName.split(" ")[0]
       : `${params.businessName} Team`;
-  const dueToday = params.monthlyTotal + params.oneTimeTotal;
+  const months = params.billingMonths === 3 || params.billingMonths === 12 ? params.billingMonths : 1;
+  const dueToday =
+    typeof params.dueTodayOverride === "number" && params.dueTodayOverride > 0
+      ? params.dueTodayOverride
+      : params.monthlyTotal * months + params.oneTimeTotal;
   const pCfg = params.paymentConfig;
   const lemonUrl =
-    params.monthlyTotal === 49
+    (pCfg as any).lemonCheckoutUrl ||
+    (params.monthlyTotal === 49
       ? pCfg.lemonCheckoutUrl49 || pCfg.lemonCustomPaymentUrl
-      : pCfg.lemonCheckoutUrl97 || pCfg.lemonCustomPaymentUrl;
+      : pCfg.lemonCheckoutUrl97 || pCfg.lemonCustomPaymentUrl);
 
   const addonsText =
     params.selectedAddons && params.selectedAddons.length > 0
       ? params.selectedAddons.map((a) => `  • ${a}`).join("\n")
       : "  • None selected (Can be enabled anytime in your Admin Panel)";
 
-  const subject = `Website Reserved for ${params.businessName} — Payment & Domain Activation Options`;
+  const subject = `Website Reserved for ${params.businessName} (${months}-Month Hosting Plan) — Payment & Activation Options`;
 
   const body = `Hi ${firstName},
 
@@ -162,61 +226,53 @@ Congratulations! Your custom website and 4-Tap Instant Estimate Funnel for ${par
 
 YOUR ACTIVATION SUMMARY:
 • Custom Website & 4-Tap Lead Funnel Build: FREE ($0 Setup — $1,500 Value Waived)
-• Selected Hosting & Care Plan: ${params.selectedPlan}
+• Selected Hosting & Care Package: ${params.selectedPlan}
+• Billing Duration: ${months === 1 ? "1 Month (Monthly Plan)" : `${months} Months Prepaid Package (${months === 12 ? "20% Discount + Free Domain Renewal" : "10% Quarterly Discount"})`}
 • Selected Growth Add-Ons:
 ${addonsText}
-• Total Due Today to Activate Live Domain & Hosting: $${dueToday} ($${params.monthlyTotal}/mo${
-    params.oneTimeTotal > 0 ? ` + $${params.oneTimeTotal} one-time add-on` : ""
-  })
-
-Live Website Preview Link:
-${params.siteUrl}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HOW TO COMPLETE YOUR ACTIVATION (CHOOSE ANY 1 OF 3 METHODS):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1) PAY BY CREDIT / DEBIT CARD (Lemon Squeezy Instant Checkout):
-   Click here to complete your secure card checkout:
-   ${lemonUrl}
-
-2) PAY BY BANK TRANSFER / WIRE / ZELLE:
-   • Bank Name: ${pCfg.bankName}
-   • Account Holder: ${pCfg.accountHolderName}
-   • Account Number: ${pCfg.accountNumber}
-   • Routing / SWIFT: ${pCfg.routingOrSwift}
-   • Zelle / IBAN / Billing Email: ${pCfg.ibanOrZelle}
-   • Reference Note: ${params.businessName} (${params.siteUrl.split("/").pop()})
-
-3) PAY BY CRYPTO (Instant Stablecoin or Crypto Settlement):
-   • USDT (TRC-20 / TRON): ${pCfg.wallets.usdt_trc20}
-   • USDT (ERC-20 / Ethereum): ${pCfg.wallets.usdt_erc20}
-   • USDC (Base / Polygon): ${pCfg.wallets.usdc_base}
-   • Bitcoin (BTC): ${pCfg.wallets.btc}
-   • Solana (SOL): ${pCfg.wallets.sol}
-
-As soon as your payment is completed (or reply to this email with your transfer confirmation/receipt), we will connect your custom domain, activate your SSL certificate, and send you your 4-digit Owner Admin CMS PIN within 24 hours.
-
-Best regards,
-Website Activation & Hosting Team`;
+• Total Due Today to Activate Live Domain & Hosting: $${dueToday} USD` +
+    `\n\nLive Website Preview Link:\n${params.siteUrl}` +
+    `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nHOW TO COMPLETE YOUR ACTIVATION (CHOOSE ANY 1 OF 3 METHODS):\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `1) PAY BY CREDIT / DEBIT CARD (Lemon Squeezy Instant Checkout):\n   Click here to complete your secure card checkout ($${dueToday}):\n   ${lemonUrl}\n\n` +
+    `2) PAY BY BANK TRANSFER / WIRE / ZELLE:\n   • Bank Name: ${pCfg.bankName}\n   • Account Holder: ${(pCfg as any).bankAccountName || pCfg.accountHolderName}\n   • Account Number: ${(pCfg as any).bankAccountNumber || pCfg.accountNumber}\n   • Routing / SWIFT: ${(pCfg as any).bankRoutingNumber || pCfg.routingOrSwift}\n   • Zelle / IBAN / Billing Email: ${(pCfg as any).zelleOrFasterPay || pCfg.ibanOrZelle}\n   • Reference Note: ${params.businessName} (${months}M Hosting)\n\n` +
+    `3) PAY BY CRYPTO (Instant Stablecoin or Crypto Settlement — $${dueToday} USD):\n   • USDT (TRC-20 / TRON): ${pCfg.wallets.usdt_trc20}\n   • USDT (ERC-20 / Ethereum): ${pCfg.wallets.usdt_erc20}\n   • USDC (Base / Polygon): ${pCfg.wallets.usdc_base}\n   • Bitcoin (BTC): ${pCfg.wallets.btc}\n   • Solana (SOL): ${pCfg.wallets.sol}\n\n` +
+    `As soon as your payment is completed (or reply to this email with your transfer confirmation/receipt), we will connect your custom domain, activate your SSL certificate, and send you your 4-digit Owner Admin CMS PIN within 24 hours.\n\nBest regards,\nWebsite Activation & Hosting Team`;
 
   return { subject, body, dueToday, lemonUrl };
 }
 
+export interface PlanWebsiteQuotas {
+  starter: number;
+  growth: number;
+  scale: number;
+  enterprise: number;
+}
+
 export interface BuilderAccessConfig {
-  mode: "owner_only" | "selected_users" | "all_users";
+  mode: "owner_only" | "high_level_plans" | "selected_users" | "all_users";
   ownerEmail: string;
   allowedUserEmails: string[];
+  allowedPlanIds?: string[];
+  planQuotas: PlanWebsiteQuotas;
   autoDetectNoWebsite: boolean;
   autoDetectBadWebsite: boolean;
   badWebsiteScoreThreshold: number;
   updatedAt: string;
 }
 
+const DEFAULT_PLAN_QUOTAS: PlanWebsiteQuotas = {
+  starter: 250,
+  growth: 500,
+  scale: 1000,
+  enterprise: 999999,
+};
+
 const DEFAULT_ACCESS_CONFIG: BuilderAccessConfig = {
-  mode: "owner_only",
+  mode: "all_users",
   ownerEmail: OWNER_EMAIL,
   allowedUserEmails: [OWNER_EMAIL, "admin@vanguardhunter.io"],
+  allowedPlanIds: ["starter", "growth", "scale", "enterprise"],
+  planQuotas: DEFAULT_PLAN_QUOTAS,
   autoDetectNoWebsite: true,
   autoDetectBadWebsite: true,
   badWebsiteScoreThreshold: 65,
@@ -232,14 +288,72 @@ async function getBuilderAccessConfig(): Promise<BuilderAccessConfig> {
       .limit(1);
     if (rows.length > 0 && rows[0].value) {
       const parsed = JSON.parse(rows[0].value);
-      return {
+      // Auto-upgrade legacy config that didn't have planQuotas yet to "all_users" with tiered plan limits
+      const migratedMode = !parsed.planQuotas && parsed.mode === "high_level_plans"
+        ? "all_users"
+        : parsed.mode || DEFAULT_ACCESS_CONFIG.mode;
+      const merged: BuilderAccessConfig = {
         ...DEFAULT_ACCESS_CONFIG,
         ...parsed,
+        mode: migratedMode,
+        planQuotas: {
+          ...DEFAULT_PLAN_QUOTAS,
+          ...(parsed.planQuotas || {}),
+        },
         ownerEmail: OWNER_EMAIL,
       };
+      if (!parsed.planQuotas) {
+        await saveBuilderAccessConfig(merged).catch(() => {});
+      }
+      return merged;
     }
   } catch {}
   return DEFAULT_ACCESS_CONFIG;
+}
+
+export async function getCallerWebsiteQuota(params: {
+  email: string;
+  planId: string;
+  isOwner: boolean;
+  config: BuilderAccessConfig;
+}): Promise<{
+  used: number;
+  limit: number;
+  remaining: number;
+  unlimited: boolean;
+  planId: string;
+}> {
+  const cleanPlan = (params.planId || "starter").toLowerCase();
+  const quotas = params.config.planQuotas || DEFAULT_PLAN_QUOTAS;
+  const rawLimit = params.isOwner
+    ? 999999
+    : cleanPlan === "enterprise"
+    ? Math.max(999999, Number(quotas.enterprise ?? 999999))
+    : cleanPlan === "scale"
+    ? Math.max(1000, Number(quotas.scale ?? 1000))
+    : cleanPlan === "growth"
+    ? Math.max(500, Number(quotas.growth ?? 500))
+    : Math.max(250, Number(quotas.starter ?? 250));
+
+  let used = 0;
+  if (params.email) {
+    try {
+      const rows = await db
+        .select({ siteId: generatedWebsitesTable.siteId })
+        .from(generatedWebsitesTable)
+        .where(eq(generatedWebsitesTable.createdByEmail, params.email));
+      used = rows.filter((r) => r.siteId !== "valley-construction-sacramento").length;
+    } catch {}
+  }
+
+  const unlimited = params.isOwner || rawLimit >= 99999;
+  return {
+    used,
+    limit: rawLimit,
+    remaining: unlimited ? 999999 : Math.max(0, rawLimit - used),
+    unlimited,
+    planId: params.isOwner ? "enterprise" : cleanPlan,
+  };
 }
 
 async function saveBuilderAccessConfig(cfg: BuilderAccessConfig): Promise<void> {
@@ -264,23 +378,17 @@ async function saveBuilderAccessConfig(cfg: BuilderAccessConfig): Promise<void> 
 }
 
 async function resolveCallerUser(req: Request): Promise<{
+  userId?: number;
   email: string;
   role: string;
   isOwner: boolean;
   fullName: string;
+  planId: string;
+  subscriptionStatus: string;
 } | null> {
   const auth = req.headers.authorization || "";
   const token = auth.replace(/^Bearer\s+/i, "").trim();
   const adminHeader = String(req.headers["x-admin-token"] || "").trim();
-
-  if (token === "admin123" || token === "admin_owner_token" || adminHeader === "admin123") {
-    return {
-      email: OWNER_EMAIL,
-      role: "admin",
-      isOwner: true,
-      fullName: "Platform Owner",
-    };
-  }
 
   if (token) {
     const rows = await db
@@ -296,12 +404,26 @@ async function resolveCallerUser(req: Request): Promise<{
         emailLower === "admin@vanguardhunter.io" ||
         u.role === "admin";
       return {
+        userId: u.id,
         email: emailLower,
         role: isOwner ? "admin" : u.role,
         isOwner,
         fullName: u.fullName || "User",
+        planId: (u.planId || "starter").toLowerCase(),
+        subscriptionStatus: (u.subscriptionStatus || "active").toLowerCase(),
       };
     }
+  }
+
+  if (token === "admin123" || token === "admin_owner_token" || adminHeader === "admin123") {
+    return {
+      email: OWNER_EMAIL,
+      role: "admin",
+      isOwner: true,
+      fullName: "Platform Owner",
+      planId: "enterprise",
+      subscriptionStatus: "active",
+    };
   }
 
   return null;
@@ -310,32 +432,47 @@ async function resolveCallerUser(req: Request): Promise<{
 async function isCallerAllowedBuilder(req: Request): Promise<{
   allowed: boolean;
   isOwner: boolean;
+  userId?: number;
   email: string;
+  planId: string;
   config: BuilderAccessConfig;
 }> {
   const config = await getBuilderAccessConfig();
   const caller = await resolveCallerUser(req);
 
   if (!caller) {
-    return { allowed: false, isOwner: false, email: "", config };
+    return { allowed: false, isOwner: false, email: "", planId: "starter", config };
   }
 
   if (caller.isOwner || caller.email === OWNER_EMAIL) {
-    return { allowed: true, isOwner: true, email: caller.email, config };
+    return { allowed: true, isOwner: true, userId: caller.userId, email: caller.email, planId: caller.planId, config };
   }
 
   if (config.mode === "all_users") {
-    return { allowed: true, isOwner: false, email: caller.email, config };
+    return { allowed: true, isOwner: false, userId: caller.userId, email: caller.email, planId: caller.planId, config };
   }
 
-  if (config.mode === "selected_users") {
-    const whitelisted = (config.allowedUserEmails || []).map((e) => e.trim().toLowerCase());
-    if (whitelisted.includes(caller.email)) {
-      return { allowed: true, isOwner: false, email: caller.email, config };
+  const whitelisted = (config.allowedUserEmails || []).map((e) => e.trim().toLowerCase());
+
+  if (config.mode === "high_level_plans") {
+    const highLevelPlans = config.allowedPlanIds && config.allowedPlanIds.length > 0
+      ? config.allowedPlanIds.map((p) => p.toLowerCase())
+      : ["scale", "enterprise"];
+    if (
+      (highLevelPlans.includes(caller.planId) && caller.subscriptionStatus === "active") ||
+      whitelisted.includes(caller.email)
+    ) {
+      return { allowed: true, isOwner: false, userId: caller.userId, email: caller.email, planId: caller.planId, config };
     }
   }
 
-  return { allowed: false, isOwner: false, email: caller.email, config };
+  if (config.mode === "selected_users") {
+    if (whitelisted.includes(caller.email)) {
+      return { allowed: true, isOwner: false, userId: caller.userId, email: caller.email, planId: caller.planId, config };
+    }
+  }
+
+  return { allowed: false, isOwner: false, userId: caller.userId, email: caller.email, planId: caller.planId, config };
 }
 
 // ─── Industry Preset Generator (Valley Construction Signature + All Trades) ──
@@ -631,6 +768,20 @@ export function buildIndustrySiteBlueprint(params: {
         a: `We serve ${areas.join(", ")}, and surrounding neighborhoods within 35 miles of ${city}.`,
       },
     ],
+    chatbotConfig: {
+      enabled: true,
+      soundEnabled: true,
+      autoOpenDelayMs: 800,
+      agentName: `${biz} Team`,
+      greeting: `👋 Hi there! Welcome to ${biz} in ${city}. How can we help you with your ${cat.toLowerCase()} needs today?`,
+      firstQuestion:
+        funnelStep1Options[0]
+          ? `Which ${cat.toLowerCase()} service can ${biz} help you with today?`
+          : `What can ${biz} help you with today?`,
+      followUpQuestion: "When are you looking to get started?",
+      priorityQuestion: "What matters most to you for this project?",
+      quickOptions: funnelStep1Options,
+    },
     transformationSummary: {
       detectionStatus: params.detectionStatus,
       originalWebsite: params.originalWebsite || "None (No Website Listed)",
@@ -651,26 +802,27 @@ export function buildIndustrySiteBlueprint(params: {
           impact: "3.8x higher visitor-to-lead conversion rate",
         },
         {
-          title: "2. Above-the-Fold Click-to-Call & Trust Header",
+          title: "2. Built-In Automated Website Chatbot (With Arrival Sound Chime & Guided Questions)",
+          before: "No live assistant on the website — visitors leave within seconds when their questions aren't answered.",
+          after: `Automated bottom-right chatbot built directly into ${biz}'s website that chimes when visitors arrive, asks interactive questions about their ${cat.toLowerCase()} needs, and captures their phone/email automatically.`,
+          impact: "+48% more after-hours & mobile visitor conversations converted into leads",
+        },
+        {
+          title: "3. Above-the-Fold Click-to-Call & Trust Header",
           before: "Buried phone number and no operating hours reassurance.",
           after: `Direct 1-tap phone action (${phone}) + live '${city} Mon–Sat 8am–8pm Free Estimates' announcement bar.`,
           impact: "+64% more direct inbound phone calls from mobile users",
         },
         {
-          title: "3. 'A Schedule You Can See' Transparent Process Architecture",
+          title: "4. 'A Schedule You Can See' Transparent Process & Local SEO",
           before: "Generic claims like 'Quality Service' that look identical to every competitor.",
-          after: "Concrete 4-step visual timeline showing Walkthrough → Material Lock → Daily Photo Updates → Final Inspection.",
-          impact: "Eliminates #1 buyer fear (contractor delays) before they even call",
-        },
-        {
-          title: `4. Hyper-Local ${city} & Suburb SEO Authority`,
-          before: `Missing neighborhood targeting for ${areas.slice(1, 4).join(", ")}.`,
-          after: `Dedicated local territory signals for ${areas.join(", ")} built into headings and schema.`,
-          impact: "Captures high-ticket suburban searches around " + city,
+          after: `Concrete 4-step visual timeline and dedicated local territory signals for ${areas.join(", ")}.`,
+          impact: "Eliminates buyer fear and captures high-ticket searches around " + city,
         },
       ],
       ownerBenefits: [
         `Custom-built specifically for ${biz} in ${city} — ready to go live on your domain today`,
+        "Built-in Automated Website Chatbot at the bottom of the site with arrival sound chime & visitor question flow",
         "Pre-wired 4-Tap Instant Estimate Funnel that texts/emails you new leads immediately",
         "100% mobile-optimized with zero slow plugins or bloated templates",
         "Full ownership & white-glove domain connection included when you claim this site",
@@ -722,8 +874,9 @@ ${params.siteUrl}
 
 Here is what is already built and ready for ${params.businessName}:
 • Custom 4-Tap Lead & Booking Funnel${servicesLine} — replaces long contact forms so customers in ${params.city} select the exact service they need and send their phone number in 12 seconds.
+• Built-In Automated Website Chatbot (Bottom of Site) — automatically greets every visitor with a sound notification chime, asks interactive questions about their ${params.category.toLowerCase()} needs, and captures leads 24/7.
 • Transparent 4-Step Customer Process & Service Showcase matched to your ${params.category.toLowerCase()} offerings.
-• Built-In Owner Admin Panel — edit your text, swap photos, or update your logo anytime.
+• Built-In Owner Admin Panel — edit your text, swap photos, customize your chatbot, or update your logo anytime.
 
 Click the link above to test your live website. If you want to keep it, click "Claim Free Website ($0 Build)" at the top of the preview page—you only cover your simple monthly hosting & care plan (and any optional growth add-ons like custom logo design or 24/7 AI receptionist you choose).
 
@@ -818,6 +971,12 @@ async function ensureFlagshipSeedSite(baseUrl: string) {
         createdByEmail: OWNER_EMAIL,
       });
     }
+    void prewarmSiteWalkthroughVoice({
+      businessName: "Valley Construction and Renovation",
+      ownerName: "Marcus Vance",
+      city: "Sacramento",
+      siteConfig: blueprint,
+    });
   } catch (err) {
     console.error("[website-builder] Failed to seed flagship site:", err);
   }
@@ -828,10 +987,18 @@ async function ensureFlagshipSeedSite(baseUrl: string) {
 router.get("/website-builder/access", async (req: Request, res: Response) => {
   try {
     const check = await isCallerAllowedBuilder(req);
+    const quota = await getCallerWebsiteQuota({
+      email: check.email,
+      planId: check.planId,
+      isOwner: check.isOwner,
+      config: check.config,
+    });
     res.json({
       allowed: check.allowed,
       isOwner: check.isOwner,
       callerEmail: check.email,
+      callerPlanId: check.planId,
+      quota,
       config: check.config,
     });
   } catch (err: any) {
@@ -852,6 +1019,8 @@ router.put("/website-builder/access", async (req: Request, res: Response) => {
     const {
       mode,
       allowedUserEmails,
+      allowedPlanIds,
+      planQuotas,
       autoDetectNoWebsite,
       autoDetectBadWebsite,
       badWebsiteScoreThreshold,
@@ -860,8 +1029,21 @@ router.put("/website-builder/access", async (req: Request, res: Response) => {
     const current = await getBuilderAccessConfig();
     const updated: BuilderAccessConfig = {
       ...current,
-      ...(mode && ["owner_only", "selected_users", "all_users"].includes(mode) ? { mode } : {}),
+      ...(mode && ["owner_only", "high_level_plans", "selected_users", "all_users"].includes(mode)
+        ? { mode }
+        : {}),
       ...(Array.isArray(allowedUserEmails) ? { allowedUserEmails } : {}),
+      ...(Array.isArray(allowedPlanIds) ? { allowedPlanIds } : {}),
+      ...(planQuotas && typeof planQuotas === "object"
+        ? {
+            planQuotas: {
+              starter: Math.max(0, Number(planQuotas.starter ?? current.planQuotas?.starter ?? 3)),
+              growth: Math.max(0, Number(planQuotas.growth ?? current.planQuotas?.growth ?? 15)),
+              scale: Math.max(0, Number(planQuotas.scale ?? current.planQuotas?.scale ?? 100)),
+              enterprise: Math.max(1, Number(planQuotas.enterprise ?? current.planQuotas?.enterprise ?? 999999)),
+            },
+          }
+        : {}),
       ...(typeof autoDetectNoWebsite === "boolean" ? { autoDetectNoWebsite } : {}),
       ...(typeof autoDetectBadWebsite === "boolean" ? { autoDetectBadWebsite } : {}),
       ...(typeof badWebsiteScoreThreshold === "number" ? { badWebsiteScoreThreshold } : {}),
@@ -879,7 +1061,7 @@ router.put("/website-builder/access", async (req: Request, res: Response) => {
       details:
         updated.mode === "owner_only"
           ? `Strictly locked to ${OWNER_EMAIL} only (Disabled for all SaaS users)`
-          : `Access mode set to ${updated.mode}`,
+          : `Access mode: ${updated.mode} · Quotas: Starter=${updated.planQuotas.starter}, Growth=${updated.planQuotas.growth}, Scale=${updated.planQuotas.scale}`,
     });
 
     res.json({ success: true, config: updated });
@@ -925,13 +1107,35 @@ router.get("/website-builder/candidates", async (req: Request, res: Response) =>
       return;
     }
 
-    const prospects = await db
+    const allProspects = await db
       .select()
       .from(crmProspectsTable)
       .orderBy(desc(crmProspectsTable.createdAt))
-      .limit(200);
+      .limit(400);
 
-    const existingSites = await db.select().from(generatedWebsitesTable);
+    const prospects = allProspects.filter((p) => {
+      const payload = (p.payload || {}) as any;
+      if (payload.ownerUserId !== undefined && payload.ownerUserId !== null) {
+        return check.userId !== undefined && Number(payload.ownerUserId) === check.userId;
+      }
+      if (/^u\d+_/.test(String(p.id))) {
+        return check.userId !== undefined && String(p.id).startsWith(`u${check.userId}_`);
+      }
+      return check.isOwner;
+    });
+
+    const existingSites = check.isOwner
+      ? await db
+          .select()
+          .from(generatedWebsitesTable)
+          .orderBy(desc(generatedWebsitesTable.createdAt))
+          .limit(300)
+      : await db
+          .select()
+          .from(generatedWebsitesTable)
+          .where(eq(generatedWebsitesTable.createdByEmail, check.email))
+          .orderBy(desc(generatedWebsitesTable.createdAt))
+          .limit(300);
     const byBizName = new Map(
       existingSites.map((s) => [s.businessName.trim().toLowerCase(), s])
     );
@@ -1006,19 +1210,195 @@ router.get("/website-builder/sites", async (req: Request, res: Response) => {
     }
 
     const baseUrl = getAgencyBaseUrl(req);
-    await ensureFlagshipSeedSite(baseUrl);
+    if (check.isOwner) {
+      await ensureFlagshipSeedSite(baseUrl);
+    }
 
-    const sites = await db
-      .select()
-      .from(generatedWebsitesTable)
-      .orderBy(desc(generatedWebsitesTable.createdAt))
-      .limit(200);
+    const sites = check.isOwner
+      ? (
+          await db
+            .select()
+            .from(generatedWebsitesTable)
+            .orderBy(desc(generatedWebsitesTable.createdAt))
+            .limit(200)
+        ).filter((s) => {
+          const siteOwner = String(s.createdByEmail || "").trim().toLowerCase();
+          return !siteOwner || siteOwner === check.email || siteOwner === OWNER_EMAIL;
+        })
+      : await db
+          .select()
+          .from(generatedWebsitesTable)
+          .where(eq(generatedWebsitesTable.createdByEmail, check.email))
+          .orderBy(desc(generatedWebsitesTable.createdAt))
+          .limit(200);
+
+    // Auto-upgrade any existing site across ALL workflows/industries to visualEngineVersion 5 so every business gets 100% unique, non-overlapping images
+    const globalUsedUrlsAcrossSites = new Set<string>();
+    const upgradedSites: typeof sites = [];
+    for (let siteIdx = 0; siteIdx < sites.length; siteIdx++) {
+      let s = sites[siteIdx];
+      const cfg = (s.siteConfig || {}) as any;
+      const existingWork = Array.isArray(cfg.finishedWork) ? cfg.finishedWork : [];
+      const hasDuplicateOrMissingUrls =
+        existingWork.length < 3 ||
+        existingWork.some(
+          (fw: any) =>
+            !fw?.customImageUrl ||
+            globalUsedUrlsAcrossSites.has(String(fw.customImageUrl).trim())
+        );
+
+      if (
+        (cfg.visualEngineVersion !== 5 || hasDuplicateOrMissingUrls) &&
+        s.siteId !== "valley-construction-sacramento"
+      ) {
+        try {
+          const bpParams = {
+            businessName: s.businessName,
+            ownerName: s.ownerName || "",
+            category: s.category || "Local Services",
+            city: s.city || "Sacramento",
+            country: s.country || "USA",
+            phone: s.phone || "(916) 291-1047",
+            email: s.email || "",
+            originalWebsite: s.originalWebsite || "",
+            detectionStatus: (s.detectionStatus as any) || "bad_website",
+            originalScore: s.originalScore || 38,
+            scrapedIntel: null,
+            imageVariationSeed: Number(cfg.imageVariationSeed ?? siteIdx),
+            avoidUrls: globalUsedUrlsAcrossSites,
+          };
+          const freshBlueprint = buildAccurateBusinessBlueprint(bpParams);
+          const rawMergedWork = freshBlueprint.finishedWork.map((fw: any, idx: number) => {
+            const prevUrl = String(cfg.finishedWork?.[idx]?.customImageUrl || "").trim();
+            const keepPrevUrl =
+              prevUrl &&
+              (prevUrl.startsWith("data:image/") || !globalUsedUrlsAcrossSites.has(prevUrl));
+            return {
+              ...fw,
+              title: cfg.finishedWork?.[idx]?.title || fw.title,
+              location: cfg.finishedWork?.[idx]?.location || fw.location,
+              duration: cfg.finishedWork?.[idx]?.duration || fw.duration,
+              scope: cfg.finishedWork?.[idx]?.scope || fw.scope,
+              imageType: cfg.finishedWork?.[idx]?.imageType || fw.imageType,
+              customImageUrl: keepPrevUrl ? prevUrl : fw.customImageUrl || "",
+            };
+          });
+          const uniqueFinishedWork = assignUniqueOfferingImageTypes(
+            rawMergedWork,
+            s.category || "Local Services",
+            s.businessName,
+            {
+              city: s.city || "Sacramento",
+              variationSeed: Number(cfg.imageVariationSeed ?? siteIdx),
+              avoidUrls: globalUsedUrlsAcrossSites,
+            }
+          );
+          uniqueFinishedWork.forEach((fw: any) => {
+            if (fw?.customImageUrl) globalUsedUrlsAcrossSites.add(String(fw.customImageUrl).trim());
+          });
+          const mergedConfig = {
+            ...freshBlueprint,
+            ...cfg,
+            visualEngineVersion: 5,
+            imageVariationSeed: Number(cfg.imageVariationSeed ?? siteIdx),
+            archetype: freshBlueprint.archetype,
+            themeId:
+              freshBlueprint.archetype === "fitness_athletic"
+                ? "kinetic_crimson"
+                : cfg.themeId && cfg.themeId !== "valley_craft"
+                ? cfg.themeId
+                : freshBlueprint.themeId,
+            emblemType: freshBlueprint.emblemType,
+            finishedWork: uniqueFinishedWork,
+            scrapedImages: Array.isArray(cfg.scrapedImages) ? cfg.scrapedImages : [],
+          };
+          const [updatedRow] = await db
+            .update(generatedWebsitesTable)
+            .set({
+              themeId: mergedConfig.themeId,
+              siteConfig: mergedConfig,
+              updatedAt: new Date(),
+            })
+            .where(eq(generatedWebsitesTable.siteId, s.siteId))
+            .returning();
+          if (updatedRow) {
+            publicSiteMemoryCache.delete(s.siteId);
+            s = updatedRow;
+          }
+        } catch {}
+      } else {
+        existingWork.forEach((fw: any) => {
+          if (fw?.customImageUrl) globalUsedUrlsAcrossSites.add(String(fw.customImageUrl).trim());
+        });
+      }
+
+      const latestCfg = (s.siteConfig || {}) as any;
+      const hasAutomatedWording =
+        /automated|ai\b|bot\b/i.test(String(latestCfg.chatbotConfig?.agentName || "")) ||
+        /automated assistant|ai assistant/i.test(String(latestCfg.chatbotConfig?.greeting || ""));
+
+      if (!latestCfg.chatbotConfig || !latestCfg.chatbotConfig.greeting || hasAutomatedWording) {
+        const biz = latestCfg.brandName || s.businessName || "Our Team";
+        const city = latestCfg.city || s.city || "your area";
+        const cat = latestCfg.category || s.category || "Services";
+        const step1Opts = Array.isArray(latestCfg.funnelConfig?.step1Options)
+          ? latestCfg.funnelConfig.step1Options
+          : [];
+        const cleanAgent =
+          latestCfg.chatbotConfig?.agentName && !/automated|ai\b|bot\b/i.test(latestCfg.chatbotConfig.agentName)
+            ? latestCfg.chatbotConfig.agentName
+            : `${biz} Team`;
+        const cleanGreeting =
+          latestCfg.chatbotConfig?.greeting && !/automated assistant|ai assistant/i.test(latestCfg.chatbotConfig.greeting)
+            ? latestCfg.chatbotConfig.greeting
+            : `👋 Hi there! Welcome to ${biz} in ${city}. How can we help you with your ${cat.toLowerCase()} needs today?`;
+        const enrichedCfg = {
+          ...latestCfg,
+          chatbotConfig: {
+            enabled: latestCfg.chatbotConfig?.enabled !== false,
+            soundEnabled: latestCfg.chatbotConfig?.soundEnabled !== false,
+            autoOpenDelayMs: 800,
+            agentName: cleanAgent,
+            greeting: cleanGreeting,
+            firstQuestion:
+              latestCfg.chatbotConfig?.firstQuestion ||
+              latestCfg.funnelConfig?.step1Question?.replace(/^1\.\s*/, "") ||
+              `What can ${biz} help you with today? Tap an option below or ask any question:`,
+            followUpQuestion:
+              latestCfg.funnelConfig?.step2Question?.replace(/^2\.\s*/, "") ||
+              "When are you looking to get started?",
+            priorityQuestion:
+              latestCfg.funnelConfig?.step3Question?.replace(/^3\.\s*/, "") ||
+              "What matters most to you for this service?",
+            quickOptions: step1Opts,
+          },
+        };
+        try {
+          const [updatedRow] = await db
+            .update(generatedWebsitesTable)
+            .set({ siteConfig: enrichedCfg, updatedAt: new Date() })
+            .where(eq(generatedWebsitesTable.siteId, s.siteId))
+            .returning();
+          if (updatedRow) s = updatedRow;
+        } catch {}
+        s = { ...s, siteConfig: enrichedCfg };
+      }
+
+      upgradedSites.push(s);
+    }
 
     res.json({
-      sites: sites.map((s) => ({
+      sites: upgradedSites.map((s) => ({
         ...s,
         siteUrl: `${baseUrl}/site/${s.siteId}`,
+        walkthroughWavDataUrl: getCachedSiteWalkthroughWav(s),
       })),
+    });
+
+    setImmediate(() => {
+      for (const s of upgradedSites.slice(0, 2)) {
+        void prewarmSiteWalkthroughVoice(s);
+      }
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to list generated websites" });
@@ -1032,7 +1412,22 @@ router.post("/website-builder/generate", async (req: Request, res: Response) => 
     const check = await isCallerAllowedBuilder(req);
     if (!check.allowed) {
       res.status(403).json({
-        error: `Access denied. AI Auto-Website Builder is enabled strictly for ${OWNER_EMAIL}.`,
+        error: `Access denied. AI Auto-Website Builder is currently restricted by your plan settings.`,
+      });
+      return;
+    }
+
+    const quota = await getCallerWebsiteQuota({
+      email: check.email,
+      planId: check.planId,
+      isOwner: check.isOwner,
+      config: check.config,
+    });
+
+    if (!quota.unlimited && quota.used >= quota.limit) {
+      res.status(403).json({
+        error: `Plan Limit Reached: Your ${quota.planId.toUpperCase()} plan includes up to ${quota.limit} active AI Websites & 5-Star Review Shields (${quota.used}/${quota.limit} used). Upgrade your plan in Billing or delete an unused website to build more.`,
+        quota,
       });
       return;
     }
@@ -1054,6 +1449,8 @@ router.post("/website-builder/generate", async (req: Request, res: Response) => 
       originalScore = 0,
       painPoint = "",
       themeId,
+      selectedImages,
+      imageVariationSeed,
     } = req.body ?? {};
 
     if (!businessName || !String(businessName).trim()) {
@@ -1110,41 +1507,75 @@ router.post("/website-builder/generate", async (req: Request, res: Response) => 
       ? "bad_website"
       : "upgrade_ready";
 
-    // Live-scrape the business's existing website (if any) to extract real services, headings, and photos
-    const scrapedIntel = hasNoSite ? null : await scrapeBusinessWebsiteIntel(cleanWeb);
+    // Collect already-used image URLs across existing built websites so this new site gets fresh, non-duplicate visuals
+    const existingUsedUrls = new Set<string>();
+    try {
+      const priorSites = await db
+        .select({ siteConfig: generatedWebsitesTable.siteConfig })
+        .from(generatedWebsitesTable)
+        .orderBy(desc(generatedWebsitesTable.createdAt))
+        .limit(80);
+      for (const row of priorSites) {
+        const fwList = Array.isArray((row.siteConfig as any)?.finishedWork)
+          ? (row.siteConfig as any).finishedWork
+          : [];
+        for (const fw of fwList) {
+          if (fw?.customImageUrl && typeof fw.customImageUrl === "string") {
+            existingUsedUrls.add(fw.customImageUrl.trim());
+          }
+        }
+      }
+    } catch {}
 
-    const blueprintParams = {
-      businessName: String(businessName).trim(),
-      ownerName: String(ownerName || crmPayload?.ownerName || "").trim(),
-      category: resolvedCategory,
-      city: resolvedCity,
-      country: resolvedCountry,
-      phone: resolvedPhone,
-      email: resolvedEmail,
-      address: resolvedAddress,
-      rating: Number(crmPayload?.rating) || undefined,
-      reviewCount: Number(crmPayload?.reviewCount || crmPayload?.reviewsCount) || undefined,
-      servicesList: parsedServices,
-      businessDescription: resolvedDescription,
-      originalWebsite: hasNoSite ? "" : cleanWeb,
-      detectionStatus,
-      originalScore: hasNoSite ? 0 : Number(originalScore) || 42,
-      themeId,
-      scrapedIntel,
-    };
+    // Live-scrape the business's existing website (if any) & run AI synthesis inside bounded concurrency slot
+    const acquiredSlot = await acquireAiBuildSlot();
+    let scrapedIntel: Awaited<ReturnType<typeof scrapeBusinessWebsiteIntel>> = null;
+    let baseBlueprint: any;
+    try {
+      scrapedIntel =
+        !hasNoSite && acquiredSlot ? await scrapeBusinessWebsiteIntel(cleanWeb) : null;
 
-    // 1. Build industry-accurate structural blueprint
-    const accurateBase = buildAccurateBusinessBlueprint(blueprintParams);
+      const blueprintParams = {
+        businessName: String(businessName).trim(),
+        ownerName: String(ownerName || crmPayload?.ownerName || "").trim(),
+        category: resolvedCategory,
+        city: resolvedCity,
+        country: resolvedCountry,
+        phone: resolvedPhone,
+        email: resolvedEmail,
+        address: resolvedAddress,
+        rating: Number(crmPayload?.rating) || undefined,
+        reviewCount: Number(crmPayload?.reviewCount || crmPayload?.reviewsCount) || undefined,
+        servicesList: parsedServices,
+        businessDescription: resolvedDescription,
+        originalWebsite: hasNoSite ? "" : cleanWeb,
+        detectionStatus,
+        originalScore: hasNoSite ? 0 : Number(originalScore) || 42,
+        themeId,
+        scrapedIntel,
+        selectedImages: Array.isArray(selectedImages) ? selectedImages : undefined,
+        imageVariationSeed:
+          typeof imageVariationSeed === "number" ? imageVariationSeed : existingUsedUrls.size,
+        avoidUrls: existingUsedUrls,
+      };
 
-    // 2. Deeply customize every section, funnel step, service, review, FAQ, and image category with Gemini AI
-    const baseBlueprint = await synthesizeWebsiteWithAI(blueprintParams, accurateBase);
+      // 1. Build industry-accurate structural blueprint (<5ms deterministic engine)
+      const accurateBase = buildAccurateBusinessBlueprint(blueprintParams);
+
+      // 2. Deeply customize with Gemini AI if concurrency slot acquired; otherwise serve accurateBase immediately with zero downtime
+      baseBlueprint = acquiredSlot
+        ? await synthesizeWebsiteWithAI(blueprintParams, accurateBase)
+        : accurateBase;
+    } finally {
+      if (acquiredSlot) releaseAiBuildSlot();
+    }
 
     const slugBase = String(businessName)
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "")
       .slice(0, 28);
-    const shortHash = randomBytes(2).toString("hex");
+    const shortHash = randomBytes(4).toString("hex");
     const siteId = `${slugBase}-${shortHash}`;
     const baseUrl = getAgencyBaseUrl(req);
     const siteUrl = `${baseUrl}/site/${siteId}`;
@@ -1165,45 +1596,82 @@ router.post("/website-builder/generate", async (req: Request, res: Response) => 
       servicesSummary,
     });
 
-    const [inserted] = await db
-      .insert(generatedWebsitesTable)
-      .values({
-        siteId,
-        prospectId: String(prospectId || ""),
-        businessName: String(businessName).trim(),
-        ownerName: String(ownerName || crmPayload?.ownerName || ""),
-        category: resolvedCategory,
-        city: resolvedCity,
-        country: resolvedCountry,
-        phone: resolvedPhone,
-        email: resolvedEmail,
-        originalWebsite: hasNoSite ? "" : cleanWeb,
-        detectionStatus,
-        originalScore: hasNoSite ? 0 : Number(originalScore) || 42,
-        themeId: baseBlueprint.themeId,
-        siteConfig: baseBlueprint,
-        siteUrl,
-        pitchSubject: pitch.subject,
-        pitchBody: pitch.body,
-        status: "ready",
-        createdByEmail: check.email || OWNER_EMAIL,
-      })
-      .returning();
+    const siteRowValues = {
+      siteId,
+      prospectId: String(prospectId || ""),
+      businessName: String(businessName).trim(),
+      ownerName: String(ownerName || crmPayload?.ownerName || ""),
+      category: resolvedCategory,
+      city: resolvedCity,
+      country: resolvedCountry,
+      phone: resolvedPhone,
+      email: resolvedEmail,
+      originalWebsite: hasNoSite ? "" : cleanWeb,
+      detectionStatus,
+      originalScore: hasNoSite ? 0 : Number(originalScore) || 42,
+      themeId: baseBlueprint.themeId,
+      siteConfig: baseBlueprint,
+      siteUrl,
+      pitchSubject: pitch.subject,
+      pitchBody: pitch.body,
+      status: "ready",
+      createdByEmail: check.email || OWNER_EMAIL,
+    };
 
-    await db.insert(userActivitiesTable).values({
-      userEmail: check.email || OWNER_EMAIL,
-      userName: "Platform Owner",
-      category: "audit",
-      action: `Auto-Built High-Converting Website for ${businessName}`,
-      details: `Detection: ${detectionStatus.toUpperCase()} · Live URL: /site/${siteId}`,
+    let inserted: any;
+    try {
+      const [row] = await db
+        .insert(generatedWebsitesTable)
+        .values(siteRowValues)
+        .returning();
+      inserted = row;
+    } catch (dbErr) {
+      console.warn("[website-builder] DB insert fallback to memory cache:", dbErr);
+      inserted = {
+        id: Date.now(),
+        ...siteRowValues,
+        totalViews: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+    }
+
+    publicSiteMemoryCache.set(siteId, inserted);
+    if (inserted?.id) {
+      publicSiteMemoryCache.set(String(inserted.id), inserted);
+    }
+
+    try {
+      await db.insert(userActivitiesTable).values({
+        userEmail: check.email || OWNER_EMAIL,
+        userName: "Platform Owner",
+        category: "audit",
+        action: `Auto-Built High-Converting Website for ${businessName}`,
+        details: `Detection: ${detectionStatus.toUpperCase()} · Live URL: /site/${siteId}`,
+      });
+    } catch {}
+
+    const updatedQuota = await getCallerWebsiteQuota({
+      email: check.email,
+      planId: check.planId,
+      isOwner: check.isOwner,
+      config: check.config,
     });
+
+    const cachedWalkthroughAudio = getCachedSiteWalkthroughWav(inserted);
+    if (!cachedWalkthroughAudio) {
+      void ensureSiteWalkthroughAudioReady(inserted).catch(() => {});
+    }
 
     res.json({
       success: true,
       site: {
         ...inserted,
+        siteId,
         siteUrl,
+        ...(cachedWalkthroughAudio ? { walkthroughWavDataUrl: cachedWalkthroughAudio } : {}),
       },
+      quota: updatedQuota,
     });
   } catch (err: any) {
     console.error("[website-builder] Generate error:", err);
@@ -1224,7 +1692,7 @@ router.post("/website-builder/sites/:siteId/send-email", async (req: Request, re
     }
 
     const { siteId } = req.params;
-    const { toEmail, subject, body } = req.body ?? {};
+    const { toEmail, subject, body, wavBase64, voiceScript, voiceLabel } = req.body ?? {};
 
     const rows = await db
       .select()
@@ -1253,8 +1721,30 @@ router.post("/website-builder/sites/:siteId/send-email", async (req: Request, re
     const openPixelUrl = `${baseUrl}/api/track/open/${trackingId}`;
     const clickTrackUrl = `${baseUrl}/api/track/click/${trackingId}?url=${encodeURIComponent(liveSiteUrl)}`;
 
+    const cleanSlug = String(site.businessName || "Website-Preview")
+      .replace(/[^a-zA-Z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 35);
+
+    const voiceAttachmentBannerHtml = wavBase64
+      ? `<div style="margin:0 0 22px;padding:16px 18px;border-radius:12px;background:#0F172A;color:#FFFFFF;border:1px solid #334155;">
+          <div style="font-size:11px;font-weight:800;color:#FBBF24;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">
+            🎙️ Personal Audio Walkthrough Attached (${voiceLabel || "AI Studio Voice Note"})
+          </div>
+          <div style="font-size:13px;color:#E2E8F0;line-height:1.55;">
+            Play the attached <strong>Website-Walkthrough-${cleanSlug}.wav</strong> audio note in this email to hear a 25-second overview of the custom website we built for <strong>${site.businessName}</strong>.
+          </div>
+          ${
+            voiceScript
+              ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid #1E293B;font-size:12px;color:#94A3B8;font-style:italic;">"${String(voiceScript).replace(/</g, "&lt;")}"</div>`
+              : ""
+          }
+        </div>`
+      : "";
+
     const htmlBody = `
 <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:620px;margin:0 auto;color:#141210;line-height:1.65;font-size:15px;">
+  ${voiceAttachmentBannerHtml}
   ${finalBody
     .split("\n\n")
     .map((p) => `<p style="margin:0 0 16px;">${p.replace(/\n/g, "<br/>")}</p>`)
@@ -1275,6 +1765,16 @@ router.post("/website-builder/sites/:siteId/send-email", async (req: Request, re
   </div>
   <img src="${openPixelUrl}" width="1" height="1" alt="" style="display:none;" />
 </div>`;
+
+    const mailAttachments = wavBase64
+      ? [
+          {
+            filename: `Website-Walkthrough-${cleanSlug}.wav`,
+            content: Buffer.from(String(wavBase64), "base64"),
+            contentType: "audio/wav",
+          },
+        ]
+      : undefined;
 
     // Try sending via configured email accounts or Brevo mailer
     const accounts = await db
@@ -1302,6 +1802,7 @@ router.post("/website-builder/sites/:siteId/send-email", async (req: Request, re
         subject: finalSubject,
         text: finalBody,
         html: htmlBody,
+        ...(mailAttachments ? { attachments: mailAttachments } : {}),
       });
       sentVia = acct.fromEmail || acct.user;
     } else {
@@ -1392,6 +1893,7 @@ router.patch("/website-builder/sites/:siteId", async (req: Request, res: Respons
       .where(eq(generatedWebsitesTable.siteId, siteId))
       .returning();
 
+    publicSiteMemoryCache.delete(siteId);
     res.json({ success: true, site: updated });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to update site" });
@@ -1405,6 +1907,7 @@ router.delete("/website-builder/sites/:siteId", async (req: Request, res: Respon
       res.status(403).json({ error: "Access denied" });
       return;
     }
+    publicSiteMemoryCache.delete(req.params.siteId);
     await db
       .delete(generatedWebsitesTable)
       .where(eq(generatedWebsitesTable.siteId, req.params.siteId));
@@ -1416,32 +1919,76 @@ router.delete("/website-builder/sites/:siteId", async (req: Request, res: Respon
 
 // ─── 7. Public Endpoints for Business Owners Viewing & Claiming Their Site ──
 
+const publicSiteMemoryCache = new Map<string, any>();
+let cachedPaymentConfigValue: any = null;
+let cachedPaymentConfigAt = 0;
+
+async function getFastPaymentConfig() {
+  const now = Date.now();
+  if (cachedPaymentConfigValue && now - cachedPaymentConfigAt < 30_000) {
+    return cachedPaymentConfigValue;
+  }
+  const cfg = await getWebsitePaymentConfig();
+  cachedPaymentConfigValue = cfg;
+  cachedPaymentConfigAt = now;
+  return cfg;
+}
+
 router.get("/website-builder/public/:siteId", async (req: Request, res: Response) => {
   try {
     const baseUrl = getAgencyBaseUrl(req);
-    await ensureFlagshipSeedSite(baseUrl);
-
     const { siteId } = req.params;
-    const rows = await db
-      .select()
-      .from(generatedWebsitesTable)
-      .where(eq(generatedWebsitesTable.siteId, siteId))
-      .limit(1);
 
-    if (rows.length === 0) {
+    if (siteId === "valley-construction-sacramento" && !seededDefaultSite) {
+      await ensureFlagshipSeedSite(baseUrl);
+    }
+
+    let site = publicSiteMemoryCache.get(siteId);
+    if (!site) {
+      let rows = await db
+        .select()
+        .from(generatedWebsitesTable)
+        .where(eq(generatedWebsitesTable.siteId, siteId))
+        .limit(1);
+
+      if (rows.length === 0 && /^\d+$/.test(siteId)) {
+        rows = await db
+          .select()
+          .from(generatedWebsitesTable)
+          .where(eq(generatedWebsitesTable.id, Number(siteId)))
+          .limit(1);
+      }
+
+      if (rows.length === 0 && !seededDefaultSite) {
+        await ensureFlagshipSeedSite(baseUrl);
+        const retryRows = await db
+          .select()
+          .from(generatedWebsitesTable)
+          .where(eq(generatedWebsitesTable.siteId, siteId))
+          .limit(1);
+        if (retryRows.length > 0) {
+          site = retryRows[0];
+        }
+      } else if (rows.length > 0) {
+        site = rows[0];
+      }
+    }
+
+    if (!site) {
       res.status(404).json({ error: "Website preview not found" });
       return;
     }
 
-    let site = rows[0];
     const currentCfg = (site.siteConfig || {}) as any;
+    let configChanged = false;
+    let workingCfg = currentCfg;
 
-    // Auto-upgrade any legacy site that was generated with the old generic template
-    if (!currentCfg.archetype && site.siteId !== "valley-construction-sacramento") {
+    // Fast, zero-network synchronous upgrade if visualEngineVersion !== 5
+    if (
+      workingCfg.visualEngineVersion !== 5 &&
+      site.siteId !== "valley-construction-sacramento"
+    ) {
       try {
-        const scrapedIntel = site.originalWebsite
-          ? await scrapeBusinessWebsiteIntel(site.originalWebsite)
-          : null;
         const bpParams = {
           businessName: site.businessName,
           ownerName: site.ownerName || "",
@@ -1453,51 +2000,215 @@ router.get("/website-builder/public/:siteId", async (req: Request, res: Response
           originalWebsite: site.originalWebsite || "",
           detectionStatus: (site.detectionStatus as any) || "no_website",
           originalScore: site.originalScore || 0,
-          scrapedIntel,
+          scrapedIntel: null,
+          imageVariationSeed: Number(workingCfg.imageVariationSeed || 0),
         };
-        const accurateBase = buildAccurateBusinessBlueprint(bpParams);
-        const upgradedConfig = await synthesizeWebsiteWithAI(bpParams, accurateBase);
-        const [updatedRow] = await db
-          .update(generatedWebsitesTable)
-          .set({
-            themeId: upgradedConfig.themeId,
-            siteConfig: upgradedConfig,
-            updatedAt: new Date(),
-          })
-          .where(eq(generatedWebsitesTable.siteId, siteId))
-          .returning();
-        if (updatedRow) site = updatedRow;
+        const freshBlueprint = buildAccurateBusinessBlueprint(bpParams);
+        const rawMergedWork = freshBlueprint.finishedWork.map((fw: any, idx: number) => ({
+          ...fw,
+          title: workingCfg.finishedWork?.[idx]?.title || fw.title,
+          location: workingCfg.finishedWork?.[idx]?.location || fw.location,
+          duration: workingCfg.finishedWork?.[idx]?.duration || fw.duration,
+          scope: workingCfg.finishedWork?.[idx]?.scope || fw.scope,
+          imageType: workingCfg.finishedWork?.[idx]?.imageType || fw.imageType,
+          customImageUrl: workingCfg.finishedWork?.[idx]?.customImageUrl || fw.customImageUrl || "",
+        }));
+        const uniqueFinishedWork = assignUniqueOfferingImageTypes(
+          rawMergedWork,
+          site.category || "Local Services",
+          site.businessName,
+          {
+            city: site.city || "Sacramento",
+            variationSeed: Number(workingCfg.imageVariationSeed || 0),
+          }
+        );
+        workingCfg = {
+          ...freshBlueprint,
+          ...workingCfg,
+          visualEngineVersion: 5,
+          archetype: freshBlueprint.archetype,
+          themeId:
+            freshBlueprint.archetype === "fitness_athletic"
+              ? "kinetic_crimson"
+              : workingCfg.themeId && workingCfg.themeId !== "valley_craft"
+              ? workingCfg.themeId
+              : freshBlueprint.themeId,
+          emblemType: freshBlueprint.emblemType,
+          finishedWork: uniqueFinishedWork,
+          scrapedImages: Array.isArray(workingCfg.scrapedImages) ? workingCfg.scrapedImages : [],
+        };
+        site = { ...site, themeId: workingCfg.themeId, siteConfig: workingCfg };
+        configChanged = true;
       } catch (e) {
         console.warn("[website-builder] Legacy auto-upgrade skipped:", e);
       }
     }
 
+    // Ensure every business site loaded on /site/:siteId has its built-in chatbotConfig AND intelligentModules tailored
+    const latestCfg = (site.siteConfig || {}) as any;
+    const hasPublicAutomatedWording =
+      /automated|ai\b|bot\b/i.test(String(latestCfg.chatbotConfig?.agentName || "")) ||
+      /automated assistant|ai assistant/i.test(String(latestCfg.chatbotConfig?.greeting || ""));
+
+    if (
+      !latestCfg.chatbotConfig ||
+      !latestCfg.chatbotConfig.greeting ||
+      hasPublicAutomatedWording ||
+      !latestCfg.intelligentModules
+    ) {
+      const biz = latestCfg.brandName || site.businessName || "Our Team";
+      const city = latestCfg.city || site.city || "your area";
+      const cat = latestCfg.category || site.category || "Services";
+      const phone = latestCfg.phoneDisplay || site.phone || "(916) 291-1047";
+      const step1Opts = Array.isArray(latestCfg.funnelConfig?.step1Options)
+        ? latestCfg.funnelConfig.step1Options
+        : [];
+      const cleanAgent =
+        latestCfg.chatbotConfig?.agentName && !/automated|ai\b|bot\b/i.test(latestCfg.chatbotConfig.agentName)
+          ? latestCfg.chatbotConfig.agentName
+          : `${biz} Team`;
+      const cleanGreeting =
+        latestCfg.chatbotConfig?.greeting && !/automated assistant|ai assistant/i.test(latestCfg.chatbotConfig.greeting)
+          ? latestCfg.chatbotConfig.greeting
+          : `👋 Hi there! Welcome to ${biz} in ${city}. How can we help you with your ${cat.toLowerCase()} needs today?`;
+      const enrichedCfg = {
+        ...latestCfg,
+        intelligentModules:
+          latestCfg.intelligentModules ||
+          buildIntelligentSmartModules({
+            archetype: latestCfg.archetype,
+            businessName: biz,
+            category: cat,
+            city,
+            phone,
+            servicesList: step1Opts.map((o: any) => o.label),
+          }),
+        chatbotConfig: {
+          enabled: latestCfg.chatbotConfig?.enabled !== false,
+          soundEnabled: latestCfg.chatbotConfig?.soundEnabled !== false,
+          autoOpenDelayMs: 800,
+          agentName: cleanAgent,
+          greeting: cleanGreeting,
+          firstQuestion:
+            latestCfg.chatbotConfig?.firstQuestion ||
+            latestCfg.funnelConfig?.step1Question?.replace(/^1\.\s*/, "") ||
+            `What can ${biz} help you with today? Tap an option below or ask any question:`,
+          followUpQuestion:
+            latestCfg.funnelConfig?.step2Question?.replace(/^2\.\s*/, "") ||
+            "When are you looking to get started?",
+          priorityQuestion:
+            latestCfg.funnelConfig?.step3Question?.replace(/^3\.\s*/, "") ||
+            "What matters most to you for this service?",
+          quickOptions: step1Opts,
+        },
+      };
+      site = { ...site, siteConfig: enrichedCfg };
+      configChanged = true;
+    }
+
     const now = new Date();
     const nextStatus =
       site.status === "claimed" ? "claimed" : site.status === "ready" ? "viewed" : site.status;
+    const nextTotalViews = (site.totalViews || 0) + 1;
 
-    await db
-      .update(generatedWebsitesTable)
-      .set({
-        totalViews: sql`${generatedWebsitesTable.totalViews} + 1`,
-        firstViewedAt: site.firstViewedAt ?? now,
-        lastViewedAt: now,
-        status: nextStatus,
-      })
-      .where(eq(generatedWebsitesTable.siteId, siteId));
+    const cachedWalkthroughWav = getCachedSiteWalkthroughWav(site);
+    if (!cachedWalkthroughWav) {
+      void ensureSiteWalkthroughAudioReady(site).catch(() => {});
+    }
 
-    const paymentConfig = await getWebsitePaymentConfig();
+    const responseSite = {
+      ...site,
+      totalViews: nextTotalViews,
+      firstViewedAt: site.firstViewedAt ?? now,
+      lastViewedAt: now,
+      status: nextStatus,
+      siteUrl: `${baseUrl}/site/${site.siteId}`,
+      ...(cachedWalkthroughWav ? { walkthroughWavDataUrl: cachedWalkthroughWav } : {}),
+    };
 
+    publicSiteMemoryCache.set(siteId, responseSite);
+
+    const paymentConfig = await getFastPaymentConfig();
+
+    // Respond immediately so the website renders with zero delay
     res.json({
-      site: {
-        ...site,
-        totalViews: (site.totalViews || 0) + 1,
-        siteUrl: `${baseUrl}/site/${site.siteId}`,
-      },
+      site: responseSite,
       paymentConfig,
+    });
+
+    // Persist view analytics and any enrichment asynchronously after response is sent
+    setImmediate(() => {
+      void prewarmSiteWalkthroughVoice(responseSite);
+      db.update(generatedWebsitesTable)
+        .set({
+          ...(configChanged ? { themeId: responseSite.themeId, siteConfig: responseSite.siteConfig } : {}),
+          totalViews: sql`${generatedWebsitesTable.totalViews} + 1`,
+          firstViewedAt: site.firstViewedAt ?? now,
+          lastViewedAt: now,
+          status: nextStatus,
+        })
+        .where(eq(generatedWebsitesTable.siteId, siteId))
+        .catch((err) => console.warn("[website-builder] Background view update warning:", err));
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to load website preview" });
+  }
+});
+
+// Direct binary audio stream for synchronous HTML5 <audio> playback on site arrival
+router.get("/website-builder/public/:siteId/walkthrough-audio", async (req: Request, res: Response) => {
+  try {
+    const baseUrl = getAgencyBaseUrl(req);
+    const { siteId } = req.params;
+
+    if (siteId === "valley-construction-sacramento" && !seededDefaultSite) {
+      await ensureFlagshipSeedSite(baseUrl);
+    }
+
+    let site = publicSiteMemoryCache.get(siteId);
+    if (!site) {
+      const rows = await db
+        .select()
+        .from(generatedWebsitesTable)
+        .where(eq(generatedWebsitesTable.siteId, siteId))
+        .limit(1);
+      if (rows.length > 0) {
+        site = rows[0];
+      }
+    }
+
+    const targetSite = site || {
+      businessName: siteId
+        .replace(/-[a-z0-9]{4,}$/i, "")
+        .replace(/-/g, " ")
+        .replace(/\b\w/g, (c) => c.toUpperCase()),
+      city: "",
+      ownerName: "",
+      siteConfig: {},
+    };
+
+    const dataUri =
+      getCachedSiteWalkthroughWav(targetSite) ||
+      (await ensureSiteWalkthroughAudioReady(targetSite));
+
+    if (!dataUri) {
+      res.status(404).end();
+      return;
+    }
+
+    const commaIdx = dataUri.indexOf(",");
+    const header = commaIdx >= 0 ? dataUri.slice(0, commaIdx) : "";
+    const base64 = commaIdx >= 0 ? dataUri.slice(commaIdx + 1) : dataUri;
+    const contentType = header.includes("audio/mpeg") ? "audio/mpeg" : "audio/wav";
+    const audioBuf = Buffer.from(base64, "base64");
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Length", String(audioBuf.length));
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).send(audioBuf);
+  } catch {
+    res.status(500).end();
   }
 });
 
@@ -1551,6 +2262,77 @@ router.post("/website-builder/public/:siteId/funnel-submit", async (req: Request
   }
 });
 
+// 5-Star Review Shield & Bad-Review Blocker submission (1-3 Star Private Intercept or 4-5 Star Google Redirect)
+router.post("/website-builder/public/:siteId/review-shield-submit", async (req: Request, res: Response) => {
+  try {
+    const { siteId } = req.params;
+    const { stars = 5, customerName = "", customerPhone = "", feedback = "", actionType = "private_intercept" } =
+      req.body ?? {};
+
+    const rows = await db
+      .select()
+      .from(generatedWebsitesTable)
+      .where(eq(generatedWebsitesTable.siteId, siteId))
+      .limit(1);
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Business not found" });
+      return;
+    }
+
+    const site = rows[0];
+    const currentConfig = (site.siteConfig || {}) as any;
+    const existingIntercepts = Array.isArray(currentConfig.reviewShieldLogs)
+      ? currentConfig.reviewShieldLogs
+      : [];
+
+    const entry = {
+      id: `rev_${Date.now()}`,
+      stars: Number(stars) || 3,
+      customerName: String(customerName || "Anonymous Customer").trim(),
+      customerPhone: String(customerPhone || "").trim(),
+      feedback: String(feedback || "").trim(),
+      actionType: Number(stars) >= 4 ? "google_maps_redirect" : String(actionType),
+      createdAt: new Date().toISOString(),
+    };
+
+    const updatedConfig = {
+      ...currentConfig,
+      reviewShieldLogs: [entry, ...existingIntercepts].slice(0, 100),
+    };
+
+    await db
+      .update(generatedWebsitesTable)
+      .set({
+        siteConfig: updatedConfig,
+        updatedAt: new Date(),
+      })
+      .where(eq(generatedWebsitesTable.siteId, siteId));
+
+    await db.insert(userActivitiesTable).values({
+      userEmail: OWNER_EMAIL,
+      userName: site.businessName,
+      category: "outreach",
+      action:
+        Number(stars) <= 3
+          ? `🛡️ 5-Star Review Shield INTERCEPTED a ${stars}-Star Complaint for ${site.businessName}`
+          : `⭐ 5-Star Review Shield Sent a ${stars}-Star Reviewer to Google Maps for ${site.businessName}`,
+      details:
+        Number(stars) <= 3
+          ? `Customer: ${entry.customerName} (${entry.customerPhone || "No phone"}) · Private Feedback: "${entry.feedback}"`
+          : `Redirected happy customer to Google Maps review page`,
+    });
+
+    res.json({
+      success: true,
+      entry,
+      totalLogs: updatedConfig.reviewShieldLogs.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to record Review Shield submission" });
+  }
+});
+
 // Business Owner clicks "Claim This Website" and submits their claim request
 router.post("/website-builder/public/:siteId/claim", async (req: Request, res: Response) => {
   try {
@@ -1563,6 +2345,9 @@ router.post("/website-builder/public/:siteId/claim", async (req: Request, res: R
       customDomain = "",
       customNotes = "",
       selectedPlan = "VIP Hosting & Care ($97/mo · $0 Free Website Build)",
+      billingMonths = 1,
+      hostingTermTotal,
+      dueToday,
       selectedAddons = [],
       monthlyTotal = 97,
       oneTimeTotal = 0,
@@ -1591,12 +2376,16 @@ router.post("/website-builder/public/:siteId/claim", async (req: Request, res: R
     const parsedAddons = Array.isArray(selectedAddons) ? selectedAddons.map(String) : [];
     const parsedMonthly = Number(monthlyTotal) || 97;
     const parsedOneTime = Number(oneTimeTotal) || 0;
+    const parsedBillingMonths = Number(billingMonths) === 3 || Number(billingMonths) === 12 ? Number(billingMonths) : 1;
+    const parsedDueToday = Number(dueToday) > 0 ? Number(dueToday) : parsedMonthly * parsedBillingMonths + parsedOneTime;
 
     const invoiceEmail = buildClaimedPaymentEmail({
       businessName: site.businessName,
       ownerName: String(claimedByName).trim(),
       siteUrl: liveSiteUrl,
       selectedPlan: String(selectedPlan),
+      billingMonths: parsedBillingMonths,
+      dueTodayOverride: parsedDueToday,
       selectedAddons: parsedAddons,
       monthlyTotal: parsedMonthly,
       oneTimeTotal: parsedOneTime,
@@ -1664,6 +2453,8 @@ router.post("/website-builder/public/:siteId/claim", async (req: Request, res: R
       customDomain: String(customDomain).trim(),
       customNotes: String(customNotes).trim(),
       selectedPlan: String(selectedPlan),
+      billingMonths: parsedBillingMonths,
+      hostingTermTotal: Number(hostingTermTotal) || parsedMonthly * parsedBillingMonths,
       selectedAddons: parsedAddons,
       monthlyTotal: parsedMonthly,
       oneTimeTotal: parsedOneTime,
@@ -1697,6 +2488,7 @@ router.post("/website-builder/public/:siteId/claim", async (req: Request, res: R
       details: `Plan: ${claimPayload.selectedPlan} · Phone: ${claimPayload.claimedByPhone} · Email: ${claimPayload.claimedByEmail}`,
     });
 
+    publicSiteMemoryCache.delete(siteId);
     res.json({
       success: true,
       claimData: claimPayload,
@@ -1711,7 +2503,13 @@ router.post("/website-builder/public/:siteId/claim", async (req: Request, res: R
 router.post("/website-builder/public/:siteId/confirm-payment", async (req: Request, res: Response) => {
   try {
     const { siteId } = req.params;
-    const { paymentMethod = "lemon_card", paymentReference = "" } = req.body ?? {};
+    const {
+      paymentMethod = "lemon_card",
+      paymentReference = "",
+      billingMonths,
+      dueToday,
+      selectedPlan,
+    } = req.body ?? {};
 
     const rows = await db
       .select()
@@ -1728,6 +2526,9 @@ router.post("/website-builder/public/:siteId/confirm-payment", async (req: Reque
     const existingClaim = (site.claimData || {}) as any;
     const updatedClaim = {
       ...existingClaim,
+      ...(billingMonths ? { billingMonths: Number(billingMonths) } : {}),
+      ...(dueToday ? { dueToday: Number(dueToday) } : {}),
+      ...(selectedPlan ? { selectedPlan: String(selectedPlan) } : {}),
       paymentStatus: "payment_submitted",
       paymentMethodSelected: String(paymentMethod),
       paymentReference: String(paymentReference).trim(),
@@ -1752,6 +2553,7 @@ router.post("/website-builder/public/:siteId/confirm-payment", async (req: Reque
       }`,
     });
 
+    publicSiteMemoryCache.delete(siteId);
     res.json({
       success: true,
       claimData: updatedClaim,
@@ -1888,7 +2690,7 @@ router.post("/website-builder/sites/:siteId/send-payment-email", async (req: Req
 router.post("/website-builder/public/:siteId/admin-verify", async (req: Request, res: Response) => {
   try {
     const { siteId } = req.params;
-    const { pin = "" } = req.body ?? {};
+    const { pin = "", password = "" } = req.body ?? {};
     const check = await isCallerAllowedBuilder(req);
 
     const rows = await db
@@ -1904,30 +2706,44 @@ router.post("/website-builder/public/:siteId/admin-verify", async (req: Request,
 
     const site = rows[0];
     const cfg = (site.siteConfig || {}) as any;
-    const expectedPin = String(cfg.adminPin || "2026").trim();
-    const enteredPin = String(pin).trim();
+    const savedPassword = String(cfg.adminPassword || cfg.adminPin || "owner2026").trim();
+    const passwordChanged = Boolean(cfg.adminPasswordChanged);
+    const entered = String(password || pin || "").trim();
 
-    if (check.allowed || enteredPin === expectedPin || enteredPin === "2026") {
+    const isDefaultAllowed = !passwordChanged && (entered === "owner2026" || entered === "2026");
+
+    if (check.allowed || entered === savedPassword || isDefaultAllowed) {
       res.json({
         success: true,
         authorized: true,
-        adminPin: expectedPin,
+        adminPin: savedPassword,
+        adminPassword: savedPassword,
+        adminPasswordChanged: passwordChanged,
       });
       return;
     }
 
     res.status(401).json({
-      error: "Invalid Admin PIN. Ask the agency owner for your 4-digit Website Admin PIN.",
+      error: passwordChanged
+        ? "Invalid Business Owner Admin Password. Please enter your custom admin password."
+        : "Invalid Business Owner Admin Password. Default password is: owner2026",
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to verify Admin PIN" });
+    res.status(500).json({ error: err.message || "Failed to verify Admin Password" });
   }
 });
 
 router.post("/website-builder/public/:siteId/admin-save", async (req: Request, res: Response) => {
   try {
     const { siteId } = req.params;
-    const { pin = "", themeId, siteConfigUpdates = {}, status } = req.body ?? {};
+    const {
+      pin = "",
+      password = "",
+      newPassword = "",
+      themeId,
+      siteConfigUpdates = {},
+      status,
+    } = req.body ?? {};
     const check = await isCallerAllowedBuilder(req);
 
     const rows = await db
@@ -1943,21 +2759,37 @@ router.post("/website-builder/public/:siteId/admin-save", async (req: Request, r
 
     const site = rows[0];
     const currentCfg = (site.siteConfig || {}) as any;
-    const expectedPin = String(currentCfg.adminPin || "2026").trim();
-    const enteredPin = String(pin).trim();
+    const savedPassword = String(currentCfg.adminPassword || currentCfg.adminPin || "owner2026").trim();
+    const passwordChanged = Boolean(currentCfg.adminPasswordChanged);
+    const entered = String(password || pin || "").trim();
+    const isDefaultAllowed = !passwordChanged && (entered === "owner2026" || entered === "2026");
 
-    if (!check.allowed && enteredPin !== expectedPin && enteredPin !== "2026") {
+    if (!check.allowed && entered !== savedPassword && !isDefaultAllowed) {
       res.status(401).json({
-        error: "Unauthorized. Please enter a valid Website Admin PIN to save changes.",
+        error: "Unauthorized. Please enter a valid Business Owner Admin Password to save changes.",
       });
       return;
     }
+
+    const updatedPasswordCandidate = String(
+      newPassword ||
+        siteConfigUpdates.adminPassword ||
+        siteConfigUpdates.adminPin ||
+        savedPassword
+    ).trim();
+    const didChangePassword =
+      passwordChanged ||
+      Boolean(siteConfigUpdates.adminPasswordChanged) ||
+      (Boolean(updatedPasswordCandidate) && updatedPasswordCandidate !== savedPassword);
 
     const nextThemeId = themeId || siteConfigUpdates.themeId || site.themeId;
     const mergedConfig = {
       ...currentCfg,
       ...siteConfigUpdates,
       themeId: nextThemeId,
+      adminPin: updatedPasswordCandidate || "owner2026",
+      adminPassword: updatedPasswordCandidate || "owner2026",
+      adminPasswordChanged: didChangePassword,
     };
 
     const nextBusinessName = String(mergedConfig.brandName || site.businessName).trim();
@@ -1981,8 +2813,13 @@ router.post("/website-builder/public/:siteId/admin-save", async (req: Request, r
       .returning();
 
     const baseUrl = getAgencyBaseUrl(req);
+    publicSiteMemoryCache.set(siteId, {
+      ...updated,
+      siteUrl: `${baseUrl}/site/${updated.siteId}`,
+    });
     res.json({
       success: true,
+      adminPassword: mergedConfig.adminPassword,
       site: {
         ...updated,
         siteUrl: `${baseUrl}/site/${updated.siteId}`,
@@ -1992,6 +2829,186 @@ router.post("/website-builder/public/:siteId/admin-save", async (req: Request, r
     res.status(500).json({ error: err.message || "Failed to save website admin changes" });
   }
 });
+
+// ─── Regenerate Website Showcase Images (AI + Industry Unique Pool) ──────────
+async function handleRegenerateSiteImages(req: Request, res: Response) {
+  try {
+    const { siteId } = req.params;
+    const { pin = "", password = "", cardIndex, customPrompt = "" } = req.body ?? {};
+    const check = await isCallerAllowedBuilder(req);
+
+    const rows = await db
+      .select()
+      .from(generatedWebsitesTable)
+      .where(eq(generatedWebsitesTable.siteId, siteId))
+      .limit(1);
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Website not found" });
+      return;
+    }
+
+    const site = rows[0];
+    const currentCfg = (site.siteConfig || {}) as any;
+    const savedPassword = String(currentCfg.adminPassword || currentCfg.adminPin || "owner2026").trim();
+    const passwordChanged = Boolean(currentCfg.adminPasswordChanged);
+    const entered = String(password || pin || "").trim();
+    const isDefaultAllowed = !passwordChanged && (entered === "owner2026" || entered === "2026");
+
+    if (!check.allowed && entered !== savedPassword && !isDefaultAllowed) {
+      res.status(401).json({
+        error: "Unauthorized. Enter your Business Owner Admin Password (default: owner2026) to regenerate images.",
+      });
+      return;
+    }
+
+    const parsedCardIndex =
+      typeof cardIndex === "number" && Number.isFinite(cardIndex) ? cardIndex : undefined;
+
+    const { updatedFinishedWork, generatedWithAI, regeneratedIndices } =
+      await regenerateWebsiteShowcaseImages(site, {
+        cardIndex: parsedCardIndex,
+        customPrompt: String(customPrompt || "").trim(),
+      });
+
+    const updatedCfg = {
+      ...currentCfg,
+      visualEngineVersion: 5,
+      imageVariationSeed: Number(currentCfg.imageVariationSeed || 0) + 1,
+      finishedWork: updatedFinishedWork,
+      lastImageRegeneratedAt: new Date().toISOString(),
+    };
+
+    const [updatedSite] = await db
+      .update(generatedWebsitesTable)
+      .set({
+        siteConfig: updatedCfg,
+        updatedAt: new Date(),
+      })
+      .where(eq(generatedWebsitesTable.siteId, siteId))
+      .returning();
+
+    const baseUrl = getAgencyBaseUrl(req);
+    publicSiteMemoryCache.set(siteId, {
+      ...updatedSite,
+      siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
+    });
+    res.json({
+      success: true,
+      generatedWithAI,
+      regeneratedIndices,
+      finishedWork: updatedFinishedWork,
+      site: {
+        ...updatedSite,
+        siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
+      },
+    });
+  } catch (err: any) {
+    console.error("[website-builder] Regenerate images error:", err);
+    res.status(500).json({
+      error: err.message || "Failed to regenerate website images",
+    });
+  }
+}
+
+router.post("/website-builder/public/:siteId/regenerate-images", handleRegenerateSiteImages);
+router.post("/website-builder/sites/:siteId/regenerate-images", handleRegenerateSiteImages);
+
+// ─── Generate New AI Local SEO & Buyer Guide Blog Article ────────────────────
+async function handleGenerateAiBlogPost(req: Request, res: Response) {
+  try {
+    const { siteId } = req.params;
+    const { pin = "", password = "", customTopic = "" } = req.body ?? {};
+    const check = await isCallerAllowedBuilder(req);
+
+    const rows = await db
+      .select()
+      .from(generatedWebsitesTable)
+      .where(eq(generatedWebsitesTable.siteId, siteId))
+      .limit(1);
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Website not found" });
+      return;
+    }
+
+    const site = rows[0];
+    const currentCfg = (site.siteConfig || {}) as any;
+    const savedPassword = String(currentCfg.adminPassword || currentCfg.adminPin || "owner2026").trim();
+    const passwordChanged = Boolean(currentCfg.adminPasswordChanged);
+    const entered = String(password || pin || "").trim();
+    const isDefaultAllowed = !passwordChanged && (entered === "owner2026" || entered === "2026");
+
+    if (!check.allowed && entered !== savedPassword && !isDefaultAllowed) {
+      res.status(401).json({
+        error: "Unauthorized. Enter your Business Owner Admin Password (default: owner2026) to generate blog posts.",
+      });
+      return;
+    }
+
+    const existingModules =
+      currentCfg.intelligentModules ||
+      buildIntelligentSmartModules({
+        archetype: currentCfg.archetype,
+        businessName: currentCfg.brandName || site.businessName,
+        category: currentCfg.category || site.category,
+        city: currentCfg.city || site.city,
+        phone: currentCfg.phoneDisplay || site.phone,
+        servicesList: (currentCfg.funnelConfig?.step1Options || []).map((o: any) => o.label),
+      });
+
+    const newArticle = await generateAiBlogPostForWebsite(site, String(customTopic || "").trim());
+    const currentPosts = Array.isArray(existingModules.seoBlog?.posts)
+      ? existingModules.seoBlog.posts
+      : [];
+
+    const updatedModules = {
+      ...existingModules,
+      seoBlog: {
+        ...(existingModules.seoBlog || {}),
+        enabled: true,
+        posts: [newArticle, ...currentPosts],
+      },
+    };
+
+    const updatedCfg = {
+      ...currentCfg,
+      intelligentModules: updatedModules,
+    };
+
+    const [updatedSite] = await db
+      .update(generatedWebsitesTable)
+      .set({
+        siteConfig: updatedCfg,
+        updatedAt: new Date(),
+      })
+      .where(eq(generatedWebsitesTable.siteId, siteId))
+      .returning();
+
+    const baseUrl = getAgencyBaseUrl(req);
+    publicSiteMemoryCache.set(siteId, {
+      ...updatedSite,
+      siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
+    });
+    res.json({
+      success: true,
+      article: newArticle,
+      intelligentModules: updatedModules,
+      site: {
+        ...updatedSite,
+        siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
+      },
+    });
+  } catch (err: any) {
+    console.error("[website-builder] Generate blog post error:", err);
+    res.status(500).json({
+      error: err.message || "Failed to generate Local SEO Blog article",
+    });
+  }
+}
+
+router.post("/website-builder/public/:siteId/generate-blog-post", handleGenerateAiBlogPost);
+router.post("/website-builder/sites/:siteId/generate-blog-post", handleGenerateAiBlogPost);
 
 router.get("/website-builder/public/:siteId/export-html", async (req: Request, res: Response) => {
   try {
@@ -2019,6 +3036,156 @@ router.get("/website-builder/public/:siteId/export-html", async (req: Request, r
     res.send(html);
   } catch (err: any) {
     res.status(500).send("Failed to export website HTML");
+  }
+});
+
+// ─── 9. 1-Click Deploy Generated Website to User's Own Vercel Account ($0 Cost) ─
+
+router.post("/website-builder/sites/:siteId/deploy-vercel", async (req: Request, res: Response) => {
+  try {
+    const check = await isCallerAllowedBuilder(req);
+    if (!check.allowed) {
+      res.status(403).json({ error: "Access denied" });
+      return;
+    }
+
+    const { siteId } = req.params;
+    const { vercelToken = "", projectName = "", teamId = "" } = req.body ?? {};
+    const cleanToken = String(vercelToken).trim();
+
+    if (!cleanToken) {
+      res.status(400).json({
+        error: "Please paste your Vercel Access Token (from vercel.com/account/tokens) to deploy.",
+      });
+      return;
+    }
+
+    const rows = await db
+      .select()
+      .from(generatedWebsitesTable)
+      .where(eq(generatedWebsitesTable.siteId, siteId))
+      .limit(1);
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Website not found" });
+      return;
+    }
+
+    const site = rows[0];
+    const baseUrl = getAgencyBaseUrl(req);
+    const productionHtml = exportStandaloneHtmlBundle(site, baseUrl);
+
+    const cleanProjectName =
+      String(projectName || site.siteId)
+        .toLowerCase()
+        .replace(/[^a-z0-9-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .replace(/--+/g, "-")
+        .slice(0, 52) || `site-${site.siteId.slice(0, 20)}`;
+
+    const vercelEndpoint = teamId
+      ? `https://api.vercel.com/v13/deployments?teamId=${encodeURIComponent(String(teamId).trim())}`
+      : "https://api.vercel.com/v13/deployments";
+
+    const vercelPayload = {
+      name: cleanProjectName,
+      files: [
+        {
+          file: "index.html",
+          data: productionHtml,
+        },
+        {
+          file: "vercel.json",
+          data: JSON.stringify(
+            {
+              cleanUrls: true,
+              trailingSlash: false,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      projectSettings: {
+        framework: null,
+      },
+      target: "production",
+    };
+
+    const deployRes = await fetch(vercelEndpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${cleanToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(vercelPayload),
+    });
+
+    const deployData = (await deployRes.json().catch(() => ({}))) as any;
+
+    if (!deployRes.ok) {
+      const errMsg =
+        deployData?.error?.message ||
+        deployData?.message ||
+        `Vercel API returned status ${deployRes.status}`;
+      res.status(deployRes.status >= 400 && deployRes.status < 500 ? deployRes.status : 500).json({
+        error: `Vercel Deployment Error: ${errMsg}`,
+      });
+      return;
+    }
+
+    const aliasDomain =
+      Array.isArray(deployData.alias) && deployData.alias.length > 0
+        ? deployData.alias[0]
+        : deployData.url || `${cleanProjectName}.vercel.app`;
+    const liveVercelUrl = aliasDomain.startsWith("http")
+      ? aliasDomain
+      : `https://${aliasDomain}`;
+
+    const currentCfg = (site.siteConfig || {}) as any;
+    const updatedCfg = {
+      ...currentCfg,
+      hostingMode: "live_hosted",
+      vercelDeploymentUrl: liveVercelUrl,
+      vercelDeploymentId: String(deployData.id || ""),
+      vercelProjectName: cleanProjectName,
+      vercelDeployedAt: new Date().toISOString(),
+    };
+
+    const [updatedSite] = await db
+      .update(generatedWebsitesTable)
+      .set({
+        siteConfig: updatedCfg,
+        updatedAt: new Date(),
+      })
+      .where(eq(generatedWebsitesTable.siteId, siteId))
+      .returning();
+
+    await db.insert(userActivitiesTable).values({
+      userId: check.userId,
+      userEmail: check.email || OWNER_EMAIL,
+      userName: site.businessName,
+      category: "audit",
+      action: `▲ Deployed ${site.businessName} Website Live to Vercel (${liveVercelUrl})`,
+      details: `Project: ${cleanProjectName} · Deployment ID: ${deployData.id || "live"}`,
+    });
+
+    res.json({
+      success: true,
+      deploymentUrl: liveVercelUrl,
+      deploymentId: deployData.id,
+      projectName: cleanProjectName,
+      readyState: deployData.readyState || "READY",
+      site: {
+        ...updatedSite,
+        siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
+      },
+    });
+  } catch (err: any) {
+    console.error("[website-builder] Vercel deploy error:", err);
+    res.status(500).json({
+      error: err.message || "Failed to deploy website to Vercel",
+    });
   }
 });
 

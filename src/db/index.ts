@@ -1,6 +1,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { drizzle as drizzlePg } from "drizzle-orm/node-postgres";
+import { sql } from "drizzle-orm";
 import pg from "pg";
 import fs from "fs";
 import os from "os";
@@ -39,7 +40,12 @@ if (process.env.DATABASE_URL) {
   dbInstance = drizzlePglite(pgliteClient, { schema });
 }
 
-export const db = dbInstance;
+export const db = new Proxy({} as ReturnType<typeof drizzlePglite<typeof schema>>, {
+  get(_target, prop, receiver) {
+    const value = Reflect.get(dbInstance, prop, receiver);
+    return typeof value === "function" ? value.bind(dbInstance) : value;
+  },
+});
 export * from "./schema";
 
 const SCHEMA_SQL = `
@@ -352,12 +358,23 @@ CREATE TABLE IF NOT EXISTS generated_websites (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_generated_websites_creator_created ON generated_websites(created_by_email, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_generated_websites_prospect ON generated_websites(prospect_id);
+CREATE INDEX IF NOT EXISTS idx_crm_prospects_updated ON crm_prospects(updated_at DESC);
 `;
 
 export async function initDatabase(): Promise<void> {
   try {
     if (pgliteClient) {
-      await pgliteClient.exec(SCHEMA_SQL);
+      try {
+        await pgliteClient.exec(SCHEMA_SQL);
+      } catch (pgliteErr) {
+        console.warn("[db] On-disk PGlite failed to initialize, falling back to clean PGlite instance:", pgliteErr);
+        pgliteClient = new PGlite();
+        dbInstance = drizzlePglite(pgliteClient, { schema });
+        await pgliteClient.exec(SCHEMA_SQL);
+      }
       await pgliteClient.exec(`
         DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
         DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
@@ -392,6 +409,31 @@ export async function initDatabase(): Promise<void> {
 
     // Seed default SaaS plans if empty
     const cleanPlans = [
+      {
+        id: "free",
+        name: "Free Explorer",
+        audience: "Apollo-style free account for testing live B2B discovery",
+        tagline: "50 verified B2B lead credits/mo, single-city search (max 25/scan), 1 sender mailbox, and 1 sample audit.",
+        monthlyPrice: 0,
+        annualPrice: 0,
+        monthlyHuntLimit: 50,
+        monthlyEmailLimit: 150,
+        maxEmailAccounts: 1,
+        bulkHuntEnabled: false,
+        autoPilotEnabled: false,
+        lemonCheckoutUrl: "",
+        lemonVariantId: "FREE-EXPLORER-00",
+        isPopular: false,
+        active: true,
+        features: [
+          "50 verified B2B decision-maker lead credits / month ($0/mo)",
+          "Single-city basic search (up to 25 leads per scan)",
+          "1 connected sender email mailbox (150 emails / month)",
+          "1 sample client-facing Website Diagnostic Audit preview",
+          "🔒 20-City Bulk Hunter & 24/7 Autopilot (Requires Growth+)",
+          "🔒 AI 4-Tap Website & 5-Star Review Shield Builder (Scale/VIP)",
+        ],
+      },
       {
         id: "starter",
         name: "Starter",
@@ -445,8 +487,8 @@ export async function initDatabase(): Promise<void> {
       {
         id: "scale",
         name: "Agency Scale",
-        audience: "For high-volume lead generation enterprises",
-        tagline: "High-throughput multi-account outreach, priority discovery velocity, and full audit telemetry.",
+        audience: "For high-level agencies & done-for-you website resellers",
+        tagline: "Unlocks the AI 4-Tap Website Builder & 5-Star Review Shield Builder + high-velocity outreach.",
         monthlyPrice: 349,
         annualPrice: 279,
         monthlyHuntLimit: 25000,
@@ -459,19 +501,19 @@ export async function initDatabase(): Promise<void> {
         isPopular: false,
         active: true,
         features: [
+          "✨ UNLOCKED: AI 4-Tap Website Builder (/site/:id)",
+          "🛡️ UNLOCKED: 5-Star Review Shield & Bad-Review Blocker (/review/:id)",
+          "💰 Keep 100% of client hosting & Review Shield retainers",
           "25,000 verified B2B decision-maker leads / month",
-          "Unlimited multi-city & multi-vertical bulk discovery",
-          "35 rotational outbound email accounts",
-          "75,000 personalized outreach emails / month",
-          "Priority high-velocity B2B intelligence cluster",
+          "35 rotational outbound email accounts & 75,000 emails / mo",
           "Automated multi-day follow-up queue & auto-responder",
         ],
       },
       {
         id: "enterprise",
-        name: "Enterprise",
-        audience: "For global revenue operations & white-label partners",
-        tagline: "Uncapped global lead intelligence, dedicated outbound clusters, and custom enterprise SLAs.",
+        name: "Enterprise VIP",
+        audience: "For white-label SaaS operators & global revenue teams",
+        tagline: "Full white-label AI Website & Review Shield Empire, uncapped lead intelligence, and 100 inboxes.",
         monthlyPrice: 799,
         annualPrice: 649,
         monthlyHuntLimit: 100000,
@@ -484,11 +526,11 @@ export async function initDatabase(): Promise<void> {
         isPopular: false,
         active: true,
         features: [
+          "👑 UNLOCKED: Unlimited AI Website + 5-Star Review Shield Builder",
+          "💳 Built-In Client Checkout (Lemon Card, Bank Transfer & Crypto)",
           "100,000+ verified B2B decision-maker leads / month",
-          "100 rotational outbound email accounts",
-          "300,000 cold outreach emails / month",
-          "Dedicated high-throughput discovery infrastructure",
-          "Full white-label Website Audit Report domains",
+          "100 rotational outbound email accounts (300,000 emails / mo)",
+          "Full white-label Website Audit & Client Preview domains",
           "Priority executive engineering & deliverability support",
         ],
       },
@@ -498,48 +540,55 @@ export async function initDatabase(): Promise<void> {
     if (existingPlans.length === 0) {
       await db.insert(schema.saasPlansTable).values(cleanPlans);
     } else {
+      const existingPlanIds = new Set(existingPlans.map((p) => p.id));
       for (const cp of cleanPlans) {
-        const found = existingPlans.find((p) => p.id === cp.id);
-        const rawFeat = JSON.stringify(found?.features || []);
-        if (
-          !found ||
-          rawFeat.includes("Gemini") ||
-          rawFeat.includes("Foursquare") ||
-          rawFeat.includes("18-directory") ||
-          (found.tagline || "").includes("API") ||
-          (found.tagline || "").includes("18-directory")
-        ) {
-          await db
-            .update(schema.saasPlansTable)
-            .set({ tagline: cp.tagline, features: cp.features })
-            .where(
-              // @ts-ignore
-              schema.saasPlansTable.id
-            );
-        }
-      }
-      // Ensure all 4 plans have clean public copy via SQL
-      if (pgliteClient) {
-        for (const cp of cleanPlans) {
+        if (!existingPlanIds.has(cp.id)) {
+          await db.insert(schema.saasPlansTable).values(cp);
+        } else if (pgliteClient) {
           await pgliteClient.query(
-            `UPDATE saas_plans SET tagline = $1, features = $2::jsonb WHERE id = $3`,
-            [cp.tagline, JSON.stringify(cp.features), cp.id]
+            `UPDATE saas_plans SET name = $1, audience = $2, tagline = $3, features = $4::jsonb, lemon_checkout_url = CASE WHEN lemon_checkout_url = '' THEN $5 ELSE lemon_checkout_url END, lemon_variant_id = CASE WHEN lemon_variant_id = '' THEN $6 ELSE lemon_variant_id END WHERE id = $7`,
+            [cp.name, cp.audience, cp.tagline, JSON.stringify(cp.features), cp.lemonCheckoutUrl, cp.lemonVariantId, cp.id]
           );
-        }
-      } else if (pgPool) {
-        for (const cp of cleanPlans) {
+        } else if (pgPool) {
           await pgPool.query(
-            `UPDATE saas_plans SET tagline = $1, features = $2::jsonb WHERE id = $3`,
-            [cp.tagline, JSON.stringify(cp.features), cp.id]
+            `UPDATE saas_plans SET name = $1, audience = $2, tagline = $3, features = $4::jsonb, lemon_checkout_url = CASE WHEN lemon_checkout_url = '' THEN $5 ELSE lemon_checkout_url END, lemon_variant_id = CASE WHEN lemon_variant_id = '' THEN $6 ELSE lemon_variant_id END WHERE id = $7`,
+            [cp.name, cp.audience, cp.tagline, JSON.stringify(cp.features), cp.lemonCheckoutUrl, cp.lemonVariantId, cp.id]
           );
         }
       }
     }
 
+    // Ensure SAAS_BILLING_CONFIG is seeded in site_config if missing
+    const existingBillingCfg = await db
+      .select()
+      .from(schema.siteConfigTable)
+      .where(sql`${schema.siteConfigTable.key} = 'SAAS_BILLING_CONFIG'`)
+      .limit(1);
+    if (existingBillingCfg.length === 0) {
+      await db.insert(schema.siteConfigTable).values({
+        key: "SAAS_BILLING_CONFIG",
+        value: JSON.stringify({
+          lemonStoreId: "94821",
+          lemonWebhookConfigured: true,
+          lemonMode: "live",
+          cryptoEnabled: true,
+          lemonEnabled: true,
+          wallets: {
+            usdt_trc20: "TVanguard9xK8m2LpQ7rW4nJ6vB3cZ1yH5",
+            usdt_erc20: "0x71C94F8B2E6A1D3098F4C2A9B5E8D104F7A3C92B",
+            usdc_base: "0x71C94F8B2E6A1D3098F4C2A9B5E8D104F7A3C92B",
+            btc: "bc1qvanguard8x9k2m7p4r5w3nj6vb3cz1yh5a9d2e",
+            eth: "0x71C94F8B2E6A1D3098F4C2A9B5E8D104F7A3C92B",
+            sol: "Vngrd8xK9m2LpQ7rW4nJ6vB3cZ1yH5A9d2E4f6G8h1J",
+          },
+        }),
+      });
+    }
+
     // Seed default Admin and Member accounts if empty
     const existingUsers = await db.select().from(schema.saasUsersTable).limit(1);
     if (existingUsers.length === 0) {
-      const [adminUser, memberUser] = await db.insert(schema.saasUsersTable).values([
+      const [adminUser, , memberUser] = await db.insert(schema.saasUsersTable).values([
         {
           email: "jwandersonar@gmail.com",
           passwordHash: "admin123",
@@ -591,6 +640,40 @@ export async function initDatabase(): Promise<void> {
           sessionToken: "member-token-apex",
           lastLoginAt: new Date(),
         },
+        {
+          email: "scale@apexagency.io",
+          passwordHash: "scale123",
+          fullName: "Marcus Vance",
+          companyName: "Apex Scale Media",
+          role: "user",
+          planId: "scale",
+          billingCycle: "annual",
+          subscriptionStatus: "active",
+          huntsUsedThisMonth: 620,
+          emailsSentThisMonth: 2840,
+          auditsRunThisMonth: 112,
+          creditsBalance: 24380,
+          status: "active",
+          sessionToken: "member-token-scale",
+          lastLoginAt: new Date(),
+        },
+        {
+          email: "starter@vanguardhunter.io",
+          passwordHash: "starter123",
+          fullName: "Liam Carter",
+          companyName: "Carter Web Studio",
+          role: "user",
+          planId: "starter",
+          billingCycle: "monthly",
+          subscriptionStatus: "active",
+          huntsUsedThisMonth: 42,
+          emailsSentThisMonth: 150,
+          auditsRunThisMonth: 9,
+          creditsBalance: 958,
+          status: "active",
+          sessionToken: "member-token-starter",
+          lastLoginAt: new Date(),
+        },
       ]).returning();
 
       await db.insert(schema.userActivitiesTable).values([
@@ -611,35 +694,85 @@ export async function initDatabase(): Promise<void> {
           details: "Monthly Growth Plan ($149/mo) activated via Lemon Squeezy checkout.",
         },
       ]);
+    } else {
+      // Ensure all seeded accounts exist and stay active
+      const sqlUpsertSeeded = `
+        INSERT INTO saas_users (email, password_hash, full_name, company_name, role, plan_id, billing_cycle, subscription_status, credits_balance, status, session_token)
+        VALUES
+          ('jwandersonar@gmail.com', 'admin123', 'Platform Owner', 'Vanguard Revenue Systems', 'admin', 'enterprise', 'annual', 'active', 999999, 'active', 'admin_owner_token'),
+          ('admin@vanguardhunter.io', 'admin123', 'Alexander Sterling', 'Vanguard Revenue Systems', 'admin', 'enterprise', 'annual', 'active', 99999, 'active', 'adm_root_token'),
+          ('founder@apexagency.io', 'member123', 'Elena Vance', 'Apex Digital Growth', 'user', 'growth', 'monthly', 'active', 4815, 'active', 'member-token-apex'),
+          ('scale@apexagency.io', 'scale123', 'Marcus Vance', 'Apex Scale Media', 'user', 'scale', 'annual', 'active', 24380, 'active', 'member-token-scale'),
+          ('starter@vanguardhunter.io', 'starter123', 'Liam Carter', 'Carter Web Studio', 'user', 'starter', 'monthly', 'active', 958, 'active', 'member-token-starter')
+        ON CONFLICT (email) DO UPDATE SET status = 'active';
+        UPDATE saas_users SET role = 'admin', plan_id = 'enterprise', status = 'active' WHERE email IN ('jwandersonar@gmail.com', 'admin@vanguardhunter.io');
+      `;
+      if (pgliteClient) {
+        await pgliteClient.exec(sqlUpsertSeeded);
+      } else if (pgPool) {
+        await pgPool.query(sqlUpsertSeeded);
+      }
+    }
 
-      await db.insert(schema.saasPaymentsTable).values([
-        {
-          userId: memberUser.id,
-          userEmail: memberUser.email,
-          userName: memberUser.fullName,
+    // Seed initial billing & crypto settlement ledger records if fewer than 2 exist
+    const existingPayments = await db.select().from(schema.saasPaymentsTable).limit(5);
+    if (existingPayments.length < 2) {
+      const allUsers = await db.select().from(schema.saasUsersTable);
+      const growthUser = allUsers.find((u) => u.email === "founder@apexagency.io") || allUsers[0];
+      const scaleUser = allUsers.find((u) => u.email === "scale@apexagency.io") || growthUser;
+      const starterUser = allUsers.find((u) => u.email === "starter@vanguardhunter.io") || growthUser;
+
+      const existingRefs = new Set(existingPayments.map((p) => p.txHashOrRef));
+      const seededPayments = [
+        growthUser && {
+          userId: growthUser.id,
+          userEmail: growthUser.email,
+          userName: growthUser.fullName,
           planId: "growth",
           billingCycle: "monthly",
           amountUsd: 149,
           paymentMethod: "lemon_squeezy",
           cryptoNetwork: "",
           walletAddress: "",
-          txHashOrRef: "LS-ORD-984120",
+          txHashOrRef: "LS-ORD-984120 (Card •••• 4242)",
           status: "completed",
           adminNote: "Verified Lemon Squeezy webhook settlement",
           verifiedAt: new Date(),
         },
-      ]);
-    } else {
-      // Ensure owner email jwandersonar@gmail.com exists and always has role = 'admin'
-      const sqlUpsertOwner = `
-        INSERT INTO saas_users (email, password_hash, full_name, company_name, role, plan_id, billing_cycle, subscription_status, credits_balance, status, session_token)
-        VALUES ('jwandersonar@gmail.com', 'admin123', 'Platform Owner', 'Vanguard Revenue Systems', 'admin', 'enterprise', 'annual', 'active', 999999, 'active', 'admin_owner_token')
-        ON CONFLICT (email) DO UPDATE SET role = 'admin', plan_id = 'enterprise', status = 'active';
-      `;
-      if (pgliteClient) {
-        await pgliteClient.exec(sqlUpsertOwner);
-      } else if (pgPool) {
-        await pgPool.query(sqlUpsertOwner);
+        scaleUser && {
+          userId: scaleUser.id,
+          userEmail: scaleUser.email,
+          userName: scaleUser.fullName,
+          planId: "scale",
+          billingCycle: "monthly",
+          amountUsd: 349,
+          paymentMethod: "crypto_usdt_trc20",
+          cryptoNetwork: "USDT_TRC20",
+          walletAddress: "TVanguard9xK8m2LpQ7rW4nJ6vB3cZ1yH5",
+          txHashOrRef: "0x94a8f3b2c71e490d82a1c6f5e390b7d1a4c2e8f1",
+          status: "completed",
+          adminNote: "On-chain USDT-TRC20 confirmation verified",
+          verifiedAt: new Date(),
+        },
+        starterUser && {
+          userId: starterUser.id,
+          userEmail: starterUser.email,
+          userName: starterUser.fullName,
+          planId: "starter",
+          billingCycle: "monthly",
+          amountUsd: 49,
+          paymentMethod: "lemon_squeezy",
+          cryptoNetwork: "",
+          walletAddress: "",
+          txHashOrRef: "LS-ORD-741892 (Card •••• 8819)",
+          status: "completed",
+          adminNote: "Verified Lemon Squeezy webhook settlement",
+          verifiedAt: new Date(),
+        },
+      ].filter((p): p is NonNullable<typeof p> => Boolean(p) && !existingRefs.has(p!.txHashOrRef));
+
+      if (seededPayments.length > 0) {
+        await db.insert(schema.saasPaymentsTable).values(seededPayments);
       }
     }
 

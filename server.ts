@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import fs from "fs";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { initDatabase } from "./src/db";
@@ -13,19 +14,46 @@ import affiliateRouter from "./src/server/routes/affiliate";
 import saasRouter from "./src/server/routes/saas";
 import websiteBuilderRouter from "./src/server/routes/website-builder";
 
-async function startServer() {
-  await initDatabase();
+function resolvePort(): number {
+  const portArgIdx = process.argv.indexOf("--port");
+  if (portArgIdx !== -1 && process.argv[portArgIdx + 1]) {
+    const parsed = Number(process.argv[portArgIdx + 1]);
+    if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+  }
+  if (process.env.DEFAULT_APP_PORT) {
+    return Number(process.env.DEFAULT_APP_PORT) || 3000;
+  }
+  const envPort = Number(process.env.PORT);
+  if (envPort && String(envPort) !== process.env.NGINX_PORT && envPort !== 8080) {
+    return envPort;
+  }
+  return 3000;
+}
 
+async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = resolvePort();
+
+  const dbReady = initDatabase().catch((err) => {
+    console.error("[server] Database init error:", err);
+  });
 
   app.use(cors());
   app.use(express.json({ limit: "15mb" }));
   app.use(express.urlencoded({ extended: true }));
 
-  // Healthcheck
+  // Healthcheck (responds immediately)
   app.get("/api/healthz", (_req, res) => {
     res.json({ status: "ok", app: "ai-business-hunter" });
+  });
+  app.get("/api/health", (_req, res) => {
+    res.json({ status: "ok", app: "ai-business-hunter" });
+  });
+
+  // Ensure DB is initialized before processing API routes
+  app.use("/api", async (_req, _res, next) => {
+    await dbReady;
+    next();
   });
 
   // Mount AI Business Hunter & CRM routes
@@ -38,24 +66,57 @@ async function startServer() {
   app.use("/api", apiKeysRouter);
   app.use("/api", affiliateRouter);
 
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
+  // Ensure any unmatched /api/* route returns JSON 404 instead of SPA HTML
+  app.use("/api", (req, res) => {
+    res.status(404).json({ error: `API endpoint not found: ${req.method} ${req.originalUrl}` });
+  });
+
+  const distPath = path.join(process.cwd(), "dist");
+  const hasBuiltDist = fs.existsSync(path.join(distPath, "index.html"));
+
+  if (process.env.NODE_ENV !== "production" || !hasBuiltDist) {
+    const vitePromise = createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
-    app.use(vite.middlewares);
+    app.use(async (req, res, next) => {
+      try {
+        const vite = await vitePromise;
+        vite.middlewares(req, res, next);
+      } catch (err) {
+        next(err);
+      }
+    });
   } else {
-    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`AI Business Hunter server running on http://0.0.0.0:${PORT}`);
-    startScheduler();
-  });
+  const listenWithRetry = (retriesLeft = 10) => {
+    const server = app.listen(PORT, "0.0.0.0", () => {
+      console.log(`AI Business Hunter server running on http://0.0.0.0:${PORT}`);
+      dbReady.then(() => startScheduler());
+    });
+
+    server.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRINUSE" && retriesLeft > 0) {
+        console.warn(`[server] Port ${PORT} busy, retrying in 350ms (${retriesLeft} retries left)...`);
+        setTimeout(() => {
+          try {
+            server.close();
+          } catch {}
+          listenWithRetry(retriesLeft - 1);
+        }, 350);
+      } else {
+        console.error("[server] Server listen error:", err);
+        process.exit(1);
+      }
+    });
+  };
+
+  listenWithRetry();
 }
 
 startServer().catch((err) => {

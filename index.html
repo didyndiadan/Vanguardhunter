@@ -12,6 +12,54 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+    <script>
+      (function () {
+        try {
+          var m = window.location.pathname.match(/^\/(?:site|review)\/([^/?#]+)/);
+          if (m && m[1]) {
+            var siteId = decodeURIComponent(m[1]);
+            var prettyTitle = siteId
+              .replace(/-[a-f0-9]{6,10}$/i, "")
+              .split("-")
+              .map(function (w) { return w ? w.charAt(0).toUpperCase() + w.slice(1) : ""; })
+              .join(" ");
+            if (prettyTitle) {
+              document.title = prettyTitle;
+            }
+            try {
+              var cached = sessionStorage.getItem("vh_site_cache_" + siteId) || localStorage.getItem("vh_site_cache_" + siteId);
+              if (cached) {
+                var parsed = JSON.parse(cached);
+                if (parsed && parsed.site) {
+                  window.__PRELOADED_SITE_DATA__ = parsed;
+                  if (parsed.site.businessName) {
+                    document.title = parsed.site.businessName + (parsed.site.city ? " — " + parsed.site.city : "");
+                  }
+                }
+              }
+            } catch (e) {}
+            window.__PREFETCHED_SITE_ID__ = siteId;
+            window.__PREFETCHED_SITE_PROMISE__ = fetch("/api/website-builder/public/" + encodeURIComponent(siteId))
+              .then(function (r) { return r.ok ? r.json() : null; })
+              .then(function (data) {
+                if (data && data.site) {
+                  window.__PRELOADED_SITE_DATA__ = data;
+                  if (data.site.businessName) {
+                    document.title = data.site.businessName + (data.site.city ? " — " + data.site.city : "");
+                  }
+                  try {
+                    var serialized = JSON.stringify(data);
+                    sessionStorage.setItem("vh_site_cache_" + siteId, serialized);
+                    localStorage.setItem("vh_site_cache_" + siteId, serialized);
+                  } catch (e) {}
+                }
+                return data;
+              })
+              .catch(function () { return null; });
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

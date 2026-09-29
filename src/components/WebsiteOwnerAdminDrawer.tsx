@@ -23,7 +23,14 @@ import {
   Server,
   Save,
   RefreshCw,
+  Mic,
+  Volume2,
 } from "lucide-react";
+import {
+  STUDIO_VOICE_PERSONAS,
+  getStudioVoicePersona,
+  speakWithStudioVoice,
+} from "@/lib/studio-voices";
 
 export interface WebsiteThemePalette {
   id: string;
@@ -45,6 +52,24 @@ export interface WebsiteThemePalette {
 }
 
 export const WEBSITE_COLOR_THEMES: Record<string, WebsiteThemePalette> = {
+  kinetic_crimson: {
+    id: "kinetic_crimson",
+    name: "Kinetic Crimson & Carbon Athletic",
+    badge: "Fitness · Gyms · Athletic Training",
+    bgCanvas: "#F8FAFC",
+    bgElevated: "#FFFFFF",
+    bgSubtle: "#FFF1F2",
+    bgDarkSection: "#090D16",
+    textPrimary: "#090D16",
+    textSecondary: "#1E293B",
+    textMuted: "#475569",
+    accent: "#E11D48",
+    accentHover: "#BE123C",
+    accentSoft: "#FFE4E6",
+    border: "#FECDD3",
+    topBarBg: "#090D16",
+    topBarText: "#FFF1F2",
+  },
   valley_craft: {
     id: "valley_craft",
     name: "Warm Walnut & Sandstone",
@@ -245,19 +270,180 @@ export const WEBSITE_COLOR_THEMES: Record<string, WebsiteThemePalette> = {
   },
 };
 
+import kitchenImg from "@/assets/images/showcase_kitchen_remodel_1790391137149.jpg";
+import bathroomImg from "@/assets/images/showcase_bathroom_renovation_1790391148499.jpg";
+import exteriorImg from "@/assets/images/showcase_whole_home_exterior_1790391161411.jpg";
+import commercialImg from "@/assets/images/showcase_commercial_service_1790391173740.jpg";
+import plumbingHvacImg from "@/assets/images/industry_plumbing_hvac_1790393997472.jpg";
+import roofingExteriorImg from "@/assets/images/industry_roofing_exterior_1790394014092.jpg";
+import dentalMedicalImg from "@/assets/images/industry_dental_medical_1790394023456.jpg";
+import dentalNetworkImg from "@/assets/images/case_study_dental_network_1790378421158.jpg";
+import restaurantCulinaryImg from "@/assets/images/industry_restaurant_culinary_1790394033671.jpg";
+import legalAdvisoryImg from "@/assets/images/industry_legal_advisory_1790394045191.jpg";
+import autoMechanicalImg from "@/assets/images/industry_auto_mechanical_1790394056628.jpg";
+import salonWellnessImg from "@/assets/images/industry_salon_wellness_1790394067909.jpg";
+import landscapingOutdoorImg from "@/assets/images/industry_landscaping_outdoor_1790394078101.jpg";
+import commercialSolarImg from "@/assets/images/case_study_commercial_solar_1790378432723.jpg";
+import b2bIntelligenceImg from "@/assets/images/hero_b2b_intelligence_1790378408952.jpg";
+import fitnessStrengthImg from "@/assets/images/fitness_strength_training_1790421475678.jpg";
+import fitnessGroupImg from "@/assets/images/fitness_group_workout_1790421490041.jpg";
+import fitnessCoachingImg from "@/assets/images/fitness_personal_coaching_1790421502270.jpg";
+import restaurantDiningImg from "@/assets/images/restaurant_dining_experience_1790422268280.jpg";
+import salonStylingImg from "@/assets/images/salon_barber_styling_1790422282481.jpg";
+import autoDiagnosticImg from "@/assets/images/auto_diagnostic_service_1790422294786.jpg";
+import hvacDispatchImg from "@/assets/images/hvac_electrical_dispatch_1790422305378.jpg";
+import medicalConsultationImg from "@/assets/images/medical_patient_consultation_1790422317477.jpg";
+import fitnessCardioFunctionalImg from "@/assets/images/fitness_cardio_functional_1790446127481.jpg";
+import restaurantCateringBanquetImg from "@/assets/images/restaurant_catering_banquet_1790446138947.jpg";
+import restaurantArtisanKitchenImg from "@/assets/images/restaurant_artisan_kitchen_1790446302167.jpg";
+import salonSpaFacialImg from "@/assets/images/salon_spa_facial_treatment_1790446149827.jpg";
+import salonLuxuryHairColorImg from "@/assets/images/salon_luxury_hair_color_1790446312366.jpg";
+import autoBrakeTireImg from "@/assets/images/auto_brake_tire_alignment_1790446160171.jpg";
+import autoPrecisionDetailingBayImg from "@/assets/images/auto_precision_detailing_bay_1790446323994.jpg";
+import electricalPlumbingSpecialistImg from "@/assets/images/electrical_plumbing_specialist_1790446170455.jpg";
+import hvacSmartClimateInstallImg from "@/assets/images/hvac_smart_climate_install_1790446336291.jpg";
+import medicalModernTreatmentSuiteImg from "@/assets/images/medical_modern_treatment_suite_1790446292341.jpg";
+import remodelCustomLivingImg from "@/assets/images/remodel_custom_living_carpentry_1790446181402.jpg";
+import advisoryExecutiveBoardroomImg from "@/assets/images/advisory_executive_boardroom_1790446354674.jpg";
+import { selectUniqueVisualsForBusiness } from "@/lib/industry-visual-pool";
+
+export const UNIVERSAL_SHOWCASE_IMAGES: Record<string, string> = {
+  fitness_strength: fitnessStrengthImg,
+  fitness_group: fitnessGroupImg,
+  fitness_coaching: fitnessCoachingImg,
+  fitness_cardio_functional: fitnessCardioFunctionalImg,
+  medical_consultation: medicalConsultationImg,
+  medical_modern_treatment_suite: medicalModernTreatmentSuiteImg,
+  restaurant_dining: restaurantDiningImg,
+  restaurant_catering_banquet: restaurantCateringBanquetImg,
+  restaurant_artisan_kitchen: restaurantArtisanKitchenImg,
+  salon_styling: salonStylingImg,
+  salon_spa_facial_treatment: salonSpaFacialImg,
+  salon_luxury_hair_color: salonLuxuryHairColorImg,
+  auto_diagnostic: autoDiagnosticImg,
+  auto_brake_tire_alignment: autoBrakeTireImg,
+  auto_precision_detailing_bay: autoPrecisionDetailingBayImg,
+  hvac_dispatch: hvacDispatchImg,
+  electrical_plumbing_specialist: electricalPlumbingSpecialistImg,
+  hvac_smart_climate_install: hvacSmartClimateInstallImg,
+  kitchen: kitchenImg,
+  bathroom: bathroomImg,
+  remodel_custom_living_carpentry: remodelCustomLivingImg,
+  exterior: exteriorImg,
+  commercial: commercialImg,
+  plumbing_hvac: plumbingHvacImg,
+  roofing_exterior: roofingExteriorImg,
+  dental_medical: dentalMedicalImg,
+  dental_network: dentalNetworkImg,
+  restaurant_culinary: restaurantCulinaryImg,
+  legal_advisory: legalAdvisoryImg,
+  auto_mechanical: autoMechanicalImg,
+  salon_wellness: salonWellnessImg,
+  landscaping_outdoor: landscapingOutdoorImg,
+  commercial_solar: commercialSolarImg,
+  b2b_intelligence: b2bIntelligenceImg,
+  advisory_executive_boardroom: advisoryExecutiveBoardroomImg,
+};
+
+export function resolvePreviewVisualsForBusiness(
+  category = "",
+  businessName = "",
+  themeIdOverride?: string,
+  finishedWork?: any[],
+  scrapedImages?: string[],
+  variationSeed = 0,
+  avoidUrls?: Set<string>,
+  city = ""
+): {
+  theme: WebsiteThemePalette;
+  images: string[];
+  nicheLabel: string;
+} {
+  const uniqueSelection = selectUniqueVisualsForBusiness({
+    category,
+    businessName,
+    city,
+    variationSeed,
+    count: 3,
+    localAssetsMap: UNIVERSAL_SHOWCASE_IMAGES,
+    avoidUrls,
+  });
+
+  const resolvedThemeId =
+    themeIdOverride && WEBSITE_COLOR_THEMES[themeIdOverride]
+      ? themeIdOverride
+      : uniqueSelection.recommendedThemeId;
+  const theme = WEBSITE_COLOR_THEMES[resolvedThemeId] || WEBSITE_COLOR_THEMES.valley_craft;
+
+  const usedUrls = new Set<string>();
+  const imgsFromWork = Array.isArray(finishedWork)
+    ? finishedWork
+        .map((fw, i) => {
+          const customUrl = String(fw?.customImageUrl || "").trim();
+          if (
+            customUrl &&
+            /^(https?:\/\/|data:image\/)/i.test(customUrl) &&
+            !usedUrls.has(customUrl) &&
+            (customUrl.startsWith("data:image/") || !avoidUrls || !avoidUrls.has(customUrl))
+          ) {
+            usedUrls.add(customUrl);
+            if (avoidUrls) avoidUrls.add(customUrl);
+            return customUrl;
+          }
+          const fallbackUrl =
+            uniqueSelection.images.find((u) => !usedUrls.has(u)) ||
+            uniqueSelection.images[i % Math.max(1, uniqueSelection.images.length)];
+          if (fallbackUrl) {
+            usedUrls.add(fallbackUrl);
+            return fallbackUrl;
+          }
+          return "";
+        })
+        .filter(Boolean)
+    : [];
+
+  const finalImages =
+    imgsFromWork.length >= 3 ? imgsFromWork.slice(0, 3) : uniqueSelection.images.slice(0, 3);
+  const extraScraped = Array.isArray(scrapedImages)
+    ? scrapedImages.filter(
+        (u) => typeof u === "string" && /^https?:\/\//i.test(u) && !finalImages.includes(u)
+      )
+    : [];
+
+  return {
+    theme,
+    images: Array.from(new Set([...finalImages, ...extraScraped.slice(0, 3)])),
+    nicheLabel: uniqueSelection.nichePool.nicheLabel,
+  };
+}
+
 export const IMAGE_PRESET_OPTIONS = [
-  { value: "dental_medical", label: "Dental & Medical Clinic Suite" },
-  { value: "dental_network", label: "Healthcare & Patient Care" },
-  { value: "restaurant_culinary", label: "Restaurant & Culinary Dining" },
-  { value: "salon_wellness", label: "Luxury Salon, MedSpa & Wellness" },
-  { value: "legal_advisory", label: "Law Firm & Executive Advisory" },
-  { value: "auto_mechanical", label: "Auto Repair & Diagnostic Bay" },
-  { value: "plumbing_hvac", label: "Plumbing, Water Heater & HVAC" },
+  { value: "fitness_strength", label: "Fitness: Strength & Weights Workout (People Training)" },
+  { value: "fitness_group", label: "Fitness: Group Workout Class & Coaching" },
+  { value: "fitness_coaching", label: "Fitness: 1-on-1 Personal Training & Turf Sled" },
+  { value: "fitness_cardio_functional", label: "Fitness: Functional Conditioning & Battle Ropes" },
+  { value: "medical_consultation", label: "Medical & Dental: Doctor Consulting With Patient" },
+  { value: "dental_medical", label: "Medical & Dental: Modern Clinical Suite" },
+  { value: "dental_network", label: "Medical & Dental: Healthcare Team" },
+  { value: "restaurant_dining", label: "Restaurant: Chef Plating & Guests Dining" },
+  { value: "restaurant_culinary", label: "Restaurant: Signature Culinary Spread" },
+  { value: "restaurant_catering_banquet", label: "Restaurant: Private Dining & Catering Banquet" },
+  { value: "salon_styling", label: "Salon & MedSpa: Stylist Working With Client" },
+  { value: "salon_spa_facial_treatment", label: "Salon & MedSpa: Facial & Aesthetic Glow Treatment" },
+  { value: "salon_wellness", label: "Salon & MedSpa: Luxury Aesthetic Studio" },
+  { value: "auto_diagnostic", label: "Auto Repair: Master Mechanic Digital Inspection" },
+  { value: "auto_brake_tire_alignment", label: "Auto Repair: Brake, Tire & Wheel Alignment" },
+  { value: "auto_mechanical", label: "Auto Repair: Precision Service Bay" },
+  { value: "hvac_dispatch", label: "Home Services: Technician Reviewing Upfront Quote" },
+  { value: "plumbing_hvac", label: "Home Services: Plumbing, Water Heater & HVAC" },
+  { value: "electrical_plumbing_specialist", label: "Home Services: Electrical & Tankless Specialist" },
   { value: "roofing_exterior", label: "Roofing & Architectural Exterior" },
   { value: "landscaping_outdoor", label: "Landscaping & Outdoor Living" },
-  { value: "commercial_solar", label: "Commercial Solar & Energy" },
+  { value: "commercial_solar", label: "Commercial Solar & Clean Energy" },
+  { value: "legal_advisory", label: "Law Firm & Executive Advisory" },
   { value: "kitchen", label: "Custom Kitchen Remodeling" },
   { value: "bathroom", label: "Primary Spa Bathroom Remodel" },
+  { value: "remodel_custom_living_carpentry", label: "Custom Living Space & Interior Carpentry" },
   { value: "exterior", label: "Whole-Home Exterior & Deck" },
   { value: "commercial", label: "Commercial Facility & Services" },
   { value: "b2b_intelligence", label: "Corporate & Technology Office" },
@@ -279,7 +465,8 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
   initialUnlocked = false,
 }) => {
   const cfg = (site?.siteConfig || {}) as any;
-  const expectedPin = String(cfg.adminPin || "2026");
+  const expectedPin = String(cfg.adminPassword || cfg.adminPin || "owner2026");
+  const isDefaultPasswordActive = !cfg.adminPasswordChanged && (expectedPin === "owner2026" || expectedPin === "2026");
 
   // Auth state for business owners opening /site/:siteId?admin=1
   const [isUnlocked, setIsUnlocked] = useState<boolean>(initialUnlocked);
@@ -287,8 +474,78 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
   const [pinError, setPinError] = useState<string>("");
 
   const [activeTab, setActiveTab] = useState<
-    "brand_colors" | "hero_funnel" | "services_work" | "reviews_faq" | "leads_inbox" | "hosting_export"
+    | "brand_colors"
+    | "smart_modules"
+    | "hero_funnel"
+    | "services_work"
+    | "reviews_faq"
+    | "leads_inbox"
+    | "hosting_export"
   >("brand_colors");
+
+  // Intelligent Smart Modules state
+  const [intelligentModules, setIntelligentModules] = useState<any>(
+    cfg.intelligentModules || {
+      industryProfile: "local_service",
+      industryLabel: `${site?.category || "Local Business"} Conversion Suite`,
+      intelligenceReason:
+        "Intelligently configured for this business type to maximize local Google rankings, phone calls, and direct bookings.",
+      promoVoucher: {
+        enabled: true,
+        badge: "NEW CLIENT SPECIAL",
+        headline: "$50 OFF Your First Service or Priority Booking",
+        subtext: "Mention this online voucher or claim below for priority scheduling.",
+        code: "VIP50",
+        ctaLabel: "Claim Voucher",
+      },
+      priceEstimator: {
+        enabled: true,
+        title: "Instant Ballpark Price & Service Estimator",
+        subtitle: "Select a service tier below to see transparent local pricing ranges",
+        tiers: [
+          {
+            label: "Diagnostic / Initial Visit",
+            range: "$89 – $175",
+            duration: "Same-Day Available",
+            includes: "On-site evaluation, upfront written quote & options",
+          },
+          {
+            label: "Standard Service / Repair",
+            range: "$240 – $680",
+            duration: "Most Completed Same Day",
+            includes: "Commercial-grade parts, licensed labor & workmanship warranty",
+          },
+          {
+            label: "Full System / Major Project",
+            range: "$1,450 – $4,800+",
+            duration: "Flexible Financing Available",
+            includes: "Turnkey installation, priority crew & full warranty",
+          },
+        ],
+      },
+      appointmentPicker: {
+        enabled: true,
+        title: "Check Today's Open Arrival & Booking Windows",
+        subtitle: "Pick a convenient time window to lock in your priority callback",
+        slotTypes: ["Urgent / Same-Day", "Standard Service", "Free Written Quote"],
+        availableWindows: ["Today · Next Open Slot", "Tomorrow · 8am–11am", "Tomorrow · 1pm–4pm", "This Week · Flexible"],
+        ctaLabel: "Reserve This Window",
+      },
+      smsDirect: {
+        enabled: true,
+        buttonLabel: "Text Us Directly",
+        prefillMessage: `Hi ${cfg.brandName || site?.businessName || "there"}, I'm visiting your website and would like a quick quote or availability check.`,
+      },
+      seoBlog: {
+        enabled: true,
+        sectionTitle: `${cfg.city || site?.city || "Local"} Local Cost Guides & Expert Advice`,
+        sectionSubtitle: `Practical answers, transparent pricing guides, and local tips from ${cfg.brandName || site?.businessName || "our team"}.`,
+        articles: [],
+      },
+    }
+  );
+  const [customBlogTopic, setCustomBlogTopic] = useState<string>("");
+  const [generatingBlogPost, setGeneratingBlogPost] = useState<boolean>(false);
 
   // Editable config state
   const [selectedThemeId, setSelectedThemeId] = useState<string>(
@@ -325,6 +582,30 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
     Array.isArray(cfg.funnelConfig?.step1Options) ? cfg.funnelConfig.step1Options : []
   );
 
+  // Built-in Automated Chatbot Settings
+  const [chatbotEnabled, setChatbotEnabled] = useState<boolean>(
+    cfg.chatbotConfig?.enabled !== false
+  );
+  const [chatbotSoundEnabled, setChatbotSoundEnabled] = useState<boolean>(
+    cfg.chatbotConfig?.soundEnabled !== false
+  );
+  const [chatbotSpokenVoiceEnabled, setChatbotSpokenVoiceEnabled] = useState<boolean>(
+    Boolean(cfg.chatbotConfig?.spokenVoiceEnabled)
+  );
+  const [chatbotVoicePersona, setChatbotVoicePersona] = useState<string>(
+    cfg.chatbotConfig?.voicePersona || "Kore"
+  );
+  const [chatbotAgentName, setChatbotAgentName] = useState<string>(
+    cfg.chatbotConfig?.agentName && !/automated|ai\b|bot\b/i.test(cfg.chatbotConfig.agentName)
+      ? cfg.chatbotConfig.agentName
+      : `${cfg.brandName || site?.businessName || "Live"} Team`
+  );
+  const [chatbotGreeting, setChatbotGreeting] = useState<string>(
+    cfg.chatbotConfig?.greeting && !/automated assistant|ai assistant/i.test(cfg.chatbotConfig.greeting)
+      ? cfg.chatbotConfig.greeting
+      : `👋 Hi there! Welcome to ${cfg.brandName || site?.businessName || "our website"} in ${cfg.city || site?.city || "your area"}. How can we help you today?`
+  );
+
   // Services & Showcase
   const [services, setServices] = useState<any[]>(
     Array.isArray(cfg.services) ? cfg.services : []
@@ -345,7 +626,15 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
     cfg.hostingMode === "live_hosted" ? "live_hosted" : "preview"
   );
   const [customDomain, setCustomDomain] = useState<string>(cfg.customDomain || "");
-  const [adminPin, setAdminPin] = useState<string>(expectedPin);
+  const [adminPin, setAdminPin] = useState<string>(expectedPin === "2026" && !cfg.adminPasswordChanged ? "owner2026" : expectedPin);
+  const [newPasswordInput, setNewPasswordInput] = useState<string>(
+    expectedPin === "2026" && !cfg.adminPasswordChanged ? "owner2026" : expectedPin
+  );
+
+  // Image Regeneration state
+  const [regeneratingImages, setRegeneratingImages] = useState<boolean>(false);
+  const [regeneratingCardIdx, setRegeneratingCardIdx] = useState<number | null>(null);
+  const [customImageScenePrompt, setCustomImageScenePrompt] = useState<string>("");
 
   const [saving, setSaving] = useState(false);
   const [saveToast, setSaveToast] = useState<string | null>(null);
@@ -353,13 +642,122 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
 
   if (!isOpen || !site) return null;
 
-  const handleVerifyPin = (e: React.FormEvent) => {
+  const handleVerifyPin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (pinInput.trim() === expectedPin || pinInput.trim() === "2026") {
+    const entered = pinInput.trim();
+    if (!entered) {
+      setPinError("Please enter your Business Owner Admin Password.");
+      return;
+    }
+    if (
+      entered === expectedPin ||
+      entered === adminPin ||
+      (!cfg.adminPasswordChanged && (entered === "owner2026" || entered === "2026"))
+    ) {
       setIsUnlocked(true);
       setPinError("");
-    } else {
-      setPinError(`Incorrect PIN. Try "${expectedPin}" or universal agency PIN "2026".`);
+      return;
+    }
+    try {
+      const res = await fetch(`/api/website-builder/public/${site.siteId}/admin-verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pin: entered, password: entered }),
+      });
+      const data = await res.json();
+      if (res.ok && data.authorized) {
+        setIsUnlocked(true);
+        setPinError("");
+        return;
+      }
+      setPinError(
+        data.error ||
+          (isDefaultPasswordActive
+            ? 'Incorrect password. Default Business Owner Password is "owner2026".'
+            : "Incorrect Business Owner Admin Password.")
+      );
+    } catch {
+      setPinError(
+        isDefaultPasswordActive
+          ? 'Incorrect password. Default Business Owner Password is "owner2026".'
+          : "Incorrect Business Owner Admin Password."
+      );
+    }
+  };
+
+  const handleRegenerateImages = async (cardIndex?: number) => {
+    setRegeneratingImages(true);
+    setRegeneratingCardIdx(typeof cardIndex === "number" ? cardIndex : null);
+    setSaveToast(null);
+    try {
+      const res = await fetch(`/api/website-builder/public/${site.siteId}/regenerate-images`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pin: adminPin || expectedPin || "owner2026",
+          password: adminPin || expectedPin || "owner2026",
+          cardIndex: typeof cardIndex === "number" ? cardIndex : undefined,
+          customPrompt: customImageScenePrompt.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to regenerate images");
+
+      if (Array.isArray(data.finishedWork)) {
+        setFinishedWork(data.finishedWork);
+      }
+      if (data.site) {
+        onSiteUpdated(data.site);
+      }
+      setSaveToast(
+        typeof cardIndex === "number"
+          ? `✨ Showcase Photo #${cardIndex + 1} regenerated with a fresh unique image!`
+          : "✨ All 3 Showcase Photos regenerated with unique industry images!"
+      );
+      setTimeout(() => setSaveToast(null), 4500);
+    } catch (err: any) {
+      setSaveToast(`Error: ${err.message}`);
+    } finally {
+      setRegeneratingImages(false);
+      setRegeneratingCardIdx(null);
+    }
+  };
+
+  const handleUpdatePasswordOnly = async () => {
+    const cleanNewPw = newPasswordInput.trim();
+    if (!cleanNewPw || cleanNewPw.length < 4) {
+      setSaveToast("Error: Admin password must be at least 4 characters.");
+      return;
+    }
+    setAdminPin(cleanNewPw);
+    setSaving(true);
+    setSaveToast(null);
+    try {
+      const res = await fetch(`/api/website-builder/public/${site.siteId}/admin-save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pin: expectedPin,
+          password: expectedPin,
+          newPassword: cleanNewPw,
+          themeId: selectedThemeId,
+          siteConfigUpdates: {
+            ...cfg,
+            adminPin: cleanNewPw,
+            adminPassword: cleanNewPw,
+            adminPasswordChanged: true,
+          },
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to update password");
+      onSiteUpdated(data.site);
+      setSaveToast(`🔑 Business Owner Admin Password changed to "${cleanNewPw}"!`);
+      setTimeout(() => setSaveToast(null), 4500);
+    } catch (err: any) {
+      setSaveToast(`Error: ${err.message}`);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -393,6 +791,37 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
     reader.readAsDataURL(file);
   };
 
+  const handleGenerateAiBlogArticle = async () => {
+    setGeneratingBlogPost(true);
+    setSaveToast(null);
+    try {
+      const res = await fetch(`/api/website-builder/public/${site.siteId}/generate-blog-post`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pin: adminPin || expectedPin || "owner2026",
+          password: adminPin || expectedPin || "owner2026",
+          customTopic: customBlogTopic.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not generate AI blog article");
+      if (data.site?.siteConfig?.intelligentModules) {
+        setIntelligentModules(data.site.siteConfig.intelligentModules);
+      }
+      if (data.site) {
+        onSiteUpdated(data.site);
+      }
+      setCustomBlogTopic("");
+      setSaveToast(`✨ New Local SEO Guide published: "${data.article?.title || "Article"}"!`);
+      setTimeout(() => setSaveToast(null), 4500);
+    } catch (err: any) {
+      setSaveToast(`Error: ${err.message}`);
+    } finally {
+      setGeneratingBlogPost(false);
+    }
+  };
+
   const handleSaveAll = async (overrideHostingMode?: "preview" | "live_hosted") => {
     setSaving(true);
     setSaveToast(null);
@@ -422,17 +851,31 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
         step1Question: funnelStep1Question.trim(),
         step1Options: step1Options.filter((o) => o.label.trim()),
       },
+      chatbotConfig: {
+        ...(cfg.chatbotConfig || {}),
+        enabled: chatbotEnabled,
+        soundEnabled: chatbotSoundEnabled,
+        spokenVoiceEnabled: chatbotSpokenVoiceEnabled,
+        voicePersona: chatbotVoicePersona,
+        agentName: chatbotAgentName.trim(),
+        greeting: chatbotGreeting.trim(),
+      },
       services,
       finishedWork,
       reviews,
       faqs,
+      intelligentModules,
       serviceAreas: serviceAreasText
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean),
       hostingMode: nextHostingMode,
       customDomain: customDomain.trim(),
-      adminPin: adminPin.trim() || "2026",
+      adminPin: (newPasswordInput.trim() || adminPin.trim() || "owner2026"),
+      adminPassword: (newPasswordInput.trim() || adminPin.trim() || "owner2026"),
+      adminPasswordChanged:
+        Boolean(cfg.adminPasswordChanged) ||
+        (Boolean(newPasswordInput.trim()) && newPasswordInput.trim() !== "owner2026"),
     };
 
     try {
@@ -441,6 +884,8 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           pin: expectedPin,
+          password: expectedPin,
+          newPassword: newPasswordInput.trim() || adminPin.trim() || "owner2026",
           themeId: selectedThemeId,
           siteConfigUpdates: updatedSiteConfig,
         }),
@@ -485,7 +930,7 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                   Website Admin CMS & Hosting Control
                 </h2>
                 <span className="text-[11px] font-mono text-amber-300 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded">
-                  PIN: {adminPin}
+                  Owner Password: {adminPin}
                 </span>
               </div>
               <p className="text-xs text-slate-400 truncate">
@@ -531,7 +976,7 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
           </div>
         )}
 
-        {/* PIN Lock Screen if not yet unlocked */}
+        {/* Password Lock Screen if not yet unlocked */}
         {!isUnlocked ? (
           <div className="flex-1 flex items-center justify-center p-6">
             <form
@@ -543,21 +988,35 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
               </div>
               <div>
                 <h3 className="text-lg font-bold text-white">
-                  Unlock {brandName} Admin Panel
+                  Unlock {brandName} Business Owner Admin
                 </h3>
                 <p className="text-xs text-slate-400 mt-1">
-                  Enter the 4-digit Website Admin PIN to edit logo, brand colors, services, photos, and hosting settings.
+                  Enter the single Business Owner Admin Password to edit logo, regenerate photos, customize services, or change your admin password.
                 </p>
               </div>
+              {isDefaultPasswordActive && (
+                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-2">
+                  <div className="text-xs text-amber-200">
+                    Default Owner Password: <code className="font-mono font-bold text-amber-300">owner2026</code>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPinInput("owner2026")}
+                    className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-[11px] font-bold cursor-pointer"
+                  >
+                    Use Default
+                  </button>
+                </div>
+              )}
               <div>
                 <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                  4-Digit Admin PIN
+                  Business Owner Admin Password
                 </label>
                 <input
-                  type="text"
+                  type="password"
                   value={pinInput}
                   onChange={(e) => setPinInput(e.target.value)}
-                  placeholder="Enter PIN (e.g. 2026)"
+                  placeholder={isDefaultPasswordActive ? "Enter owner2026" : "Enter your custom admin password"}
                   className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-white text-sm font-mono focus:outline-none focus:border-amber-500"
                 />
                 {pinError && <p className="text-xs text-rose-400 mt-1.5">{pinError}</p>}
@@ -567,17 +1026,7 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                   type="submit"
                   className="flex-1 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs cursor-pointer"
                 >
-                  Unlock Admin Controls
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPinInput(expectedPin);
-                    setIsUnlocked(true);
-                  }}
-                  className="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium cursor-pointer"
-                >
-                  Quick Agency Unlock
+                  Unlock Admin Controls →
                 </button>
               </div>
             </form>
@@ -588,7 +1037,8 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
             <div className="px-5 pt-3 bg-[#141923] border-b border-slate-800 flex items-center gap-1.5 overflow-x-auto no-scrollbar">
               {[
                 { id: "brand_colors", label: "Logo & Colors", icon: Palette },
-                { id: "hero_funnel", label: "Headline & 4-Tap Funnel", icon: Sparkles },
+                { id: "smart_modules", label: "✨ Smart Features & AI Blog", icon: Sparkles },
+                { id: "hero_funnel", label: "Headline & 4-Tap Funnel", icon: Layout },
                 { id: "services_work", label: "Services & Photos", icon: Briefcase },
                 { id: "reviews_faq", label: "Reviews & FAQ", icon: MessageSquare },
                 {
@@ -622,6 +1072,76 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
               {/* TAB 1: LOGO, COLORS & BUSINESS INFO */}
               {activeTab === "brand_colors" && (
                 <div className="space-y-6">
+                  {/* Quick Action Strip: Regenerate Images & Business Owner Admin Password */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                    <div className="bg-gradient-to-br from-amber-500/15 to-[#161C28] border border-amber-500/35 rounded-2xl p-4 flex flex-col justify-between gap-3">
+                      <div>
+                        <div className="text-[11px] font-bold uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                          <Sparkles className="w-3.5 h-3.5" />
+                          Unique Showcase Photos
+                        </div>
+                        <p className="text-xs text-slate-300 mt-1">
+                          Images unrelated or not unique? Regenerate all 3 website photos with AI / niche imagery.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleRegenerateImages()}
+                          disabled={regeneratingImages}
+                          className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-extrabold cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${regeneratingImages ? "animate-spin" : ""}`} />
+                          {regeneratingImages ? "Regenerating..." : "✨ Regenerate Images"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setActiveTab("services_work")}
+                          className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
+                        >
+                          Edit Cards
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="bg-[#161C28] border border-slate-700 rounded-2xl p-4 flex flex-col justify-between gap-3">
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                            <Lock className="w-3.5 h-3.5" />
+                            Business Owner Password
+                          </span>
+                          <span className="text-[10px] font-mono text-amber-300">
+                            {isDefaultPasswordActive ? "Default: owner2026" : "Custom Active"}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-300 mt-1">
+                          Single password for business owner to unlock this Admin panel. Change it anytime below:
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={newPasswordInput}
+                          onChange={(e) => {
+                            setNewPasswordInput(e.target.value);
+                            setAdminPin(e.target.value);
+                          }}
+                          placeholder="owner2026"
+                          className="flex-1 px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-700 text-xs font-mono text-white"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleUpdatePasswordOnly}
+                          disabled={saving}
+                          className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-extrabold cursor-pointer shrink-0"
+                        >
+                          Change Password
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Logo Upload & Emblem Card */}
                   <div className="bg-[#161C28] border border-slate-800 rounded-2xl p-5 space-y-4">
                     <div className="flex items-center justify-between">
@@ -675,6 +1195,7 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                             onChange={(e) => setEmblemType(e.target.value)}
                             className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200"
                           >
+                            <option value="fitness">Emblem: Fitness / Gym Dumbbell</option>
                             <option value="roof">Emblem: Home / Roofing / Remodel</option>
                             <option value="medical">Emblem: Medical / Dental Cross</option>
                             <option value="culinary">Emblem: Restaurant / Culinary</option>
@@ -857,6 +1378,384 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                 </div>
               )}
 
+              {/* TAB 2: INTELLIGENT SMART FEATURES & AI LOCAL SEO BLOG */}
+              {activeTab === "smart_modules" && (
+                <div className="space-y-6">
+                  {/* Industry Intelligence Profile Banner */}
+                  <div className="bg-gradient-to-br from-emerald-950/60 via-[#161C28] to-amber-950/30 border border-emerald-500/35 rounded-2xl p-5 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-extrabold">
+                        <Sparkles className="w-3.5 h-3.5" />
+                        AI Industry Intelligence: {intelligentModules?.industryLabel || "Smart Conversion Suite"}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setIntelligentModules({
+                            ...intelligentModules,
+                            promoVoucher: { ...(intelligentModules.promoVoucher || {}), enabled: true },
+                            priceEstimator: { ...(intelligentModules.priceEstimator || {}), enabled: true },
+                            appointmentPicker: { ...(intelligentModules.appointmentPicker || {}), enabled: true },
+                            smsDirect: { ...(intelligentModules.smsDirect || {}), enabled: true },
+                            seoBlog: { ...(intelligentModules.seoBlog || {}), enabled: true },
+                          })
+                        }
+                        className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/30 text-amber-300 text-xs font-bold cursor-pointer"
+                      >
+                        Enable All 4 Smart Features
+                      </button>
+                    </div>
+                    <p className="text-xs text-slate-300 leading-relaxed">
+                      {intelligentModules?.intelligenceReason ||
+                        "Our builder automatically analyzed this business's industry and enabled the highest-converting combination of features. You can toggle any or both conversion tools below and click Save & Publish Live."}
+                    </p>
+
+                    {/* 4 Feature Toggles Grid */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-2">
+                      {[
+                        {
+                          key: "priceEstimator",
+                          title: "1. Interactive Price / Service Estimator",
+                          desc: "Best for contractors, dental, auto & service quotes",
+                        },
+                        {
+                          key: "appointmentPicker",
+                          title: "2. Live Appointment / Slot Picker",
+                          desc: "Best for clinics, salons, restaurants & dispatch",
+                        },
+                        {
+                          key: "promoVoucher",
+                          title: "3. Instant Promo Voucher Banner",
+                          desc: "Captures hesitant visitors with a claimable offer",
+                        },
+                        {
+                          key: "seoBlog",
+                          title: "4. AI Local SEO & Cost Guides (Auto-Blog)",
+                          desc: "Ranks on Google for local pricing & question searches",
+                        },
+                      ].map((feat) => {
+                        const isOn = Boolean(intelligentModules?.[feat.key]?.enabled);
+                        return (
+                          <div
+                            key={feat.key}
+                            onClick={() =>
+                              setIntelligentModules({
+                                ...intelligentModules,
+                                [feat.key]: {
+                                  ...(intelligentModules?.[feat.key] || {}),
+                                  enabled: !isOn,
+                                },
+                              })
+                            }
+                            className={`p-3.5 rounded-xl border transition cursor-pointer flex items-start justify-between gap-3 ${
+                              isOn
+                                ? "bg-emerald-950/40 border-emerald-500/40 text-white"
+                                : "bg-slate-900/70 border-slate-800 text-slate-400"
+                            }`}
+                          >
+                            <div>
+                              <div className="text-xs font-bold">{feat.title}</div>
+                              <div className="text-[11px] text-slate-400 mt-0.5">{feat.desc}</div>
+                            </div>
+                            <span
+                              className={`px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase shrink-0 ${
+                                isOn
+                                  ? "bg-emerald-500 text-slate-950"
+                                  : "bg-slate-800 text-slate-400"
+                              }`}
+                            >
+                              {isOn ? "ACTIVE" : "OFF"}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Feature 4: AI Local SEO & Cost Guides (Auto-Blog) + 1-Click Generator */}
+                  <div className="bg-[#161C28] border border-slate-800 rounded-2xl p-5 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-bold uppercase tracking-wider text-amber-400">
+                          AI Local SEO & Cost Guides (Auto-Blog)
+                        </div>
+                        <h3 className="text-sm font-bold text-white mt-0.5">
+                          1-Click Local SEO Article Generator ({Array.isArray(intelligentModules?.seoBlog?.articles) ? intelligentModules.seoBlog.articles.length : 0} Published)
+                        </h3>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          Instead of a dead manual blog, generate high-converting local cost & buyer guides tailored to {brandName} in {city}.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* 1-Click Generator Input + Button */}
+                    <div className="p-3.5 rounded-xl bg-slate-900/90 border border-amber-500/30 flex flex-col sm:flex-row gap-2.5">
+                      <input
+                        type="text"
+                        value={customBlogTopic}
+                        onChange={(e) => setCustomBlogTopic(e.target.value)}
+                        placeholder={`Optional topic (e.g. "How much does ${services[0]?.name || "service"} cost in ${city}?") or leave blank for AI`}
+                        className="flex-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs text-white focus:outline-none focus:border-amber-400"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleGenerateAiBlogArticle}
+                        disabled={generatingBlogPost}
+                        className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-extrabold cursor-pointer shrink-0 disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${generatingBlogPost ? "animate-spin" : ""}`} />
+                        {generatingBlogPost ? "Writing SEO Guide..." : "✨ Generate New Local SEO Article"}
+                      </button>
+                    </div>
+
+                    {/* Existing Articles List */}
+                    <div className="space-y-3">
+                      {(Array.isArray(intelligentModules?.seoBlog?.articles)
+                        ? intelligentModules.seoBlog.articles
+                        : []
+                      ).map((art: any, idx: number) => (
+                        <div
+                          key={art.id || idx}
+                          className="p-3.5 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-amber-300 bg-amber-500/10 px-2.5 py-0.5 rounded-full">
+                              {art.categoryBadge || "Local Guide"} · {art.readTime || "2 min read"}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const nextArticles = (intelligentModules.seoBlog?.articles || []).filter(
+                                  (_: any, i: number) => i !== idx
+                                );
+                                setIntelligentModules({
+                                  ...intelligentModules,
+                                  seoBlog: {
+                                    ...(intelligentModules.seoBlog || {}),
+                                    articles: nextArticles,
+                                  },
+                                });
+                              }}
+                              className="text-rose-400 hover:text-rose-300 p-1 cursor-pointer"
+                              title="Remove article"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                          <input
+                            type="text"
+                            value={art.title || ""}
+                            onChange={(e) => {
+                              const nextArticles = [...(intelligentModules.seoBlog?.articles || [])];
+                              nextArticles[idx] = { ...nextArticles[idx], title: e.target.value };
+                              setIntelligentModules({
+                                ...intelligentModules,
+                                seoBlog: { ...(intelligentModules.seoBlog || {}), articles: nextArticles },
+                              });
+                            }}
+                            className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs font-bold text-white"
+                          />
+                          <textarea
+                            rows={2}
+                            value={art.summary || ""}
+                            onChange={(e) => {
+                              const nextArticles = [...(intelligentModules.seoBlog?.articles || [])];
+                              nextArticles[idx] = { ...nextArticles[idx], summary: e.target.value };
+                              setIntelligentModules({
+                                ...intelligentModules,
+                                seoBlog: { ...(intelligentModules.seoBlog || {}), articles: nextArticles },
+                              });
+                            }}
+                            className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-300"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Feature 3: Promo Voucher Customizer */}
+                  <div className="bg-[#161C28] border border-slate-800 rounded-2xl p-5 space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-sm font-bold text-white">
+                          Promo Voucher / New Client Offer Banner
+                        </h3>
+                        <p className="text-xs text-slate-400">
+                          Customize the special offer and voucher code shown on the website.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div>
+                        <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                          Offer Badge
+                        </label>
+                        <input
+                          type="text"
+                          value={intelligentModules?.promoVoucher?.badge || ""}
+                          onChange={(e) =>
+                            setIntelligentModules({
+                              ...intelligentModules,
+                              promoVoucher: {
+                                ...(intelligentModules.promoVoucher || {}),
+                                badge: e.target.value,
+                              },
+                            })
+                          }
+                          className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white"
+                        />
+                      </div>
+                      <div className="sm:col-span-2">
+                        <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                          Voucher Headline
+                        </label>
+                        <input
+                          type="text"
+                          value={intelligentModules?.promoVoucher?.headline || ""}
+                          onChange={(e) =>
+                            setIntelligentModules({
+                              ...intelligentModules,
+                              promoVoucher: {
+                                ...(intelligentModules.promoVoucher || {}),
+                                headline: e.target.value,
+                              },
+                            })
+                          }
+                          className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white font-bold"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                          Promo Code
+                        </label>
+                        <input
+                          type="text"
+                          value={intelligentModules?.promoVoucher?.code || ""}
+                          onChange={(e) =>
+                            setIntelligentModules({
+                              ...intelligentModules,
+                              promoVoucher: {
+                                ...(intelligentModules.promoVoucher || {}),
+                                code: e.target.value,
+                              },
+                            })
+                          }
+                          className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs font-mono text-amber-300"
+                        />
+                      </div>
+                      <div className="sm:col-span-2">
+                        <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                          Subtext
+                        </label>
+                        <input
+                          type="text"
+                          value={intelligentModules?.promoVoucher?.subtext || ""}
+                          onChange={(e) =>
+                            setIntelligentModules({
+                              ...intelligentModules,
+                              promoVoucher: {
+                                ...(intelligentModules.promoVoucher || {}),
+                                subtext: e.target.value,
+                              },
+                            })
+                          }
+                          className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-slate-300"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Feature 1: Interactive Price Estimator Tiers */}
+                  <div className="bg-[#161C28] border border-slate-800 rounded-2xl p-5 space-y-4">
+                    <div>
+                      <h3 className="text-sm font-bold text-white">
+                        Interactive Price & Service Estimator Tiers
+                      </h3>
+                      <p className="text-xs text-slate-400">
+                        Edit the ballpark pricing tiers visitors can click through before requesting a quote.
+                      </p>
+                    </div>
+                    <input
+                      type="text"
+                      value={intelligentModules?.priceEstimator?.title || ""}
+                      onChange={(e) =>
+                        setIntelligentModules({
+                          ...intelligentModules,
+                          priceEstimator: {
+                            ...(intelligentModules.priceEstimator || {}),
+                            title: e.target.value,
+                          },
+                        })
+                      }
+                      className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs font-bold text-white"
+                    />
+                    <div className="space-y-2.5">
+                      {(Array.isArray(intelligentModules?.priceEstimator?.tiers)
+                        ? intelligentModules.priceEstimator.tiers
+                        : []
+                      ).map((tier: any, idx: number) => (
+                        <div
+                          key={idx}
+                          className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 grid grid-cols-1 sm:grid-cols-3 gap-2"
+                        >
+                          <input
+                            type="text"
+                            value={tier.label || ""}
+                            onChange={(e) => {
+                              const nextTiers = [...(intelligentModules.priceEstimator?.tiers || [])];
+                              nextTiers[idx] = { ...nextTiers[idx], label: e.target.value };
+                              setIntelligentModules({
+                                ...intelligentModules,
+                                priceEstimator: {
+                                  ...(intelligentModules.priceEstimator || {}),
+                                  tiers: nextTiers,
+                                },
+                              });
+                            }}
+                            placeholder="Tier Name"
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-white font-semibold"
+                          />
+                          <input
+                            type="text"
+                            value={tier.range || ""}
+                            onChange={(e) => {
+                              const nextTiers = [...(intelligentModules.priceEstimator?.tiers || [])];
+                              nextTiers[idx] = { ...nextTiers[idx], range: e.target.value };
+                              setIntelligentModules({
+                                ...intelligentModules,
+                                priceEstimator: {
+                                  ...(intelligentModules.priceEstimator || {}),
+                                  tiers: nextTiers,
+                                },
+                              });
+                            }}
+                            placeholder="Price Range (e.g. $150 - $350)"
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-emerald-400 font-bold"
+                          />
+                          <input
+                            type="text"
+                            value={tier.includes || ""}
+                            onChange={(e) => {
+                              const nextTiers = [...(intelligentModules.priceEstimator?.tiers || [])];
+                              nextTiers[idx] = { ...nextTiers[idx], includes: e.target.value };
+                              setIntelligentModules({
+                                ...intelligentModules,
+                                priceEstimator: {
+                                  ...(intelligentModules.priceEstimator || {}),
+                                  tiers: nextTiers,
+                                },
+                              });
+                            }}
+                            placeholder="What's included"
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-300"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* TAB 2: HERO & 4-TAP FUNNEL */}
               {activeTab === "hero_funnel" && (
                 <div className="space-y-6">
@@ -1001,12 +1900,213 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                       ))}
                     </div>
                   </div>
+
+                  {/* Built-In Automated Website Chatbot Settings */}
+                  <div className="bg-[#161C28] border border-slate-800 rounded-2xl p-5 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h3 className="text-sm font-bold text-white">
+                          Built-In Automated Website Chatbot &amp; Arrival Sound
+                        </h3>
+                        <p className="text-xs text-slate-400">
+                          Automatically pops up at the bottom of the website when a visitor arrives, plays a chime sound, and asks interactive lead-capture questions.
+                        </p>
+                      </div>
+                      <label className="inline-flex items-center gap-2 text-xs font-semibold text-emerald-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={chatbotEnabled}
+                          onChange={(e) => setChatbotEnabled(e.target.checked)}
+                        />
+                        <span>Enable Chatbot on Website</span>
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Chat Team / Display Name
+                        </label>
+                        <input
+                          type="text"
+                          value={chatbotAgentName}
+                          onChange={(e) => setChatbotAgentName(e.target.value)}
+                          placeholder="e.g. Force Fitness Team"
+                          className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-white"
+                        />
+                      </div>
+                      <div className="flex items-end pb-1">
+                        <label className="inline-flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={chatbotSoundEnabled}
+                            onChange={(e) => setChatbotSoundEnabled(e.target.checked)}
+                          />
+                          <span>🔊 Play Audible Notification Chime When Chatbot Appears</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">
+                        Automated Welcome Message
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={chatbotGreeting}
+                        onChange={(e) => setChatbotGreeting(e.target.value)}
+                        className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-white"
+                      />
+                    </div>
+
+                    {/* 6-Persona AI Receptionist Spoken Voice Studio */}
+                    <div className="p-4 rounded-xl bg-purple-950/20 border border-purple-500/30 space-y-3">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                        <div>
+                          <div className="text-xs font-bold text-purple-200 flex items-center gap-1.5">
+                            <Mic className="w-3.5 h-3.5 text-purple-400" />
+                            <span>AI Receptionist Spoken Voice Persona (6 Distinct Voices)</span>
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-0.5">
+                            Choose which studio voice persona greets visitors and speaks replies out loud inside the live website chatbot.
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const sample =
+                              chatbotGreeting ||
+                              `Hi there! Welcome to ${brandName || site.businessName}. How can we help you today?`;
+                            speakWithStudioVoice(sample, chatbotVoicePersona);
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold inline-flex items-center gap-1.5 shrink-0 cursor-pointer shadow-xs"
+                        >
+                          <Volume2 className="w-3.5 h-3.5" />
+                          <span>Test {chatbotVoicePersona} Voice</span>
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                        {STUDIO_VOICE_PERSONAS.map((vp) => {
+                          const active = chatbotVoicePersona === vp.id;
+                          return (
+                            <button
+                              key={vp.id}
+                              type="button"
+                              onClick={() => {
+                                setChatbotVoicePersona(vp.id);
+                                const sample =
+                                  chatbotGreeting ||
+                                  `Hi there! Welcome to ${brandName || site.businessName}. How can we help you today?`;
+                                speakWithStudioVoice(sample, vp.id);
+                              }}
+                              className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                                active
+                                  ? "bg-purple-500/20 border-purple-400 text-white shadow-xs"
+                                  : "bg-slate-900/90 border-slate-800 text-slate-300 hover:border-slate-700"
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-1">
+                                <span className="text-xs font-bold text-white">
+                                  🎙️ {vp.shortName}
+                                </span>
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-purple-300 font-semibold">
+                                  {vp.lang}
+                                </span>
+                              </div>
+                              <div className="text-[11px] font-semibold text-purple-300 mt-0.5">
+                                {vp.roleBadge}
+                              </div>
+                              <div className="text-[10px] text-slate-400 mt-0.5 line-clamp-1">
+                                {vp.description}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="pt-2 border-t border-purple-500/20 flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-xs font-bold text-white">
+                            Auto-Speak Chatbot Replies Out Loud
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            Automatically read bot answers out loud in {getStudioVoicePersona(chatbotVoicePersona).label}&apos;s voice (visitors can also toggle Voice ON/OFF anytime).
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setChatbotSpokenVoiceEnabled(!chatbotSpokenVoiceEnabled)}
+                          className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer shrink-0 ${
+                            chatbotSpokenVoiceEnabled
+                              ? "bg-purple-500 text-white"
+                              : "bg-slate-800 text-slate-300 border border-slate-700"
+                          }`}
+                        >
+                          {chatbotSpokenVoiceEnabled ? "🎙️ Auto-Speak ON" : "Auto-Speak OFF"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               )}
 
               {/* TAB 3: SERVICES & SHOWCASE PHOTOS */}
               {activeTab === "services_work" && (
                 <div className="space-y-6">
+                  {/* AI & Industry Unique Image Regenerator */}
+                  <div className="bg-gradient-to-br from-amber-500/15 via-[#161C28] to-[#161C28] border border-amber-500/35 rounded-2xl p-5 space-y-3.5">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div>
+                        <div className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-amber-400">
+                          <Sparkles className="w-3.5 h-3.5" />
+                          Unique Business Photo Regenerator
+                        </div>
+                        <h3 className="text-sm font-bold text-white mt-0.5">
+                          Images Unrelated or Not Unique? Regenerate Instant AI / Niche Photos
+                        </h3>
+                        <p className="text-xs text-slate-300 mt-0.5">
+                          Generate fresh, 100% unique showcase images tailored to <strong>{brandName}</strong> ({cfg.category || site.category}) that stay permanently embedded when deployed to Vercel.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleRegenerateImages()}
+                        disabled={regeneratingImages}
+                        className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-extrabold shadow-md transition cursor-pointer shrink-0 disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${regeneratingImages && regeneratingCardIdx === null ? "animate-spin" : ""}`} />
+                        {regeneratingImages && regeneratingCardIdx === null
+                          ? "Generating 3 Unique Photos..."
+                          : "✨ Regenerate All 3 Images"}
+                      </button>
+                    </div>
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                      <input
+                        type="text"
+                        value={customImageScenePrompt}
+                        onChange={(e) => setCustomImageScenePrompt(e.target.value)}
+                        placeholder={`Optional custom scene prompt (e.g. "${cfg.category || site.category || "Specialist"} team serving client in ${city}")`}
+                        className="flex-1 px-3 py-2 rounded-xl bg-slate-950/90 border border-slate-700 text-xs text-white"
+                      />
+                      <div className="flex items-center gap-1.5">
+                        {[0, 1, 2].map((cIdx) => (
+                          <button
+                            key={cIdx}
+                            type="button"
+                            disabled={regeneratingImages}
+                            onClick={() => handleRegenerateImages(cIdx)}
+                            className="px-2.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-bold text-amber-300 cursor-pointer disabled:opacity-50"
+                          >
+                            {regeneratingImages && regeneratingCardIdx === cIdx
+                              ? "Regenerating..."
+                              : `↻ Photo #${cIdx + 1}`}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Showcase / Portfolio Cards */}
                   <div className="bg-[#161C28] border border-slate-800 rounded-2xl p-5 space-y-4">
                     <div className="flex items-center justify-between">
@@ -1015,7 +2115,7 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                           Showcase Cards & Photos
                         </h3>
                         <p className="text-xs text-slate-400">
-                          Change photos, upload real business photos, or edit project descriptions.
+                          Change photos, regenerate individual card images, upload real business photos, or edit project descriptions.
                         </p>
                       </div>
                       <button
@@ -1040,24 +2140,52 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                     </div>
 
                     <div className="space-y-4">
-                      {finishedWork.map((item, idx) => (
+                      {finishedWork.map((item, idx) => {
+                        const previewThumb =
+                          item.customImageUrl ||
+                          UNIVERSAL_SHOWCASE_IMAGES[item.imageType] ||
+                          UNIVERSAL_SHOWCASE_IMAGES.commercial;
+                        return (
                         <div
                           key={idx}
                           className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3"
                         >
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-bold text-amber-400">
-                              Showcase Card #{idx + 1}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setFinishedWork(finishedWork.filter((_, i) => i !== idx))
-                              }
-                              className="text-xs text-rose-400 hover:underline flex items-center gap-1 cursor-pointer"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" /> Remove
-                            </button>
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2.5">
+                              {previewThumb && (
+                                <img
+                                  src={previewThumb}
+                                  alt=""
+                                  referrerPolicy="no-referrer"
+                                  className="w-14 h-10 rounded-lg object-cover border border-slate-700 shrink-0"
+                                />
+                              )}
+                              <span className="text-xs font-bold text-amber-400">
+                                Showcase Card #{idx + 1}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={regeneratingImages}
+                                onClick={() => handleRegenerateImages(idx)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-[11px] font-bold cursor-pointer disabled:opacity-50"
+                              >
+                                <RefreshCw className={`w-3 h-3 ${regeneratingImages && regeneratingCardIdx === idx ? "animate-spin" : ""}`} />
+                                {regeneratingImages && regeneratingCardIdx === idx
+                                  ? "Regenerating..."
+                                  : "Regenerate Photo"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setFinishedWork(finishedWork.filter((_, i) => i !== idx))
+                                }
+                                className="text-xs text-rose-400 hover:underline flex items-center gap-1 cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" /> Remove
+                              </button>
+                            </div>
                           </div>
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                             <input
@@ -1141,10 +2269,57 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                                   />
                                 </label>
                               </div>
+                              {Array.isArray(cfg.scrapedImages) && cfg.scrapedImages.length > 0 && (
+                                <div className="mt-2">
+                                  <div className="text-[10px] text-amber-300 font-medium mb-1">
+                                    Or click a photo extracted from client&apos;s original website:
+                                  </div>
+                                  <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                                    {cfg.scrapedImages.map((sUrl: string, sIdx: number) => (
+                                      <button
+                                        key={sIdx}
+                                        type="button"
+                                        onClick={() => {
+                                          const next = [...finishedWork];
+                                          next[idx] = { ...next[idx], customImageUrl: sUrl };
+                                          setFinishedWork(next);
+                                        }}
+                                        className={`w-12 h-9 rounded border overflow-hidden shrink-0 cursor-pointer ${
+                                          item.customImageUrl === sUrl
+                                            ? "border-amber-400 ring-1 ring-amber-400"
+                                            : "border-slate-700 opacity-80 hover:opacity-100"
+                                        }`}
+                                        title="Use this photo from client's original website"
+                                      >
+                                        <img
+                                          src={sUrl}
+                                          alt=""
+                                          referrerPolicy="no-referrer"
+                                          className="w-full h-full object-cover"
+                                        />
+                                      </button>
+                                    ))}
+                                    {item.customImageUrl && (
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const next = [...finishedWork];
+                                          next[idx] = { ...next[idx], customImageUrl: "" };
+                                          setFinishedWork(next);
+                                        }}
+                                        className="text-[10px] text-slate-400 hover:text-white underline px-1.5 shrink-0"
+                                      >
+                                        Use HD Preset
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
 
@@ -1580,24 +2755,24 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                     </div>
                   </div>
 
-                  {/* Client Admin Handover Credentials */}
-                  <div className="bg-[#161C28] border border-slate-800 rounded-2xl p-5 space-y-4">
+                  {/* Client Admin Handover Credentials & Single Password Management */}
+                  <div className="bg-[#161C28] border border-amber-500/30 rounded-2xl p-5 space-y-4">
                     <div className="flex items-center gap-2.5">
                       <ShieldCheck className="w-5 h-5 text-amber-400" />
                       <div>
                         <h3 className="text-sm font-bold text-white">
-                          Client Admin Portal Access (Handover to Business Owner)
+                          Business Owner Admin Password & Portal Access
                         </h3>
                         <p className="text-xs text-slate-400">
-                          Send this link and 4-digit PIN to the business owner so they can log in, change their logo, edit services, and view leads anytime.
+                          Every created website starts with a single default password (<code className="text-amber-300 font-mono font-bold">owner2026</code>) for the business owner, and can be changed right here inside Admin at any time.
                         </p>
                       </div>
                     </div>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
-                        <div className="text-[11px] text-slate-400 mb-1">
-                          Client Admin Portal Link
+                      <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+                        <div className="text-[11px] text-slate-400">
+                          Business Owner Admin Portal Link
                         </div>
                         <div className="flex items-center justify-between gap-2">
                           <code className="text-xs text-amber-300 truncate">{clientAdminUrl}</code>
@@ -1613,33 +2788,53 @@ export const WebsiteOwnerAdminDrawer: React.FC<WebsiteOwnerAdminDrawerProps> = (
                             )}
                           </button>
                         </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            copyText(
+                              "creds",
+                              `Website Admin Portal for ${brandName}:\nLive Website: ${liveCleanUrl}\nAdmin Edit Link: ${clientAdminUrl}\nBusiness Owner Admin Password: ${newPasswordInput || adminPin}`
+                            )
+                          }
+                          className="w-full py-1.5 px-2.5 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-semibold cursor-pointer"
+                        >
+                          {copiedKey === "creds"
+                            ? "✓ Copied Owner Login Pack!"
+                            : "Copy Owner Login Link + Password"}
+                        </button>
                       </div>
 
-                      <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">
-                        <div className="text-[11px] text-slate-400 mb-1">
-                          Client 4-Digit Admin PIN
+                      <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] text-slate-400">
+                            Change Business Owner Password
+                          </span>
+                          <span className="text-[10px] font-mono text-emerald-400">
+                            Current: {adminPin}
+                          </span>
                         </div>
                         <div className="flex items-center gap-2">
                           <input
                             type="text"
-                            value={adminPin}
-                            onChange={(e) => setAdminPin(e.target.value)}
-                            className="w-24 px-2.5 py-1 rounded bg-slate-950 border border-slate-700 text-xs font-mono text-white"
+                            value={newPasswordInput}
+                            onChange={(e) => {
+                              setNewPasswordInput(e.target.value);
+                              setAdminPin(e.target.value);
+                            }}
+                            placeholder="Enter new owner password"
+                            className="flex-1 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs font-mono text-white"
                           />
                           <button
                             type="button"
-                            onClick={() =>
-                              copyText(
-                                "creds",
-                                `Website Admin Portal for ${brandName}:\nLive Website: ${liveCleanUrl}\nAdmin Edit Link: ${clientAdminUrl}\nAdmin PIN: ${adminPin}`
-                              )
-                            }
-                            className="flex-1 py-1.5 px-2.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-semibold cursor-pointer"
+                            onClick={handleUpdatePasswordOnly}
+                            disabled={saving}
+                            className="py-1.5 px-3 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-extrabold cursor-pointer shrink-0"
                           >
-                            {copiedKey === "creds"
-                              ? "Copied Handover Pack!"
-                              : "Copy Client Login Pack"}
+                            Update Password
                           </button>
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          Default single password for all newly created sites is <code className="text-amber-300 font-mono">owner2026</code> until changed here.
                         </div>
                       </div>
                     </div>
