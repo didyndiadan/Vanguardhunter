@@ -473,7 +473,9 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
 
   // Testing state
   const [testingAccountId, setTestingAccountId] = useState<number | null>(null);
-  const [testRecipientEmail, setTestRecipientEmail] = useState<string>("");
+  const [testRecipientEmail, setTestRecipientEmail] = useState<string>(() => {
+    try { return localStorage.getItem("vh_last_test_recipient") || ""; } catch { return ""; }
+  });
   const [testingRotation, setTestingRotation] = useState<boolean>(false);
 
   const showNotice = (type: "success" | "error", text: string) => {
@@ -603,12 +605,22 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
 
   const handleTestSingleAccount = async (acct: SmtpAccountItem) => {
     setTestingAccountId(acct.id);
+    const savedRecipient = (() => {
+      try { return localStorage.getItem("vh_last_test_recipient") || ""; } catch { return ""; }
+    })();
+    const effectiveRecipient =
+      testRecipientEmail.trim() ||
+      savedRecipient.trim() ||
+      (acct.fromEmail && acct.fromEmail.toLowerCase() !== acct.user.toLowerCase() ? acct.fromEmail : acct.user);
+    if (testRecipientEmail.trim()) {
+      try { localStorage.setItem("vh_last_test_recipient", testRecipientEmail.trim()); } catch {}
+    }
     try {
       const res = await fetch(`/api/crm/email-accounts/${acct.id}/test`, {
         method: "POST",
         headers: buildAuthHeaders(),
         body: JSON.stringify({
-          to: testRecipientEmail.trim() || acct.fromEmail || acct.user,
+          to: effectiveRecipient,
         }),
       });
       const data = await res.json();
@@ -616,7 +628,7 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
       showNotice(
         "success",
         `✓ Verified! Test email successfully sent via "${acct.label}" (${acct.user}) to ${
-          testRecipientEmail.trim() || acct.fromEmail || acct.user
+          data.to || effectiveRecipient
         }.`
       );
       await loadAccounts();
@@ -771,9 +783,12 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
             <input
               type="email"
               value={testRecipientEmail}
-              onChange={(e) => setTestRecipientEmail(e.target.value)}
-              placeholder="Optional test recipient email..."
-              className="px-3 py-2 text-xs border border-slate-300 rounded-lg w-52"
+              onChange={(e) => {
+                setTestRecipientEmail(e.target.value);
+                try { localStorage.setItem("vh_last_test_recipient", e.target.value.trim()); } catch {}
+              }}
+              placeholder="Send test email to (e.g. other@gmail.com)..."
+              className="px-3 py-2 text-xs border border-slate-300 rounded-lg w-60"
             />
             <button
               type="button"
@@ -1351,6 +1366,16 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
                         )}
                       </td>
                       <td className="py-3.5 px-4 text-right space-x-1.5 whitespace-nowrap">
+                        <input
+                          type="email"
+                          value={testRecipientEmail}
+                          onChange={(e) => {
+                            setTestRecipientEmail(e.target.value);
+                            try { localStorage.setItem("vh_last_test_recipient", e.target.value.trim()); } catch {}
+                          }}
+                          placeholder="Recipient email..."
+                          className="px-2 py-1 text-[11px] border border-slate-300 rounded w-40 mr-1"
+                        />
                         <button
                           type="button"
                           onClick={() => handleTestSingleAccount(acct)}

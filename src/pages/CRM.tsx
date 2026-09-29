@@ -16,11 +16,12 @@ import {
   X, Copy, Check, Building, Zap, LayoutDashboard, Radar, ExternalLink,
   Settings, Eye, EyeOff, Wifi, WifiOff, PlayCircle, StopCircle,
   ChevronDown, ChevronUp, Bot, MapPin, Filter, Inbox, BotMessageSquare,
-  Database, ArrowLeft,
+  Database, ArrowLeft, Wand2,
 } from "lucide-react";
 import API_BASE from "@/lib/api";
 import { getCachedSaasUser, getSaasToken, clearSaasSession, isUserAdmin, saasFetch } from "@/lib/saas-auth";
 import OwnerWebsiteBuilderPanel from "@/components/OwnerWebsiteBuilderPanel";
+import TrainYourAIPanel from "@/components/TrainYourAIPanel";
 import MultiSmtpManagerPanel, { SmtpAppPasswordGuide } from "@/components/MultiSmtpManagerPanel";
 import ProjectWorkspaceBar, { ExportLeadsBar } from "@/components/ProjectWorkspaceBar";
 import {
@@ -598,9 +599,8 @@ const CHECK_LABELS: Record<string, string> = {
 };
 
 const PROVIDER_CONFIGS: Record<string, { label: string; icon: string; colorClass: string; host: string; port: number; hint: string }> = {
-  gmail:       { label: "Gmail",              icon: "G",  colorClass: "text-red-600 bg-red-50 border-red-200",       host: "smtp.gmail.com",        port: 587,  hint: "Use your 16-char Gmail App Password (auto-connects via IPv4 587/465 or Port 993 on Render)" },
-  gmail_https: { label: "Gmail Bridge (443)", icon: "⚡", colorClass: "text-emerald-600 bg-emerald-50 border-emerald-200", host: "script.google.com", port: 443,  hint: "Paste your Google Apps Script Web App URL (https://script.google.com/...) as Password to send over HTTPS Port 443" },
-  brevo:       { label: "Brevo (Port 2525)",  icon: "B",  colorClass: "text-teal-600 bg-teal-50 border-teal-200",     host: "smtp-relay.brevo.com",  port: 2525, hint: "Use Brevo SMTP key (xsmtpsib-...) on Port 2525 or API key (xkeysib-...) over HTTPS" },
+  gmail:       { label: "Gmail",              icon: "G",  colorClass: "text-red-600 bg-red-50 border-red-200",       host: "smtp.gmail.com",        port: 587,  hint: "Use your 16-character Google App Password (myaccount.google.com/apppasswords) on Port 587 or 465." },
+  brevo:       { label: "Brevo",              icon: "B",  colorClass: "text-teal-600 bg-teal-50 border-teal-200",     host: "smtp-relay.brevo.com",  port: 587,  hint: "Use your Brevo SMTP key (xsmtpsib-...) or API key (xkeysib-...)" },
   outlook:     { label: "Outlook / 365",      icon: "O",  colorClass: "text-blue-600 bg-blue-50 border-blue-200",     host: "smtp.office365.com",    port: 587,  hint: "Use your Microsoft App Password" },
   smtp:        { label: "Custom SMTP",        icon: "⚙",  colorClass: "text-gray-600 bg-gray-50 border-gray-200",     host: "",                      port: 587,  hint: "Any SMTP-compatible provider" },
 };
@@ -723,12 +723,16 @@ function AccountDialog({ account, onSave, onClose }: {
   const [showPass, setShowPass] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [testTo, setTestTo] = useState(
-    account?.fromEmail && account.fromEmail.toLowerCase() !== (account.user || "").toLowerCase()
-      ? account.fromEmail
-      : ""
-  );
-  const [copiedScript, setCopiedScript] = useState(false);
+  const [testTo, setTestTo] = useState(() => {
+    try {
+      const savedRecipient = localStorage.getItem("vh_last_test_recipient") || "";
+      if (savedRecipient.trim()) return savedRecipient.trim();
+    } catch {}
+    if (account?.fromEmail && account.fromEmail.toLowerCase() !== (account.user || "").toLowerCase()) {
+      return account.fromEmail;
+    }
+    return "";
+  });
   const [status, setStatus] = useState<{ type: "success" | "error"; msg: string } | null>(null);
 
   const applyPreset = (provider: string) => {
@@ -798,6 +802,9 @@ function AccountDialog({ account, onSave, onClose }: {
         (form.fromEmail.trim() && form.fromEmail.trim().toLowerCase() !== form.user.trim().toLowerCase()
           ? form.fromEmail.trim()
           : form.user.trim());
+      if (testTo.trim()) {
+        try { localStorage.setItem("vh_last_test_recipient", testTo.trim()); } catch {}
+      }
 
       const r = await fetch(`${apiBase()}/api/crm/email-accounts/${targetId}/test`, {
         method: "POST",
@@ -899,36 +906,6 @@ function AccountDialog({ account, onSave, onClose }: {
                 Generate Gmail App Password →
               </a>
             )}
-            {(form.provider === "gmail" || form.provider === "gmail_https") && (
-              <div className="mt-2 p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 space-y-1.5">
-                <div className="font-semibold">Sending to external emails on Render Free Tier?</div>
-                <p className="text-[11px] text-emerald-800">
-                  Render Free Tier blocks ports 587 &amp; 465. To send to any external address for free over HTTPS Port 443: copy the 10-line script below, paste it into a new project at <strong>script.google.com</strong> (Deploy → Web App → Who has access: Anyone), and paste the Web App URL into the Password field above.
-                </p>
-                <div className="flex flex-wrap gap-2 pt-0.5">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const code = `function doPost(e){try{var d=JSON.parse(e.postData.contents||"{}");if(d.action==="ping")return ContentService.createTextOutput(JSON.stringify({ok:true})).setMimeType(ContentService.MimeType.JSON);GmailApp.sendEmail(d.to,d.subject||"",d.text||"",{htmlBody:d.html||d.text||"",name:d.fromName||"Outreach Team",replyTo:d.replyTo||d.fromEmail||""});return ContentService.createTextOutput(JSON.stringify({ok:true})).setMimeType(ContentService.MimeType.JSON);}catch(err){return ContentService.createTextOutput(JSON.stringify({ok:false,error:String(err)})).setMimeType(ContentService.MimeType.JSON);}}`;
-                      navigator.clipboard.writeText(code);
-                      setCopiedScript(true);
-                      setTimeout(() => setCopiedScript(false), 3000);
-                    }}
-                    className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-[11px]"
-                  >
-                    {copiedScript ? "✓ Copied 10-Line Script!" : "Copy 10-Line Gmail Port 443 Script"}
-                  </button>
-                  <a
-                    href="https://script.google.com/home/start"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="px-2.5 py-1 rounded bg-white border border-emerald-300 text-emerald-900 font-semibold text-[11px]"
-                  >
-                    Open script.google.com ↗
-                  </a>
-                </div>
-              </div>
-            )}
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -956,12 +933,26 @@ function AccountDialog({ account, onSave, onClose }: {
             </div>
           )}
 
-          <div className="flex gap-2 pt-1">
-            <Input value={testTo} onChange={e => setTestTo(e.target.value)} placeholder="Test recipient (optional)" className="flex-1" />
-            <Button variant="outline" onClick={test} disabled={testing} className="gap-1.5 whitespace-nowrap">
-              {testing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-              {testing ? "Sending…" : "Send Test"}
-            </Button>
+          <div className="space-y-1.5 pt-1">
+            <label className="text-xs font-semibold text-muted-foreground block">
+              Send Test Email To (enter another email address to test external delivery):
+            </label>
+            <div className="flex gap-2">
+              <Input
+                type="email"
+                value={testTo}
+                onChange={e => {
+                  setTestTo(e.target.value);
+                  try { localStorage.setItem("vh_last_test_recipient", e.target.value.trim()); } catch {}
+                }}
+                placeholder="e.g. another-account@gmail.com"
+                className="flex-1"
+              />
+              <Button variant="outline" onClick={test} disabled={testing} className="gap-1.5 whitespace-nowrap">
+                {testing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                {testing ? "Sending…" : "Send Test"}
+              </Button>
+            </div>
           </div>
 
           <div className="flex gap-2 pt-1">
@@ -983,7 +974,9 @@ function EmailSettingsPanel() {
   const [editingAccount, setEditingAccount] = useState<EmailAccount | undefined>(undefined);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [testingId, setTestingId] = useState<number | null>(null);
-  const [listTestTo, setListTestTo] = useState<string>("");
+  const [listTestTo, setListTestTo] = useState<string>(() => {
+    try { return localStorage.getItem("vh_last_test_recipient") || ""; } catch { return ""; }
+  });
   const [testStatus, setTestStatus] = useState<Record<number, { type: "success" | "error"; msg: string }>>({});
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
@@ -1178,10 +1171,14 @@ function EmailSettingsPanel() {
               </div>
               <div className="px-4 pb-3 flex items-center gap-2 flex-wrap border-t border-border/30 pt-3">
                 <Input
+                  type="email"
                   value={listTestTo}
-                  onChange={e => setListTestTo(e.target.value)}
-                  placeholder={acct.fromEmail && acct.fromEmail !== acct.user ? `Recipient (${acct.fromEmail})` : "Test recipient email…"}
-                  className="h-7 text-xs w-44"
+                  onChange={e => {
+                    setListTestTo(e.target.value);
+                    try { localStorage.setItem("vh_last_test_recipient", e.target.value.trim()); } catch {}
+                  }}
+                  placeholder={acct.fromEmail && acct.fromEmail !== acct.user ? `Recipient (${acct.fromEmail})` : "Send test to another email…"}
+                  className="h-7 text-xs w-48"
                 />
                 <Button size="sm" variant="outline" onClick={() => testAccount(acct)} disabled={testingId === acct.id} className="h-7 text-xs gap-1">
                   {testingId === acct.id ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
@@ -6525,7 +6522,7 @@ export default function CRM() {
     try {
       const params = new URLSearchParams(window.location.search);
       const t = params.get("tab");
-      if (t && t !== "train-ai") return t;
+      if (t) return t;
     } catch {}
     return "hunter";
   });
@@ -6588,7 +6585,7 @@ export default function CRM() {
     try {
       const params = new URLSearchParams(window.location.search);
       const t = params.get("tab");
-      if (t && t !== "train-ai") setTab(t);
+      if (t) setTab(t);
     } catch {}
   }, [location]);
 
@@ -6846,6 +6843,9 @@ export default function CRM() {
             <TabsTrigger value="reports" className="flex-1 gap-1.5">
               <Globe className="w-4 h-4" /> Audit Reports
             </TabsTrigger>
+            <TabsTrigger value="train-ai" className="flex-1 gap-1.5 text-purple-700 font-bold">
+              <Wand2 className="w-4 h-4 text-purple-600" /> Train Your AI (My Offers)
+            </TabsTrigger>
             {(canUseWebsiteBuilder || builderAccessMode !== "owner_only") && (
               <TabsTrigger value="website-builder" className="flex-1 gap-1.5 text-amber-700 font-bold">
                 <Sparkles className="w-4 h-4 text-amber-600" />
@@ -6897,6 +6897,15 @@ export default function CRM() {
 
           <TabsContent value="reports">
             <WebsiteReportsPanel />
+          </TabsContent>
+
+          <TabsContent value="train-ai">
+            <TrainYourAIPanel
+              userFullName={getCachedSaasUser()?.fullName}
+              userCompanyName={getCachedSaasUser()?.companyName}
+              userEmail={getCachedSaasUser()?.email}
+              onNavigateToHunter={() => setTab("hunter")}
+            />
           </TabsContent>
 
           {(canUseWebsiteBuilder || builderAccessMode !== "owner_only") && (

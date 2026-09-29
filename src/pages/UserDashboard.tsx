@@ -15,6 +15,7 @@ import {
 } from "@/lib/saas-auth";
 import { ExportLeadsBar } from "@/components/ProjectWorkspaceBar";
 import MultiSmtpManagerPanel, { SmtpAppPasswordGuide } from "@/components/MultiSmtpManagerPanel";
+import TrainYourAIPanel from "@/components/TrainYourAIPanel";
 import {
   LeadProject,
   ExportableLead,
@@ -129,7 +130,7 @@ function matchesBusinessOrDomain(
   return false;
 }
 
-type DashboardTab = "overview" | "projects" | "smtp" | "support" | "billing" | "activities" | "settings";
+type DashboardTab = "overview" | "projects" | "train-ai" | "smtp" | "support" | "billing" | "activities" | "settings";
 
 const DISCOVERY_PRESET_PLAYBOOKS = [
   {
@@ -386,7 +387,7 @@ export default function UserDashboard() {
     const tabParam = params.get("tab") as DashboardTab | null;
     if (
       tabParam &&
-      ["overview", "projects", "smtp", "support", "billing", "activities", "settings"].includes(tabParam)
+      ["overview", "projects", "train-ai", "smtp", "support", "billing", "activities", "settings"].includes(tabParam)
     ) {
       setActiveTab(tabParam);
     }
@@ -1022,6 +1023,24 @@ export default function UserDashboard() {
 
             <button
               type="button"
+              onClick={() => handleSelectTab("train-ai")}
+              className={`w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-medium rounded-lg transition-colors cursor-pointer ${
+                activeTab === "train-ai"
+                  ? "bg-blue-600 text-white"
+                  : "text-slate-300 hover:text-white hover:bg-slate-900"
+              }`}
+            >
+              <span className="flex items-center gap-3">
+                <Sparkles className="w-4 h-4 text-purple-400" />
+                <span>Train Your AI &amp; Offers</span>
+              </span>
+              <span className="font-mono-num text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 font-bold">
+                Offers
+              </span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => handleSelectTab("smtp")}
               className={`w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-medium rounded-lg transition-colors cursor-pointer ${
                 activeTab === "smtp"
@@ -1315,6 +1334,7 @@ export default function UserDashboard() {
             [
               { id: "overview", label: "Overview" },
               { id: "projects", label: `Projects (${projects.length})` },
+              { id: "train-ai", label: "Train Your AI (Offers)" },
               { id: "smtp", label: "Multi-SMTP & Gmail" },
               {
                 id: "support",
@@ -3348,6 +3368,18 @@ export default function UserDashboard() {
                 mode="user"
                 title="Multi-SMTP & Multiple Gmail Accounts + App Password Setup Guide"
                 subtitle="Connect multiple Gmail or custom SMTP accounts to wire up your outreach & messaging activities, and follow the step-by-step instructions below to generate your Gmail 16-character App Password or other SMTP credentials."
+              />
+            </div>
+          )}
+
+          {/* TAB: TRAIN YOUR AI & OFFERS */}
+          {activeTab === "train-ai" && (
+            <div className="space-y-6">
+              <TrainYourAIPanel
+                userFullName={user?.fullName}
+                userCompanyName={user?.companyName}
+                userEmail={user?.email}
+                onNavigateToHunter={() => setLocation("/crm?tab=hunter")}
               />
             </div>
           )}
