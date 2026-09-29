@@ -723,7 +723,12 @@ function AccountDialog({ account, onSave, onClose }: {
   const [showPass, setShowPass] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [testTo, setTestTo] = useState("");
+  const [testTo, setTestTo] = useState(
+    account?.fromEmail && account.fromEmail.toLowerCase() !== (account.user || "").toLowerCase()
+      ? account.fromEmail
+      : ""
+  );
+  const [copiedScript, setCopiedScript] = useState(false);
   const [status, setStatus] = useState<{ type: "success" | "error"; msg: string } | null>(null);
 
   const applyPreset = (provider: string) => {
@@ -788,11 +793,17 @@ function AccountDialog({ account, onSave, onClose }: {
         targetId = createData.account?.id;
       }
 
+      const targetRecipient =
+        testTo.trim() ||
+        (form.fromEmail.trim() && form.fromEmail.trim().toLowerCase() !== form.user.trim().toLowerCase()
+          ? form.fromEmail.trim()
+          : form.user.trim());
+
       const r = await fetch(`${apiBase()}/api/crm/email-accounts/${targetId}/test`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...adminAuthHeader() },
         body: JSON.stringify({
-          to: testTo || form.user,
+          to: targetRecipient,
           ...payload,
         }),
       });
@@ -801,7 +812,7 @@ function AccountDialog({ account, onSave, onClose }: {
       if (d.account) {
         setSavedAccount(d.account);
       }
-      setStatus({ type: "success", msg: `✓ Connected & verified! Test email delivered to ${testTo || form.user}.` });
+      setStatus({ type: "success", msg: `✓ Connected & verified! Test email delivered to ${d.to || targetRecipient}.` });
     } catch (e: any) {
       setStatus({ type: "error", msg: e.message });
     } finally { setTesting(false); }
@@ -888,6 +899,36 @@ function AccountDialog({ account, onSave, onClose }: {
                 Generate Gmail App Password →
               </a>
             )}
+            {(form.provider === "gmail" || form.provider === "gmail_https") && (
+              <div className="mt-2 p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 space-y-1.5">
+                <div className="font-semibold">Sending to external emails on Render Free Tier?</div>
+                <p className="text-[11px] text-emerald-800">
+                  Render Free Tier blocks ports 587 &amp; 465. To send to any external address for free over HTTPS Port 443: copy the 10-line script below, paste it into a new project at <strong>script.google.com</strong> (Deploy → Web App → Who has access: Anyone), and paste the Web App URL into the Password field above.
+                </p>
+                <div className="flex flex-wrap gap-2 pt-0.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const code = `function doPost(e){try{var d=JSON.parse(e.postData.contents||"{}");if(d.action==="ping")return ContentService.createTextOutput(JSON.stringify({ok:true})).setMimeType(ContentService.MimeType.JSON);GmailApp.sendEmail(d.to,d.subject||"",d.text||"",{htmlBody:d.html||d.text||"",name:d.fromName||"Outreach Team",replyTo:d.replyTo||d.fromEmail||""});return ContentService.createTextOutput(JSON.stringify({ok:true})).setMimeType(ContentService.MimeType.JSON);}catch(err){return ContentService.createTextOutput(JSON.stringify({ok:false,error:String(err)})).setMimeType(ContentService.MimeType.JSON);}}`;
+                      navigator.clipboard.writeText(code);
+                      setCopiedScript(true);
+                      setTimeout(() => setCopiedScript(false), 3000);
+                    }}
+                    className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-[11px]"
+                  >
+                    {copiedScript ? "✓ Copied 10-Line Script!" : "Copy 10-Line Gmail Port 443 Script"}
+                  </button>
+                  <a
+                    href="https://script.google.com/home/start"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-2.5 py-1 rounded bg-white border border-emerald-300 text-emerald-900 font-semibold text-[11px]"
+                  >
+                    Open script.google.com ↗
+                  </a>
+                </div>
+              </div>
+            )}
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -942,6 +983,7 @@ function EmailSettingsPanel() {
   const [editingAccount, setEditingAccount] = useState<EmailAccount | undefined>(undefined);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [testingId, setTestingId] = useState<number | null>(null);
+  const [listTestTo, setListTestTo] = useState<string>("");
   const [testStatus, setTestStatus] = useState<Record<number, { type: "success" | "error"; msg: string }>>({});
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
@@ -993,14 +1035,17 @@ function EmailSettingsPanel() {
   const testAccount = async (acct: EmailAccount) => {
     setTestingId(acct.id);
     setTestStatus(prev => { const n = { ...prev }; delete n[acct.id]; return n; });
+    const targetTo =
+      listTestTo.trim() ||
+      (acct.fromEmail && acct.fromEmail.toLowerCase() !== acct.user.toLowerCase() ? acct.fromEmail : acct.user);
     try {
       const r = await fetch(`${apiBase()}/api/crm/email-accounts/${acct.id}/test`, {
         method: "POST", headers: { "Content-Type": "application/json", ...adminAuth() },
-        body: JSON.stringify({ to: acct.user }),
+        body: JSON.stringify({ to: targetTo }),
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error((d as any).error || `Request failed (${r.status})`);
-      setTestStatus(prev => ({ ...prev, [acct.id]: { type: "success", msg: "Test email sent!" } }));
+      setTestStatus(prev => ({ ...prev, [acct.id]: { type: "success", msg: `Test email sent to ${d.to || targetTo}!` } }));
     } catch (e: any) {
       setTestStatus(prev => ({ ...prev, [acct.id]: { type: "error", msg: e.message } }));
     } finally { setTestingId(null); }
@@ -1132,6 +1177,12 @@ function EmailSettingsPanel() {
                 <Switch checked={acct.active} onCheckedChange={() => toggleActive(acct)} />
               </div>
               <div className="px-4 pb-3 flex items-center gap-2 flex-wrap border-t border-border/30 pt-3">
+                <Input
+                  value={listTestTo}
+                  onChange={e => setListTestTo(e.target.value)}
+                  placeholder={acct.fromEmail && acct.fromEmail !== acct.user ? `Recipient (${acct.fromEmail})` : "Test recipient email…"}
+                  className="h-7 text-xs w-44"
+                />
                 <Button size="sm" variant="outline" onClick={() => testAccount(acct)} disabled={testingId === acct.id} className="h-7 text-xs gap-1">
                   {testingId === acct.id ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
                   {testingId === acct.id ? "Testing…" : "Send Test"}

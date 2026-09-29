@@ -1239,18 +1239,23 @@ router.post("/crm/email-accounts/:id/test", requireAdmin, async (req, res) => {
     res.status(404).json({ error: "Account not found or missing credentials" });
     return;
   }
+  const targetRecipient =
+    (to && String(to).trim()) ||
+    (acct.fromEmail && acct.fromEmail.trim().toLowerCase() !== acct.user.trim().toLowerCase()
+      ? acct.fromEmail.trim()
+      : acct.user.trim());
   try {
     const transporter = makeTransporter(acct);
     const result = await transporter.sendMail({
       from: `"${acct.fromName}" <${acct.fromEmail || acct.user}>`,
-      to: to || acct.user,
+      to: targetRecipient,
       subject: "DevStudio CRM — Email Test",
       text: `Account "${acct.label}" is working correctly.`,
-      html: `<div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:24px;"><h2 style="color:#6d28d9;">✓ Account working</h2><p>Account <strong>${acct.label}</strong> (${acct.user}) is configured and sending correctly via ${acct.host}.</p></div>`,
+      html: `<div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:24px;"><h2 style="color:#6d28d9;">✓ Account working</h2><p>Account <strong>${acct.label}</strong> (${acct.user}) is configured and sending correctly to <strong>${targetRecipient}</strong> via ${acct.host}.</p></div>`,
     });
     // Best-effort DB update — ignore if DB is unavailable
     db.update(emailAccountsTable).set({ consecutiveFailures: 0, autoPaused: false, lastError: "", active: true }).where(eq(emailAccountsTable.id, id)).catch(() => {});
-    res.json({ success: true, via: result?.via || "smtp", account: maskAccount({ ...acct, consecutiveFailures: 0, autoPaused: false, lastError: "", active: true }) });
+    res.json({ success: true, to: targetRecipient, via: result?.via || "smtp", account: maskAccount({ ...acct, consecutiveFailures: 0, autoPaused: false, lastError: "", active: true }) });
   } catch (err: any) {
     // Best-effort failure recording — ignore if DB is unavailable
     recordFailure(id, err.message || String(err)).catch(() => {});
