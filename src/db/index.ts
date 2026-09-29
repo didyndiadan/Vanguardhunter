@@ -14,23 +14,7 @@ let dbInstance: ReturnType<typeof drizzlePglite<typeof schema>>;
 let pgliteClient: PGlite | null = null;
 let pgPool: pg.Pool | null = null;
 
-if (process.env.DATABASE_URL) {
-  const dbUrl = process.env.DATABASE_URL;
-  const needsSsl =
-    /sslmode=require|render\.com|neon\.tech|supabase\.co|aws\.neon\.tech|cockroachlabs/i.test(dbUrl) ||
-    process.env.PGSSLMODE === "require";
-  pgPool = new Pool({
-    connectionString: dbUrl,
-    max: 25,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000,
-    ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
-  });
-  pgPool.on("error", (err) => {
-    console.error("[db] Unexpected error on idle PostgreSQL client (handled safely):", err.message);
-  });
-  dbInstance = drizzlePg(pgPool, { schema }) as unknown as ReturnType<typeof drizzlePglite<typeof schema>>;
-} else {
+function initPgliteFallback() {
   const dataDir = process.env.PGDATA_DIR || path.join(os.tmpdir(), "ai-business-hunter-pgdata-v2");
   try {
     fs.mkdirSync(dataDir, { recursive: true });
@@ -43,6 +27,27 @@ if (process.env.DATABASE_URL) {
     pgliteClient = new PGlite();
   }
   dbInstance = drizzlePglite(pgliteClient, { schema });
+}
+
+const rawDbUrl = (process.env.DATABASE_URL || "").trim();
+if (/^postgres(ql)?:\/\//i.test(rawDbUrl)) {
+  const needsSsl =
+    Boolean(process.env.RENDER) ||
+    /sslmode=require|render\.com|dpg-|neon\.tech|supabase\.co|aws\.neon\.tech|cockroachlabs/i.test(rawDbUrl) ||
+    process.env.PGSSLMODE === "require";
+  pgPool = new Pool({
+    connectionString: rawDbUrl,
+    max: 25,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 6000,
+    ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
+  });
+  pgPool.on("error", (err) => {
+    console.error("[db] Unexpected error on idle PostgreSQL client (handled safely):", err.message);
+  });
+  dbInstance = drizzlePg(pgPool, { schema }) as unknown as ReturnType<typeof drizzlePglite<typeof schema>>;
+} else {
+  initPgliteFallback();
 }
 
 export const db = new Proxy({} as ReturnType<typeof drizzlePglite<typeof schema>>, {
@@ -371,6 +376,58 @@ CREATE INDEX IF NOT EXISTS idx_crm_prospects_updated ON crm_prospects(updated_at
 
 export async function initDatabase(): Promise<void> {
   try {
+    if (pgPool && rawDbUrl) {
+      let pgConnected = false;
+      try {
+        await pgPool.query("SELECT 1");
+        pgConnected = true;
+      } catch (firstErr: any) {
+        const msg = String(firstErr?.message || "");
+        console.warn("[db] Initial PostgreSQL connection failed, retrying with alternate SSL mode:", msg);
+        try {
+          await pgPool.end().catch(() => {});
+          const retrySsl = /does not support SSL/i.test(msg) ? false : { rejectUnauthorized: false };
+          pgPool = new Pool({
+            connectionString: rawDbUrl,
+            max: 25,
+            idleTimeoutMillis: 30000,
+            connectionTimeoutMillis: 6000,
+            ssl: retrySsl,
+          });
+          pgPool.on("error", (err) => {
+            console.error("[db] Unexpected error on idle PostgreSQL client (handled safely):", err.message);
+          });
+          dbInstance = drizzlePg(pgPool, { schema }) as unknown as ReturnType<typeof drizzlePglite<typeof schema>>;
+          await pgPool.query("SELECT 1");
+          pgConnected = true;
+        } catch (secondErr: any) {
+          console.warn(
+            "[db] PostgreSQL DATABASE_URL unreachable (" +
+              String(secondErr?.message || secondErr) +
+              "), falling back to embedded PGlite database."
+          );
+          await pgPool?.end().catch(() => {});
+          pgPool = null;
+          initPgliteFallback();
+        }
+      }
+
+      if (pgConnected && pgPool) {
+        try {
+          await pgPool.query(SCHEMA_SQL);
+          await pgPool.query(`
+            DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
+            DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
+          `);
+        } catch (schemaErr: any) {
+          console.warn("[db] PostgreSQL schema init failed, falling back to embedded PGlite:", schemaErr?.message);
+          await pgPool.end().catch(() => {});
+          pgPool = null;
+          initPgliteFallback();
+        }
+      }
+    }
+
     if (pgliteClient) {
       try {
         await pgliteClient.exec(SCHEMA_SQL);
@@ -381,12 +438,6 @@ export async function initDatabase(): Promise<void> {
         await pgliteClient.exec(SCHEMA_SQL);
       }
       await pgliteClient.exec(`
-        DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
-        DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
-      `);
-    } else if (pgPool) {
-      await pgPool.query(SCHEMA_SQL);
-      await pgPool.query(`
         DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
         DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
       `);
