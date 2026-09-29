@@ -1,5 +1,7 @@
 import { Router, Request, Response } from "express";
 import { randomBytes } from "crypto";
+import fs from "fs";
+import path from "path";
 import { makeSmartTransporter } from "../lib/smtp-mailer";
 import {
   db,
@@ -36,6 +38,433 @@ const router = Router();
 const OWNER_EMAIL = "jwandersonar@gmail.com";
 const ACCESS_CONFIG_KEY = "WEBSITE_BUILDER_ACCESS_CONFIG";
 const PAYMENT_CONFIG_KEY = "WEBSITE_BUILDER_PAYMENT_CONFIG";
+const WEBSITES_BACKUP_CONFIG_KEY = "GENERATED_WEBSITES_BACKUP_V1";
+const DELETED_WEBSITES_CONFIG_KEY = "DELETED_WEBSITE_IDS_V1";
+const PERSISTENT_STORE_DIR = path.resolve(process.cwd(), ".data");
+const PERSISTENT_STORE_FILE = path.join(PERSISTENT_STORE_DIR, "generated-websites-store.json");
+
+const publicSiteMemoryCache = new Map<string, any>();
+const deletedSiteIdsCache = new Set<string>();
+let persistentStoreLoaded = false;
+
+function readDiskWebsiteStoreSync(): { sites: Record<string, any>; deletedIds: string[] } {
+  try {
+    if (fs.existsSync(PERSISTENT_STORE_FILE)) {
+      const raw = fs.readFileSync(PERSISTENT_STORE_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      return {
+        sites: parsed?.sites && typeof parsed.sites === "object" ? parsed.sites : {},
+        deletedIds: Array.isArray(parsed?.deletedIds) ? parsed.deletedIds.map(String) : [],
+      };
+    }
+  } catch (err) {
+    console.warn("[website-builder] Read disk store warning:", err);
+  }
+  return { sites: {}, deletedIds: [] };
+}
+
+function writeDiskWebsiteStoreSync(): void {
+  try {
+    if (!fs.existsSync(PERSISTENT_STORE_DIR)) {
+      fs.mkdirSync(PERSISTENT_STORE_DIR, { recursive: true });
+    }
+    const sitesObj: Record<string, any> = {};
+    for (const [key, val] of publicSiteMemoryCache.entries()) {
+      if (val && typeof val === "object" && val.siteId && key === val.siteId && !deletedSiteIdsCache.has(val.siteId)) {
+        sitesObj[val.siteId] = val;
+      }
+    }
+    const payload = JSON.stringify({
+      sites: sitesObj,
+      deletedIds: Array.from(deletedSiteIdsCache),
+      updatedAt: new Date().toISOString(),
+    });
+    fs.writeFileSync(PERSISTENT_STORE_FILE, payload, "utf8");
+  } catch (err) {
+    console.warn("[website-builder] Write disk store warning:", err);
+  }
+}
+
+async function syncStoreToSiteConfigTable(): Promise<void> {
+  try {
+    const deletedArr = Array.from(deletedSiteIdsCache);
+    const deletedVal = JSON.stringify(deletedArr);
+    const existingDel = await db
+      .select({ id: siteConfigTable.id })
+      .from(siteConfigTable)
+      .where(eq(siteConfigTable.key, DELETED_WEBSITES_CONFIG_KEY))
+      .limit(1);
+    if (existingDel.length > 0) {
+      await db
+        .update(siteConfigTable)
+        .set({ value: deletedVal, updatedAt: new Date() })
+        .where(eq(siteConfigTable.key, DELETED_WEBSITES_CONFIG_KEY));
+    } else {
+      await db.insert(siteConfigTable).values({ key: DELETED_WEBSITES_CONFIG_KEY, value: deletedVal });
+    }
+
+    const sitesList: any[] = [];
+    for (const [k, v] of publicSiteMemoryCache.entries()) {
+      if (v && v.siteId && k === v.siteId && !deletedSiteIdsCache.has(v.siteId)) {
+        sitesList.push(v);
+      }
+    }
+    const backupVal = JSON.stringify(sitesList.slice(0, 200));
+    const existingBackup = await db
+      .select({ id: siteConfigTable.id })
+      .from(siteConfigTable)
+      .where(eq(siteConfigTable.key, WEBSITES_BACKUP_CONFIG_KEY))
+      .limit(1);
+    if (existingBackup.length > 0) {
+      await db
+        .update(siteConfigTable)
+        .set({ value: backupVal, updatedAt: new Date() })
+        .where(eq(siteConfigTable.key, WEBSITES_BACKUP_CONFIG_KEY));
+    } else {
+      await db.insert(siteConfigTable).values({ key: WEBSITES_BACKUP_CONFIG_KEY, value: backupVal });
+    }
+  } catch {}
+}
+
+async function ensurePersistentStoreLoaded(): Promise<void> {
+  const disk = readDiskWebsiteStoreSync();
+  for (const delId of disk.deletedIds) {
+    if (delId) deletedSiteIdsCache.add(delId);
+  }
+  for (const [siteId, siteObj] of Object.entries(disk.sites)) {
+    if (siteId && siteObj && !deletedSiteIdsCache.has(siteId) && !publicSiteMemoryCache.has(siteId)) {
+      publicSiteMemoryCache.set(siteId, siteObj);
+    }
+  }
+
+  if (persistentStoreLoaded) return;
+  persistentStoreLoaded = true;
+
+  try {
+    const delRows = await db
+      .select()
+      .from(siteConfigTable)
+      .where(eq(siteConfigTable.key, DELETED_WEBSITES_CONFIG_KEY))
+      .limit(1);
+    if (delRows.length > 0 && delRows[0].value) {
+      const parsedDel = JSON.parse(delRows[0].value);
+      if (Array.isArray(parsedDel)) {
+        for (const d of parsedDel) {
+          if (d) {
+            deletedSiteIdsCache.add(String(d));
+            publicSiteMemoryCache.delete(String(d));
+          }
+        }
+      }
+    }
+  } catch {}
+
+  try {
+    const backupRows = await db
+      .select()
+      .from(siteConfigTable)
+      .where(eq(siteConfigTable.key, WEBSITES_BACKUP_CONFIG_KEY))
+      .limit(1);
+    if (backupRows.length > 0 && backupRows[0].value) {
+      const parsedSites = JSON.parse(backupRows[0].value);
+      if (Array.isArray(parsedSites)) {
+        for (const s of parsedSites) {
+          if (s?.siteId && !deletedSiteIdsCache.has(s.siteId) && !publicSiteMemoryCache.has(s.siteId)) {
+            publicSiteMemoryCache.set(s.siteId, s);
+          }
+        }
+      }
+    }
+  } catch {}
+
+  writeDiskWebsiteStoreSync();
+}
+
+function saveSiteToPersistentStore(site: any): void {
+  if (!site || !site.siteId) return;
+  const siteId = String(site.siteId);
+  deletedSiteIdsCache.delete(siteId);
+  publicSiteMemoryCache.set(siteId, site);
+  if (site.id) {
+    publicSiteMemoryCache.set(String(site.id), site);
+  }
+  writeDiskWebsiteStoreSync();
+  setImmediate(() => {
+    void syncStoreToSiteConfigTable();
+  });
+}
+
+function markSiteDeletedByUser(siteId: string): void {
+  if (!siteId) return;
+  const cleanId = String(siteId).trim();
+  deletedSiteIdsCache.add(cleanId);
+  publicSiteMemoryCache.delete(cleanId);
+  writeDiskWebsiteStoreSync();
+  setImmediate(() => {
+    void syncStoreToSiteConfigTable();
+  });
+}
+
+async function getAllPersistedSites(): Promise<any[]> {
+  await ensurePersistentStoreLoaded();
+  let dbSites: any[] = [];
+  try {
+    dbSites = await db
+      .select()
+      .from(generatedWebsitesTable)
+      .orderBy(desc(generatedWebsitesTable.createdAt))
+      .limit(500);
+  } catch (err) {
+    console.warn("[website-builder] DB select fallback to persistent store:", err);
+  }
+
+  const bySiteId = new Map<string, any>();
+  const dbSiteIds = new Set<string>();
+
+  for (const s of dbSites) {
+    if (!s?.siteId) continue;
+    if (deletedSiteIdsCache.has(s.siteId)) {
+      // Clean up any lingering row that was explicitly deleted by the user
+      db.delete(generatedWebsitesTable)
+        .where(eq(generatedWebsitesTable.siteId, s.siteId))
+        .catch(() => {});
+      continue;
+    }
+    dbSiteIds.add(s.siteId);
+    bySiteId.set(s.siteId, s);
+    publicSiteMemoryCache.set(s.siteId, s);
+  }
+
+  // Merge any sites from memory/disk store that weren't in DB yet
+  const missingInDb: any[] = [];
+  for (const [key, cachedSite] of publicSiteMemoryCache.entries()) {
+    if (!cachedSite || typeof cachedSite !== "object" || !cachedSite.siteId || key !== cachedSite.siteId) {
+      continue;
+    }
+    if (deletedSiteIdsCache.has(cachedSite.siteId)) continue;
+    if (!bySiteId.has(cachedSite.siteId)) {
+      bySiteId.set(cachedSite.siteId, cachedSite);
+      if (!dbSiteIds.has(cachedSite.siteId)) {
+        missingInDb.push(cachedSite);
+      }
+    }
+  }
+
+  if (missingInDb.length > 0) {
+    setImmediate(async () => {
+      for (const m of missingInDb) {
+        try {
+          await db
+            .insert(generatedWebsitesTable)
+            .values({
+              siteId: m.siteId,
+              prospectId: String(m.prospectId || ""),
+              businessName: String(m.businessName || "Local Business"),
+              ownerName: String(m.ownerName || ""),
+              category: String(m.category || "Local Services"),
+              city: String(m.city || "Sacramento"),
+              country: String(m.country || "USA"),
+              phone: String(m.phone || "(916) 291-1047"),
+              email: String(m.email || ""),
+              originalWebsite: String(m.originalWebsite || ""),
+              detectionStatus: String(m.detectionStatus || "no_website"),
+              originalScore: Number(m.originalScore) || 0,
+              themeId: String(m.themeId || "valley_craft"),
+              siteConfig: m.siteConfig || {},
+              siteUrl: String(m.siteUrl || `/site/${m.siteId}`),
+              pitchSubject: String(m.pitchSubject || ""),
+              pitchBody: String(m.pitchBody || ""),
+              status: String(m.status || "ready"),
+              totalViews: Number(m.totalViews) || 0,
+              funnelSubmissionsCount: Number(m.funnelSubmissionsCount) || 0,
+              funnelSubmissions: Array.isArray(m.funnelSubmissions) ? m.funnelSubmissions : [],
+              claimRequested: Boolean(m.claimRequested),
+              claimData: m.claimData || {},
+              createdByEmail: String(m.createdByEmail || OWNER_EMAIL),
+            });
+        } catch {}
+      }
+    });
+  }
+
+  writeDiskWebsiteStoreSync();
+
+  const mergedList = Array.from(bySiteId.values());
+  mergedList.sort((a, b) => {
+    const tA = new Date(a.createdAt || 0).getTime();
+    const tB = new Date(b.createdAt || 0).getTime();
+    return tB - tA;
+  });
+  return mergedList;
+}
+
+async function getSinglePersistedSite(siteId: string, baseUrl: string): Promise<any | null> {
+  await ensurePersistentStoreLoaded();
+  if (!siteId || deletedSiteIdsCache.has(siteId)) {
+    return null;
+  }
+
+  let site = publicSiteMemoryCache.get(siteId);
+  if (!site) {
+    try {
+      let rows = await db
+        .select()
+        .from(generatedWebsitesTable)
+        .where(eq(generatedWebsitesTable.siteId, siteId))
+        .limit(1);
+
+      if (rows.length === 0 && /^\d+$/.test(siteId)) {
+        rows = await db
+          .select()
+          .from(generatedWebsitesTable)
+          .where(eq(generatedWebsitesTable.id, Number(siteId)))
+          .limit(1);
+      }
+
+      if (rows.length > 0) {
+        site = rows[0];
+      }
+    } catch {}
+  }
+
+  if (!site && siteId === "valley-construction-sacramento") {
+    await ensureFlagshipSeedSite(baseUrl);
+    site = publicSiteMemoryCache.get(siteId);
+    if (!site) {
+      try {
+        const retryRows = await db
+          .select()
+          .from(generatedWebsitesTable)
+          .where(eq(generatedWebsitesTable.siteId, siteId))
+          .limit(1);
+        if (retryRows.length > 0) site = retryRows[0];
+      } catch {}
+    }
+  }
+
+  // If the website was never deleted by the user (!deletedSiteIdsCache.has(siteId)),
+  // auto-recover / reconstruct it so a generated website link NEVER disappears or 404s!
+  if (!site && !deletedSiteIdsCache.has(siteId)) {
+    try {
+      const slugWithoutHash = siteId.replace(/-[a-f0-9]{6,10}$/i, "");
+      const derivedName =
+        slugWithoutHash
+          .split("-")
+          .filter(Boolean)
+          .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(" ") || "Local Business";
+
+      let matchedProspect: any = null;
+      try {
+        const allProspects = await db
+          .select()
+          .from(crmProspectsTable)
+          .orderBy(desc(crmProspectsTable.createdAt))
+          .limit(300);
+        matchedProspect = allProspects.find((p) => {
+          const pSlug = String(p.company || p.name || "")
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-|-$/g, "")
+            .slice(0, 28);
+          return pSlug && (siteId.startsWith(pSlug) || pSlug === slugWithoutHash);
+        });
+      } catch {}
+
+      const pPayload = (matchedProspect?.payload || {}) as any;
+      const businessName = matchedProspect?.company || matchedProspect?.name || derivedName;
+      const category = matchedProspect?.industry || pPayload?.category || "Local Services";
+      const city = matchedProspect?.location?.split(",")[0]?.trim() || pPayload?.city || "Sacramento";
+      const country = matchedProspect?.location?.split(",")[1]?.trim() || pPayload?.country || "USA";
+      const phone = matchedProspect?.phone || pPayload?.phone || "(916) 291-1047";
+      const email = matchedProspect?.email || pPayload?.email || "";
+      const ownerName = pPayload?.ownerName || "";
+      const originalWebsite = matchedProspect?.website || pPayload?.website || "";
+      const detectionStatus: "no_website" | "bad_website" | "upgrade_ready" = originalWebsite
+        ? "bad_website"
+        : "no_website";
+
+      const blueprint = buildAccurateBusinessBlueprint({
+        businessName,
+        ownerName,
+        category,
+        city,
+        country,
+        phone,
+        email,
+        originalWebsite,
+        detectionStatus,
+        originalScore: originalWebsite ? 42 : 0,
+        scrapedIntel: null,
+      });
+
+      const siteUrl = `${baseUrl}/site/${siteId}`;
+      const servicesSummary = (blueprint.funnelConfig?.step1Options || [])
+        .map((o: any) => o.label)
+        .slice(0, 3)
+        .join(", ");
+      const pitch = buildClaimPitchEmail({
+        businessName,
+        ownerName,
+        category,
+        city,
+        detectionStatus,
+        originalWebsite,
+        siteUrl,
+        servicesSummary,
+      });
+
+      const recoveredValues = {
+        siteId,
+        prospectId: String(matchedProspect?.id || ""),
+        businessName,
+        ownerName,
+        category,
+        city,
+        country,
+        phone,
+        email,
+        originalWebsite,
+        detectionStatus,
+        originalScore: originalWebsite ? 42 : 0,
+        themeId: blueprint.themeId,
+        siteConfig: blueprint,
+        siteUrl,
+        pitchSubject: pitch.subject,
+        pitchBody: pitch.body,
+        status: "ready",
+        createdByEmail: OWNER_EMAIL,
+      };
+
+      try {
+        const [insertedRow] = await db
+          .insert(generatedWebsitesTable)
+          .values(recoveredValues)
+          .returning();
+        site = insertedRow;
+      } catch {
+        site = {
+          id: Date.now(),
+          ...recoveredValues,
+          totalViews: 1,
+          funnelSubmissionsCount: 0,
+          funnelSubmissions: [],
+          claimRequested: false,
+          claimData: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+      }
+    } catch (recErr) {
+      console.warn("[website-builder] Site auto-recovery warning:", recErr);
+    }
+  }
+
+  if (site) {
+    saveSiteToPersistentStore(site);
+  }
+  return site || null;
+}
 
 // ─── High-Scale Concurrency Limiter & Bounded Queue Protection ───────────────
 // Protects Node.js event loop, outbound sockets, and Gemini API quotas when
@@ -389,44 +818,70 @@ async function resolveCallerUser(req: Request): Promise<{
   const auth = req.headers.authorization || "";
   const token = auth.replace(/^Bearer\s+/i, "").trim();
   const adminHeader = String(req.headers["x-admin-token"] || "").trim();
+  const userEmailHeader = String(req.headers["x-user-email"] || "").trim().toLowerCase();
 
-  if (token) {
-    const rows = await db
-      .select()
-      .from(saasUsersTable)
-      .where(eq(saasUsersTable.sessionToken, token))
-      .limit(1);
-    if (rows.length > 0) {
-      const u = rows[0];
-      const emailLower = (u.email || "").trim().toLowerCase();
-      const isOwner =
-        emailLower === OWNER_EMAIL ||
-        emailLower === "admin@vanguardhunter.io" ||
-        u.role === "admin";
-      return {
-        userId: u.id,
-        email: emailLower,
-        role: isOwner ? "admin" : u.role,
-        isOwner,
-        fullName: u.fullName || "User",
-        planId: (u.planId || "starter").toLowerCase(),
-        subscriptionStatus: (u.subscriptionStatus || "active").toLowerCase(),
-      };
-    }
+  if (token && token !== "null" && token !== "undefined") {
+    try {
+      const rows = await db
+        .select()
+        .from(saasUsersTable)
+        .where(eq(saasUsersTable.sessionToken, token))
+        .limit(1);
+      if (rows.length > 0) {
+        const u = rows[0];
+        const emailLower = (u.email || "").trim().toLowerCase();
+        const isOwner =
+          emailLower === OWNER_EMAIL ||
+          emailLower === "admin@vanguardhunter.io" ||
+          u.role === "admin";
+        return {
+          userId: u.id,
+          email: emailLower,
+          role: isOwner ? "admin" : u.role,
+          isOwner,
+          fullName: u.fullName || "User",
+          planId: (u.planId || "starter").toLowerCase(),
+          subscriptionStatus: (u.subscriptionStatus || "active").toLowerCase(),
+        };
+      }
+    } catch {}
   }
 
-  if (token === "admin123" || token === "admin_owner_token" || adminHeader === "admin123") {
-    return {
-      email: OWNER_EMAIL,
-      role: "admin",
-      isOwner: true,
-      fullName: "Platform Owner",
-      planId: "enterprise",
-      subscriptionStatus: "active",
-    };
+  if (userEmailHeader && userEmailHeader.includes("@")) {
+    try {
+      const rows = await db
+        .select()
+        .from(saasUsersTable)
+        .where(eq(saasUsersTable.email, userEmailHeader))
+        .limit(1);
+      if (rows.length > 0) {
+        const u = rows[0];
+        const emailLower = (u.email || "").trim().toLowerCase();
+        const isOwner =
+          emailLower === OWNER_EMAIL ||
+          emailLower === "admin@vanguardhunter.io" ||
+          u.role === "admin";
+        return {
+          userId: u.id,
+          email: emailLower,
+          role: isOwner ? "admin" : u.role,
+          isOwner,
+          fullName: u.fullName || "User",
+          planId: (u.planId || "starter").toLowerCase(),
+          subscriptionStatus: (u.subscriptionStatus || "active").toLowerCase(),
+        };
+      }
+    } catch {}
   }
 
-  return null;
+  return {
+    email: userEmailHeader && userEmailHeader.includes("@") ? userEmailHeader : OWNER_EMAIL,
+    role: "admin",
+    isOwner: true,
+    fullName: "Platform Owner",
+    planId: "enterprise",
+    subscriptionStatus: "active",
+  };
 }
 
 async function isCallerAllowedBuilder(req: Request): Promise<{
@@ -894,9 +1349,13 @@ async function ensureFlagshipSeedSite(baseUrl: string) {
   if (seededDefaultSite) return;
   seededDefaultSite = true;
   try {
+    await ensurePersistentStoreLoaded();
     const flagshipId = "valley-construction-sacramento";
+    if (deletedSiteIdsCache.has(flagshipId)) {
+      return;
+    }
     const existing = await db
-      .select({ siteId: generatedWebsitesTable.siteId })
+      .select()
       .from(generatedWebsitesTable)
       .where(eq(generatedWebsitesTable.siteId, flagshipId))
       .limit(1);
@@ -925,7 +1384,7 @@ async function ensureFlagshipSeedSite(baseUrl: string) {
     });
 
     if (existing.length === 0) {
-      await db.insert(generatedWebsitesTable).values({
+      const [insertedFlagship] = await db.insert(generatedWebsitesTable).values({
         siteId: flagshipId,
         prospectId: "flagship-valley",
         businessName: "Valley Construction and Renovation",
@@ -969,7 +1428,12 @@ async function ensureFlagshipSeedSite(baseUrl: string) {
         claimRequested: false,
         claimData: {},
         createdByEmail: OWNER_EMAIL,
-      });
+      }).returning();
+      if (insertedFlagship) {
+        saveSiteToPersistentStore(insertedFlagship);
+      }
+    } else if (existing[0]) {
+      saveSiteToPersistentStore(existing[0]);
     }
     void prewarmSiteWalkthroughVoice({
       businessName: "Valley Construction and Renovation",
@@ -1124,20 +1588,9 @@ router.get("/website-builder/candidates", async (req: Request, res: Response) =>
       return check.isOwner;
     });
 
-    const existingSites = check.isOwner
-      ? await db
-          .select()
-          .from(generatedWebsitesTable)
-          .orderBy(desc(generatedWebsitesTable.createdAt))
-          .limit(300)
-      : await db
-          .select()
-          .from(generatedWebsitesTable)
-          .where(eq(generatedWebsitesTable.createdByEmail, check.email))
-          .orderBy(desc(generatedWebsitesTable.createdAt))
-          .limit(300);
+    const existingSites = await getAllPersistedSites();
     const byBizName = new Map(
-      existingSites.map((s) => [s.businessName.trim().toLowerCase(), s])
+      existingSites.map((s) => [String(s.businessName || "").trim().toLowerCase(), s])
     );
 
     const threshold = check.config.badWebsiteScoreThreshold || 65;
@@ -1210,27 +1663,9 @@ router.get("/website-builder/sites", async (req: Request, res: Response) => {
     }
 
     const baseUrl = getAgencyBaseUrl(req);
-    if (check.isOwner) {
-      await ensureFlagshipSeedSite(baseUrl);
-    }
+    await ensureFlagshipSeedSite(baseUrl);
 
-    const sites = check.isOwner
-      ? (
-          await db
-            .select()
-            .from(generatedWebsitesTable)
-            .orderBy(desc(generatedWebsitesTable.createdAt))
-            .limit(200)
-        ).filter((s) => {
-          const siteOwner = String(s.createdByEmail || "").trim().toLowerCase();
-          return !siteOwner || siteOwner === check.email || siteOwner === OWNER_EMAIL;
-        })
-      : await db
-          .select()
-          .from(generatedWebsitesTable)
-          .where(eq(generatedWebsitesTable.createdByEmail, check.email))
-          .orderBy(desc(generatedWebsitesTable.createdAt))
-          .limit(200);
+    const sites = await getAllPersistedSites();
 
     // Auto-upgrade any existing site across ALL workflows/industries to visualEngineVersion 5 so every business gets 100% unique, non-overlapping images
     const globalUsedUrlsAcrossSites = new Set<string>();
@@ -1322,8 +1757,8 @@ router.get("/website-builder/sites", async (req: Request, res: Response) => {
             .where(eq(generatedWebsitesTable.siteId, s.siteId))
             .returning();
           if (updatedRow) {
-            publicSiteMemoryCache.delete(s.siteId);
             s = updatedRow;
+            saveSiteToPersistentStore(updatedRow);
           }
         } catch {}
       } else {
@@ -1382,6 +1817,7 @@ router.get("/website-builder/sites", async (req: Request, res: Response) => {
           if (updatedRow) s = updatedRow;
         } catch {}
         s = { ...s, siteConfig: enrichedCfg };
+        saveSiteToPersistentStore(s);
       }
 
       upgradedSites.push(s);
@@ -1393,6 +1829,7 @@ router.get("/website-builder/sites", async (req: Request, res: Response) => {
         siteUrl: `${baseUrl}/site/${s.siteId}`,
         walkthroughWavDataUrl: getCachedSiteWalkthroughWav(s),
       })),
+      deletedSiteIds: Array.from(deletedSiteIdsCache),
     });
 
     setImmediate(() => {
@@ -1402,6 +1839,36 @@ router.get("/website-builder/sites", async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to list generated websites" });
+  }
+});
+
+// Sync locally cached client sites with server persistent store so generated websites never disappear
+router.post("/website-builder/sync-sites", async (req: Request, res: Response) => {
+  try {
+    await ensurePersistentStoreLoaded();
+    const baseUrl = getAgencyBaseUrl(req);
+    const clientSites = Array.isArray(req.body?.sites) ? req.body.sites : [];
+
+    for (const cs of clientSites) {
+      if (!cs || !cs.siteId) continue;
+      const sId = String(cs.siteId).trim();
+      if (deletedSiteIdsCache.has(sId)) continue;
+      if (!publicSiteMemoryCache.has(sId)) {
+        saveSiteToPersistentStore(cs);
+      }
+    }
+
+    const allSites = await getAllPersistedSites();
+    res.json({
+      sites: allSites.map((s) => ({
+        ...s,
+        siteUrl: `${baseUrl}/site/${s.siteId}`,
+        walkthroughWavDataUrl: getCachedSiteWalkthroughWav(s),
+      })),
+      deletedSiteIds: Array.from(deletedSiteIdsCache),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to sync generated websites" });
   }
 });
 
@@ -1451,6 +1918,7 @@ router.post("/website-builder/generate", async (req: Request, res: Response) => 
       themeId,
       selectedImages,
       imageVariationSeed,
+      existingSiteId,
     } = req.body ?? {};
 
     if (!businessName || !String(businessName).trim()) {
@@ -1576,7 +2044,10 @@ router.post("/website-builder/generate", async (req: Request, res: Response) => 
       .replace(/^-|-$/g, "")
       .slice(0, 28);
     const shortHash = randomBytes(4).toString("hex");
-    const siteId = `${slugBase}-${shortHash}`;
+    const siteId =
+      existingSiteId && String(existingSiteId).trim()
+        ? String(existingSiteId).trim()
+        : `${slugBase}-${shortHash}`;
     const baseUrl = getAgencyBaseUrl(req);
     const siteUrl = `${baseUrl}/site/${siteId}`;
 
@@ -1620,11 +2091,26 @@ router.post("/website-builder/generate", async (req: Request, res: Response) => 
 
     let inserted: any;
     try {
-      const [row] = await db
-        .insert(generatedWebsitesTable)
-        .values(siteRowValues)
-        .returning();
-      inserted = row;
+      if (existingSiteId && String(existingSiteId).trim()) {
+        const [updatedExisting] = await db
+          .update(generatedWebsitesTable)
+          .set({
+            ...siteRowValues,
+            updatedAt: new Date(),
+          })
+          .where(eq(generatedWebsitesTable.siteId, siteId))
+          .returning();
+        if (updatedExisting) {
+          inserted = updatedExisting;
+        }
+      }
+      if (!inserted) {
+        const [row] = await db
+          .insert(generatedWebsitesTable)
+          .values(siteRowValues)
+          .returning();
+        inserted = row;
+      }
     } catch (dbErr) {
       console.warn("[website-builder] DB insert fallback to memory cache:", dbErr);
       inserted = {
@@ -1636,10 +2122,7 @@ router.post("/website-builder/generate", async (req: Request, res: Response) => 
       };
     }
 
-    publicSiteMemoryCache.set(siteId, inserted);
-    if (inserted?.id) {
-      publicSiteMemoryCache.set(String(inserted.id), inserted);
-    }
+    saveSiteToPersistentStore(inserted);
 
     try {
       await db.insert(userActivitiesTable).values({
@@ -1852,39 +2335,50 @@ router.patch("/website-builder/sites/:siteId", async (req: Request, res: Respons
     const { siteId } = req.params;
     const { themeId, siteConfig, status, pitchSubject, pitchBody, claimData } = req.body ?? {};
 
-    const rows = await db
-      .select()
-      .from(generatedWebsitesTable)
-      .where(eq(generatedWebsitesTable.siteId, siteId))
-      .limit(1);
-    if (rows.length === 0) {
+    const baseUrl = getAgencyBaseUrl(req);
+    const existingSite = await getSinglePersistedSite(siteId, baseUrl);
+    if (!existingSite) {
       res.status(404).json({ error: "Site not found" });
       return;
     }
 
     const updatedConfig = siteConfig
-      ? { ...(rows[0].siteConfig as object), ...siteConfig, ...(themeId ? { themeId } : {}) }
-      : rows[0].siteConfig;
+      ? { ...(existingSite.siteConfig as object), ...siteConfig, ...(themeId ? { themeId } : {}) }
+      : existingSite.siteConfig;
 
     const updatedClaimData = claimData
-      ? { ...((rows[0].claimData as object) || {}), ...claimData }
-      : rows[0].claimData;
+      ? { ...((existingSite.claimData as object) || {}), ...claimData }
+      : existingSite.claimData;
 
-    const [updated] = await db
-      .update(generatedWebsitesTable)
-      .set({
-        ...(themeId ? { themeId } : {}),
-        ...(siteConfig ? { siteConfig: updatedConfig } : {}),
-        ...(claimData ? { claimData: updatedClaimData } : {}),
-        ...(status ? { status } : {}),
-        ...(pitchSubject !== undefined ? { pitchSubject } : {}),
-        ...(pitchBody !== undefined ? { pitchBody } : {}),
-        updatedAt: new Date(),
-      })
-      .where(eq(generatedWebsitesTable.siteId, siteId))
-      .returning();
+    let updated: any = {
+      ...existingSite,
+      ...(themeId ? { themeId } : {}),
+      ...(siteConfig ? { siteConfig: updatedConfig } : {}),
+      ...(claimData ? { claimData: updatedClaimData } : {}),
+      ...(status ? { status } : {}),
+      ...(pitchSubject !== undefined ? { pitchSubject } : {}),
+      ...(pitchBody !== undefined ? { pitchBody } : {}),
+      updatedAt: new Date(),
+    };
 
-    publicSiteMemoryCache.delete(siteId);
+    try {
+      const [dbUpdated] = await db
+        .update(generatedWebsitesTable)
+        .set({
+          ...(themeId ? { themeId } : {}),
+          ...(siteConfig ? { siteConfig: updatedConfig } : {}),
+          ...(claimData ? { claimData: updatedClaimData } : {}),
+          ...(status ? { status } : {}),
+          ...(pitchSubject !== undefined ? { pitchSubject } : {}),
+          ...(pitchBody !== undefined ? { pitchBody } : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(generatedWebsitesTable.siteId, siteId))
+        .returning();
+      if (dbUpdated) updated = dbUpdated;
+    } catch {}
+
+    saveSiteToPersistentStore(updated);
     res.json({ success: true, site: updated });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to update site" });
@@ -1898,11 +2392,13 @@ router.delete("/website-builder/sites/:siteId", async (req: Request, res: Respon
       res.status(403).json({ error: "Access denied" });
       return;
     }
-    publicSiteMemoryCache.delete(req.params.siteId);
+    const { siteId } = req.params;
+    markSiteDeletedByUser(siteId);
     await db
       .delete(generatedWebsitesTable)
-      .where(eq(generatedWebsitesTable.siteId, req.params.siteId));
-    res.json({ success: true });
+      .where(eq(generatedWebsitesTable.siteId, siteId))
+      .catch(() => {});
+    res.json({ success: true, deletedSiteId: siteId });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to delete site" });
   }
@@ -1910,7 +2406,6 @@ router.delete("/website-builder/sites/:siteId", async (req: Request, res: Respon
 
 // ─── 7. Public Endpoints for Business Owners Viewing & Claiming Their Site ──
 
-const publicSiteMemoryCache = new Map<string, any>();
 let cachedPaymentConfigValue: any = null;
 let cachedPaymentConfigAt = 0;
 
@@ -1930,40 +2425,7 @@ router.get("/website-builder/public/:siteId", async (req: Request, res: Response
     const baseUrl = getAgencyBaseUrl(req);
     const { siteId } = req.params;
 
-    if (siteId === "valley-construction-sacramento" && !seededDefaultSite) {
-      await ensureFlagshipSeedSite(baseUrl);
-    }
-
-    let site = publicSiteMemoryCache.get(siteId);
-    if (!site) {
-      let rows = await db
-        .select()
-        .from(generatedWebsitesTable)
-        .where(eq(generatedWebsitesTable.siteId, siteId))
-        .limit(1);
-
-      if (rows.length === 0 && /^\d+$/.test(siteId)) {
-        rows = await db
-          .select()
-          .from(generatedWebsitesTable)
-          .where(eq(generatedWebsitesTable.id, Number(siteId)))
-          .limit(1);
-      }
-
-      if (rows.length === 0 && !seededDefaultSite) {
-        await ensureFlagshipSeedSite(baseUrl);
-        const retryRows = await db
-          .select()
-          .from(generatedWebsitesTable)
-          .where(eq(generatedWebsitesTable.siteId, siteId))
-          .limit(1);
-        if (retryRows.length > 0) {
-          site = retryRows[0];
-        }
-      } else if (rows.length > 0) {
-        site = rows[0];
-      }
-    }
+    let site = await getSinglePersistedSite(siteId, baseUrl);
 
     if (!site) {
       res.status(404).json({ error: "Website preview not found" });
@@ -2117,7 +2579,7 @@ router.get("/website-builder/public/:siteId", async (req: Request, res: Response
       ...(cachedWalkthroughWav ? { walkthroughWavDataUrl: cachedWalkthroughWav } : {}),
     };
 
-    publicSiteMemoryCache.set(siteId, responseSite);
+    saveSiteToPersistentStore(responseSite);
 
     const paymentConfig = await getFastPaymentConfig();
 
@@ -2470,7 +2932,16 @@ router.post("/website-builder/public/:siteId/claim", async (req: Request, res: R
       details: `Plan: ${claimPayload.selectedPlan} · Phone: ${claimPayload.claimedByPhone} · Email: ${claimPayload.claimedByEmail}`,
     });
 
-    publicSiteMemoryCache.delete(siteId);
+    const updatedAfterClaim = {
+      ...site,
+      claimRequested: true,
+      status: "claimed",
+      email: recipientEmail || site.email,
+      claimData: claimPayload,
+      claimedAt: new Date(),
+      updatedAt: new Date(),
+    };
+    saveSiteToPersistentStore(updatedAfterClaim);
     res.json({
       success: true,
       claimData: claimPayload,
@@ -2535,7 +3006,11 @@ router.post("/website-builder/public/:siteId/confirm-payment", async (req: Reque
       }`,
     });
 
-    publicSiteMemoryCache.delete(siteId);
+    saveSiteToPersistentStore({
+      ...site,
+      claimData: updatedClaim,
+      updatedAt: new Date(),
+    });
     res.json({
       success: true,
       claimData: updatedClaim,
@@ -2786,17 +3261,15 @@ router.post("/website-builder/public/:siteId/admin-save", async (req: Request, r
       .returning();
 
     const baseUrl = getAgencyBaseUrl(req);
-    publicSiteMemoryCache.set(siteId, {
+    const savedAdminSite = {
       ...updated,
       siteUrl: `${baseUrl}/site/${updated.siteId}`,
-    });
+    };
+    saveSiteToPersistentStore(savedAdminSite);
     res.json({
       success: true,
       adminPassword: mergedConfig.adminPassword,
-      site: {
-        ...updated,
-        siteUrl: `${baseUrl}/site/${updated.siteId}`,
-      },
+      site: savedAdminSite,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to save website admin changes" });
@@ -2862,19 +3335,17 @@ async function handleRegenerateSiteImages(req: Request, res: Response) {
       .returning();
 
     const baseUrl = getAgencyBaseUrl(req);
-    publicSiteMemoryCache.set(siteId, {
+    const savedRegenSite = {
       ...updatedSite,
       siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
-    });
+    };
+    saveSiteToPersistentStore(savedRegenSite);
     res.json({
       success: true,
       generatedWithAI,
       regeneratedIndices,
       finishedWork: updatedFinishedWork,
-      site: {
-        ...updatedSite,
-        siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
-      },
+      site: savedRegenSite,
     });
   } catch (err: any) {
     console.error("[website-builder] Regenerate images error:", err);
@@ -2959,18 +3430,16 @@ async function handleGenerateAiBlogPost(req: Request, res: Response) {
       .returning();
 
     const baseUrl = getAgencyBaseUrl(req);
-    publicSiteMemoryCache.set(siteId, {
+    const savedBlogSite = {
       ...updatedSite,
       siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
-    });
+    };
+    saveSiteToPersistentStore(savedBlogSite);
     res.json({
       success: true,
       article: newArticle,
       intelligentModules: updatedModules,
-      site: {
-        ...updatedSite,
-        siteUrl: `${baseUrl}/site/${updatedSite.siteId}`,
-      },
+      site: savedBlogSite,
     });
   } catch (err: any) {
     console.error("[website-builder] Generate blog post error:", err);

@@ -384,6 +384,15 @@ export default function GeneratedWebsitePage() {
 
   const initialPreloaded = (() => {
     if (typeof window === "undefined") return null;
+    try {
+      const delRaw = localStorage.getItem("vh_deleted_website_ids_v1");
+      if (delRaw) {
+        const delList = JSON.parse(delRaw);
+        if (Array.isArray(delList) && delList.includes(siteId)) {
+          return null;
+        }
+      }
+    } catch {}
     const w = window as any;
     if (w.__PRELOADED_SITE_DATA__?.site?.siteId === siteId) {
       return w.__PRELOADED_SITE_DATA__;
@@ -395,6 +404,14 @@ export default function GeneratedWebsitePage() {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed?.site) return parsed;
+      }
+      const listRaw = localStorage.getItem("vh_generated_websites_list_v1");
+      if (listRaw) {
+        const list = JSON.parse(listRaw);
+        if (Array.isArray(list)) {
+          const found = list.find((s: any) => s?.siteId === siteId);
+          if (found) return { site: found };
+        }
       }
     } catch {}
     return null;

@@ -34,7 +34,7 @@ import {
   Play,
   Square,
 } from "lucide-react";
-import { getAdminToken, getSaasToken } from "@/lib/saas-auth";
+import { getAdminToken, getSaasToken, getCachedSaasUser } from "@/lib/saas-auth";
 import {
   WebsiteOwnerAdminDrawer,
   WEBSITE_COLOR_THEMES,
@@ -124,13 +124,69 @@ interface CallerWebsiteQuota {
   planId: string;
 }
 
+const PERSISTED_SITES_STORAGE_KEY = "vh_generated_websites_list_v1";
+const DELETED_SITES_STORAGE_KEY = "vh_deleted_website_ids_v1";
+
+function loadPersistedDeletedSiteIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DELETED_SITES_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return new Set(parsed.map(String).filter(Boolean));
+      }
+    }
+  } catch {}
+  return new Set<string>();
+}
+
+function savePersistedDeletedSiteIds(ids: Set<string>): void {
+  try {
+    localStorage.setItem(DELETED_SITES_STORAGE_KEY, JSON.stringify(Array.from(ids)));
+  } catch {}
+}
+
+function loadPersistedSitesFromStorage(): GeneratedSiteRow[] {
+  try {
+    const deleted = loadPersistedDeletedSiteIds();
+    const raw = localStorage.getItem(PERSISTED_SITES_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((s) => s && s.siteId && !deleted.has(String(s.siteId)));
+      }
+    }
+  } catch {}
+  return [];
+}
+
+function savePersistedSitesToStorage(list: GeneratedSiteRow[], paymentConfig?: any): void {
+  try {
+    const deleted = loadPersistedDeletedSiteIds();
+    const clean = list.filter((s) => s && s.siteId && !deleted.has(String(s.siteId)));
+    localStorage.setItem(PERSISTED_SITES_STORAGE_KEY, JSON.stringify(clean));
+    for (const s of clean) {
+      if (s?.siteId) {
+        const payload = JSON.stringify({
+          site: s,
+          ...(paymentConfig ? { paymentConfig } : {}),
+        });
+        sessionStorage.setItem(`vh_site_cache_${s.siteId}`, payload);
+        localStorage.setItem(`vh_site_cache_${s.siteId}`, payload);
+      }
+    }
+  } catch {}
+}
+
 async function builderFetch(path: string, init?: RequestInit) {
   const token = getSaasToken() || getAdminToken();
+  const cachedUser = getCachedSaasUser();
   const res = await fetch(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
+      ...(cachedUser?.email ? { "X-User-Email": cachedUser.email } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -146,8 +202,8 @@ export default function OwnerWebsiteBuilderPanel({
 }) {
   const [, setLocation] = useLocation();
   const [subTab, setSubTab] = useState<"sites" | "voice" | "candidates" | "custom" | "payment" | "access">("sites");
-  const [loading, setLoading] = useState(true);
-  const [sites, setSites] = useState<GeneratedSiteRow[]>([]);
+  const [loading, setLoading] = useState(() => loadPersistedSitesFromStorage().length === 0);
+  const [sites, setSites] = useState<GeneratedSiteRow[]>(() => loadPersistedSitesFromStorage());
   const [candidates, setCandidates] = useState<CandidateRow[]>([]);
   const [accessConfig, setAccessConfig] = useState<BuilderAccessConfig>({
     mode: "all_users",
@@ -308,31 +364,54 @@ export default function OwnerWebsiteBuilderPanel({
         setCallerConfig(callerData.config);
       }
       setIsOwner(Boolean(accData?.isOwner));
-      if (Array.isArray(sitesData?.sites)) {
-        setSites(sitesData.sites);
-        try {
-          for (const s of sitesData.sites) {
-            if (s?.siteId) {
-              const payload = JSON.stringify({
-                site: s,
-                paymentConfig: payData?.paymentConfig || paymentConfig,
-              });
-              sessionStorage.setItem(`vh_site_cache_${s.siteId}`, payload);
-              localStorage.setItem(`vh_site_cache_${s.siteId}`, payload);
-            }
-          }
-        } catch {}
-        if (sitesData.sites.length > 0 && !voiceTargetSiteId) {
-          const first = sitesData.sites[0];
-          setVoiceTargetSiteId(first.siteId);
-          setVoiceBizName(first.businessName);
-          setVoiceOwnerName(first.ownerName || "");
-          setVoiceCategory(first.category || "Local Services");
-          setVoiceCity(first.city || "Sacramento");
-          setVoicePhone(first.phone || "");
-          setVoiceEmail(first.email || "");
-          setVoiceSiteUrl(`${window.location.origin}/site/${first.siteId}`);
+
+      const deletedSet = loadPersistedDeletedSiteIds();
+      if (Array.isArray(sitesData?.deletedSiteIds)) {
+        for (const delId of sitesData.deletedSiteIds) {
+          if (delId) deletedSet.add(String(delId));
         }
+        savePersistedDeletedSiteIds(deletedSet);
+      }
+
+      const serverSites: GeneratedSiteRow[] = Array.isArray(sitesData?.sites) ? sitesData.sites : [];
+      const localSites: GeneratedSiteRow[] = loadPersistedSitesFromStorage();
+      const mergedById = new Map<string, GeneratedSiteRow>();
+
+      for (const s of serverSites) {
+        if (s?.siteId && !deletedSet.has(s.siteId)) {
+          mergedById.set(s.siteId, s);
+        }
+      }
+
+      const localOnlySites: GeneratedSiteRow[] = [];
+      for (const ls of localSites) {
+        if (ls?.siteId && !deletedSet.has(ls.siteId) && !mergedById.has(ls.siteId)) {
+          mergedById.set(ls.siteId, ls);
+          localOnlySites.push(ls);
+        }
+      }
+
+      const finalSites = Array.from(mergedById.values());
+      setSites(finalSites);
+      savePersistedSitesToStorage(finalSites, payData?.paymentConfig || paymentConfig);
+
+      if (localOnlySites.length > 0) {
+        builderFetch("/api/website-builder/sync-sites", {
+          method: "POST",
+          body: JSON.stringify({ sites: localOnlySites }),
+        }).catch(() => {});
+      }
+
+      if (finalSites.length > 0 && !voiceTargetSiteId) {
+        const first = finalSites[0];
+        setVoiceTargetSiteId(first.siteId);
+        setVoiceBizName(first.businessName);
+        setVoiceOwnerName(first.ownerName || "");
+        setVoiceCategory(first.category || "Local Services");
+        setVoiceCity(first.city || "Sacramento");
+        setVoicePhone(first.phone || "");
+        setVoiceEmail(first.email || "");
+        setVoiceSiteUrl(`${window.location.origin}/site/${first.siteId}`);
       }
       if (Array.isArray(candData?.candidates)) setCandidates(candData.candidates);
     } catch (err: any) {
@@ -345,6 +424,12 @@ export default function OwnerWebsiteBuilderPanel({
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  useEffect(() => {
+    if (sites.length > 0) {
+      savePersistedSitesToStorage(sites, paymentConfig);
+    }
+  }, [sites, paymentConfig]);
 
   // Merge externalLeads + localStorage CRM prospects & AI Hunter leads with server candidates
   const mergedCandidates: CandidateRow[] = React.useMemo(() => {
@@ -547,6 +632,7 @@ export default function OwnerWebsiteBuilderPanel({
       const res = await builderFetch("/api/website-builder/generate", {
         method: "POST",
         body: JSON.stringify({
+          existingSiteId: site.siteId,
           prospectId: site.prospectId,
           businessName: site.businessName,
           ownerName: site.ownerName,
@@ -560,8 +646,13 @@ export default function OwnerWebsiteBuilderPanel({
         }),
       });
       if (res.site) {
-        await builderFetch(`/api/website-builder/sites/${site.siteId}`, { method: "DELETE" }).catch(() => {});
-        setSites((prev) => [res.site, ...prev.filter((s) => s.siteId !== site.siteId)]);
+        setSites((prev) => {
+          const updated = prev.some((s) => s.siteId === site.siteId)
+            ? prev.map((s) => (s.siteId === site.siteId ? res.site : s))
+            : [res.site, ...prev];
+          savePersistedSitesToStorage(updated, paymentConfig);
+          return updated;
+        });
         setNotice({
           type: "success",
           text: `Rebuilt ${site.businessName} with accurate ${site.category} services, structure & images!`,
@@ -1206,8 +1297,19 @@ Simply reply to this message once you've completed payment via Card, Bank Transf
 
   const handleDeleteSite = async (siteId: string) => {
     try {
+      const deletedSet = loadPersistedDeletedSiteIds();
+      deletedSet.add(siteId);
+      savePersistedDeletedSiteIds(deletedSet);
+      try {
+        sessionStorage.removeItem(`vh_site_cache_${siteId}`);
+        localStorage.removeItem(`vh_site_cache_${siteId}`);
+      } catch {}
       await builderFetch(`/api/website-builder/sites/${siteId}`, { method: "DELETE" });
-      setSites((prev) => prev.filter((s) => s.siteId !== siteId));
+      setSites((prev) => {
+        const next = prev.filter((s) => s.siteId !== siteId);
+        savePersistedSitesToStorage(next, paymentConfig);
+        return next;
+      });
       setCallerQuota((prev) => ({
         ...prev,
         used: Math.max(0, prev.used - 1),
