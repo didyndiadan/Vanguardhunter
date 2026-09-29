@@ -1119,12 +1119,12 @@ router.put("/crm/email-accounts/:id", requireAdmin, async (req, res) => {
       ...(label !== undefined && { label }),
       ...(provider !== undefined && { provider }),
       ...(host !== undefined && { host }),
-      ...(port !== undefined && { port }),
+      ...(port !== undefined && { port: Number(port) === 443 && String(host || existing.host).includes("gmail.com") ? (secure ? 465 : 587) : Number(port) || 587 }),
       ...(secure !== undefined && { secure }),
-      ...(user !== undefined && { user }),
-      ...(password && password !== "••••••••" && { password }),
+      ...(user !== undefined && { user: String(user).trim() }),
+      ...(password && password !== "••••••••" && { password: String(password).replace(/\s+/g, "") }),
       ...(fromName !== undefined && { fromName }),
-      ...(fromEmail !== undefined && { fromEmail }),
+      ...(fromEmail !== undefined && { fromEmail: String(fromEmail).trim() }),
       ...(active !== undefined && { active }),
       ...(dailyLimit !== undefined && Number.isFinite(dailyLimit) && { dailyLimit: Math.max(0, dailyLimit) }),
       ...((resetFailures || reactivating) && { consecutiveFailures: 0, autoPaused: false, lastError: "" }),
@@ -1144,12 +1144,12 @@ router.put("/crm/email-accounts/:id", requireAdmin, async (req, res) => {
       ...(label !== undefined && { label }),
       ...(provider !== undefined && { provider }),
       ...(host !== undefined && { host }),
-      ...(port !== undefined && { port }),
+      ...(port !== undefined && { port: Number(port) || 587 }),
       ...(secure !== undefined && { secure }),
-      ...(user !== undefined && { user }),
-      ...(password && password !== "••••••••" && { password }),
+      ...(user !== undefined && { user: String(user).trim() }),
+      ...(password && password !== "••••••••" && { password: String(password).replace(/\s+/g, "") }),
       ...(fromName !== undefined && { fromName }),
-      ...(fromEmail !== undefined && { fromEmail }),
+      ...(fromEmail !== undefined && { fromEmail: String(fromEmail).trim() }),
       ...(active !== undefined && { active }),
       ...(dailyLimit !== undefined && Number.isFinite(dailyLimit) && { dailyLimit: Math.max(0, dailyLimit) }),
       ...((resetFailures || reactivating) && { consecutiveFailures: 0, autoPaused: false, lastError: null }),
@@ -1175,7 +1175,18 @@ router.delete("/crm/email-accounts/:id", requireAdmin, async (req, res) => {
 // Direct single-account test — does NOT fail over, so the user can verify that specific account.
 router.post("/crm/email-accounts/:id/test", requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id);
-  const { to } = req.body as { to?: string };
+  const { to, host, port, secure, user, password, fromName, fromEmail, provider, label } = req.body as {
+    to?: string;
+    host?: string;
+    port?: number;
+    secure?: boolean;
+    user?: string;
+    password?: string;
+    fromName?: string;
+    fromEmail?: string;
+    provider?: string;
+    label?: string;
+  };
   let acct: KvAccount | undefined;
   try {
     const rows = await db.select().from(emailAccountsTable).where(eq(emailAccountsTable.id, id)).limit(1);
@@ -1185,13 +1196,52 @@ router.post("/crm/email-accounts/:id/test", requireAdmin, async (req, res) => {
     const accounts = await kvReadAccounts();
     acct = accounts.find(a => a.id === id);
   }
+
+  // Merge any unsaved form edits passed from AccountDialog so "Send Test" tests what the user actually typed
+  if (acct) {
+    const cleanNewPass = password && password !== "••••••••" ? String(password).replace(/\s+/g, "") : "";
+    const effectiveHost = host ? String(host).trim() : acct.host;
+    let effectivePort = port !== undefined ? Number(port) || 587 : acct.port;
+    const effectiveSecure = secure !== undefined ? Boolean(secure) : acct.secure;
+    if (effectivePort === 443 && effectiveHost.toLowerCase().includes("gmail.com")) {
+      effectivePort = effectiveSecure ? 465 : 587;
+    }
+    acct = {
+      ...acct,
+      ...(label ? { label } : {}),
+      ...(provider ? { provider } : {}),
+      host: effectiveHost,
+      port: effectivePort,
+      secure: effectiveSecure,
+      user: user ? String(user).trim() : acct.user,
+      password: cleanNewPass || acct.password,
+      fromName: fromName !== undefined ? fromName : acct.fromName,
+      fromEmail: fromEmail !== undefined ? String(fromEmail).trim() : acct.fromEmail,
+    };
+    // Save updated fields to DB so the user doesn't lose them
+    db.update(emailAccountsTable)
+      .set({
+        label: acct.label,
+        provider: acct.provider,
+        host: acct.host,
+        port: acct.port,
+        secure: acct.secure,
+        user: acct.user,
+        password: acct.password,
+        fromName: acct.fromName,
+        fromEmail: acct.fromEmail,
+      })
+      .where(eq(emailAccountsTable.id, id))
+      .catch(() => {});
+  }
+
   if (!acct?.user || !acct?.password) {
     res.status(404).json({ error: "Account not found or missing credentials" });
     return;
   }
   try {
     const transporter = makeTransporter(acct);
-    await transporter.sendMail({
+    const result = await transporter.sendMail({
       from: `"${acct.fromName}" <${acct.fromEmail || acct.user}>`,
       to: to || acct.user,
       subject: "DevStudio CRM — Email Test",
@@ -1199,8 +1249,8 @@ router.post("/crm/email-accounts/:id/test", requireAdmin, async (req, res) => {
       html: `<div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:24px;"><h2 style="color:#6d28d9;">✓ Account working</h2><p>Account <strong>${acct.label}</strong> (${acct.user}) is configured and sending correctly via ${acct.host}.</p></div>`,
     });
     // Best-effort DB update — ignore if DB is unavailable
-    db.update(emailAccountsTable).set({ consecutiveFailures: 0, autoPaused: false, lastError: "" }).where(eq(emailAccountsTable.id, id)).catch(() => {});
-    res.json({ success: true });
+    db.update(emailAccountsTable).set({ consecutiveFailures: 0, autoPaused: false, lastError: "", active: true }).where(eq(emailAccountsTable.id, id)).catch(() => {});
+    res.json({ success: true, via: result?.via || "smtp", account: maskAccount({ ...acct, consecutiveFailures: 0, autoPaused: false, lastError: "", active: true }) });
   } catch (err: any) {
     // Best-effort failure recording — ignore if DB is unavailable
     recordFailure(id, err.message || String(err)).catch(() => {});

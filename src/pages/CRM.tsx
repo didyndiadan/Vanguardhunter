@@ -598,10 +598,11 @@ const CHECK_LABELS: Record<string, string> = {
 };
 
 const PROVIDER_CONFIGS: Record<string, { label: string; icon: string; colorClass: string; host: string; port: number; hint: string }> = {
-  gmail:   { label: "Gmail",         icon: "G",  colorClass: "text-red-600 bg-red-50 border-red-200",   host: "smtp.gmail.com",        port: 587, hint: "Requires Gmail App Password (not your main password)" },
-  outlook: { label: "Outlook / 365", icon: "O",  colorClass: "text-blue-600 bg-blue-50 border-blue-200", host: "smtp-mail.outlook.com", port: 587, hint: "Use your Microsoft account password" },
-  brevo:   { label: "Brevo",         icon: "B",  colorClass: "text-teal-600 bg-teal-50 border-teal-200", host: "smtp-relay.brevo.com",  port: 587, hint: "Use Brevo SMTP key as password (not account password)" },
-  smtp:    { label: "Custom SMTP",   icon: "⚙",  colorClass: "text-gray-600 bg-gray-50 border-gray-200", host: "",                      port: 587, hint: "Any SMTP-compatible provider" },
+  gmail:       { label: "Gmail",              icon: "G",  colorClass: "text-red-600 bg-red-50 border-red-200",       host: "smtp.gmail.com",        port: 587,  hint: "Use your 16-char Gmail App Password (auto-connects via IPv4 587/465 or Port 993 on Render)" },
+  gmail_https: { label: "Gmail Bridge (443)", icon: "⚡", colorClass: "text-emerald-600 bg-emerald-50 border-emerald-200", host: "script.google.com", port: 443,  hint: "Paste your Google Apps Script Web App URL (https://script.google.com/...) as Password to send over HTTPS Port 443" },
+  brevo:       { label: "Brevo (Port 2525)",  icon: "B",  colorClass: "text-teal-600 bg-teal-50 border-teal-200",     host: "smtp-relay.brevo.com",  port: 2525, hint: "Use Brevo SMTP key (xsmtpsib-...) on Port 2525 or API key (xkeysib-...) over HTTPS" },
+  outlook:     { label: "Outlook / 365",      icon: "O",  colorClass: "text-blue-600 bg-blue-50 border-blue-200",     host: "smtp.office365.com",    port: 587,  hint: "Use your Microsoft App Password" },
+  smtp:        { label: "Custom SMTP",        icon: "⚙",  colorClass: "text-gray-600 bg-gray-50 border-gray-200",     host: "",                      port: 587,  hint: "Any SMTP-compatible provider" },
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -699,11 +700,19 @@ function AccountDialog({ account, onSave, onClose }: {
   onSave: (a: EmailAccount) => void;
   onClose: () => void;
 }) {
+  const initialHost = account?.host ?? "smtp.gmail.com";
+  const initialPort =
+    account?.port === 443 && initialHost.toLowerCase().includes("gmail.com")
+      ? account?.secure
+        ? 465
+        : 587
+      : account?.port ?? 587;
+  const [savedAccount, setSavedAccount] = useState<EmailAccount | undefined>(account);
   const [form, setForm] = useState({
     label: account?.label ?? "",
     provider: account?.provider ?? "gmail",
-    host: account?.host ?? "smtp.gmail.com",
-    port: account?.port ?? 587,
+    host: initialHost,
+    port: initialPort,
     secure: account?.secure ?? false,
     user: account?.user ?? "",
     password: "",
@@ -719,25 +728,36 @@ function AccountDialog({ account, onSave, onClose }: {
 
   const applyPreset = (provider: string) => {
     const cfg = PROVIDER_CONFIGS[provider] || PROVIDER_CONFIGS.smtp;
-    setForm(f => ({ ...f, provider, host: cfg.host, port: cfg.port, secure: false }));
+    setForm(f => ({ ...f, provider, host: cfg.host, port: cfg.port, secure: cfg.port === 465 }));
   };
 
   const adminAuthHeader = (): Record<string, string> => {
     return { Authorization: `Bearer ${getToken()}` };
   };
 
+  const normalizedFormPayload = () => {
+    const isGmailHost = form.host.toLowerCase().includes("gmail.com");
+    const effectivePort = form.port === 443 && isGmailHost ? (form.secure ? 465 : 587) : form.port;
+    return {
+      ...form,
+      port: effectivePort,
+      password: form.password ? form.password.replace(/\s+/g, "") : "",
+    };
+  };
+
   const save = async () => {
-    if (!form.host || !form.user || (!form.password && !account)) {
+    if (!form.host || !form.user || (!form.password && !savedAccount)) {
       setStatus({ type: "error", msg: "Host, email, and password are required." });
       return;
     }
     setSaving(true); setStatus(null);
     try {
-      const url = account ? `${apiBase()}/api/crm/email-accounts/${account.id}` : `${apiBase()}/api/crm/email-accounts`;
+      const payload = normalizedFormPayload();
+      const url = savedAccount ? `${apiBase()}/api/crm/email-accounts/${savedAccount.id}` : `${apiBase()}/api/crm/email-accounts`;
       const r = await fetch(url, {
-        method: account ? "PUT" : "POST",
+        method: savedAccount ? "PUT" : "POST",
         headers: { "Content-Type": "application/json", ...adminAuthHeader() },
-        body: JSON.stringify(form),
+        body: JSON.stringify(payload),
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error((d as any).error || "Save failed");
@@ -748,16 +768,40 @@ function AccountDialog({ account, onSave, onClose }: {
   };
 
   const test = async () => {
-    if (!account) { setStatus({ type: "error", msg: "Save the account first, then send a test." }); return; }
+    if (!form.host || !form.user || (!form.password && !savedAccount)) {
+      setStatus({ type: "error", msg: "Enter host, email, and password first." });
+      return;
+    }
     setTesting(true); setStatus(null);
     try {
-      const r = await fetch(`${apiBase()}/api/crm/email-accounts/${account.id}/test`, {
-        method: "POST", headers: { "Content-Type": "application/json", ...adminAuthHeader() },
-        body: JSON.stringify({ to: testTo || form.user }),
+      const payload = normalizedFormPayload();
+      let targetId = savedAccount?.id;
+      if (!targetId) {
+        const createRes = await fetch(`${apiBase()}/api/crm/email-accounts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...adminAuthHeader() },
+          body: JSON.stringify(payload),
+        });
+        const createData = await createRes.json().catch(() => ({}));
+        if (!createRes.ok) throw new Error((createData as any).error || "Could not save account before testing");
+        setSavedAccount(createData.account);
+        targetId = createData.account?.id;
+      }
+
+      const r = await fetch(`${apiBase()}/api/crm/email-accounts/${targetId}/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...adminAuthHeader() },
+        body: JSON.stringify({
+          to: testTo || form.user,
+          ...payload,
+        }),
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error((d as any).error || `Request failed (${r.status})`);
-      setStatus({ type: "success", msg: `Test email sent to ${testTo || form.user}` });
+      if (d.account) {
+        setSavedAccount(d.account);
+      }
+      setStatus({ type: "success", msg: `✓ Connected & verified! Test email delivered to ${testTo || form.user}.` });
     } catch (e: any) {
       setStatus({ type: "error", msg: e.message });
     } finally { setTesting(false); }
@@ -809,7 +853,16 @@ function AccountDialog({ account, onSave, onClose }: {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <Switch checked={form.secure} onCheckedChange={v => setForm(f => ({ ...f, secure: v }))} />
+            <Switch
+              checked={form.secure}
+              onCheckedChange={v =>
+                setForm(f => ({
+                  ...f,
+                  secure: v,
+                  port: f.host.toLowerCase().includes("gmail.com") ? (v ? 465 : 587) : f.port,
+                }))
+              }
+            />
             <label className="text-sm font-medium">Use SSL/TLS (port 465)</label>
           </div>
 
@@ -862,15 +915,13 @@ function AccountDialog({ account, onSave, onClose }: {
             </div>
           )}
 
-          {account && (
-            <div className="flex gap-2 pt-1">
-              <Input value={testTo} onChange={e => setTestTo(e.target.value)} placeholder="Test recipient (optional)" className="flex-1" />
-              <Button variant="outline" onClick={test} disabled={testing} className="gap-1.5 whitespace-nowrap">
-                {testing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                {testing ? "Sending…" : "Send Test"}
-              </Button>
-            </div>
-          )}
+          <div className="flex gap-2 pt-1">
+            <Input value={testTo} onChange={e => setTestTo(e.target.value)} placeholder="Test recipient (optional)" className="flex-1" />
+            <Button variant="outline" onClick={test} disabled={testing} className="gap-1.5 whitespace-nowrap">
+              {testing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              {testing ? "Sending…" : "Send Test"}
+            </Button>
+          </div>
 
           <div className="flex gap-2 pt-1">
             <Button onClick={save} disabled={saving} className="flex-1 gap-2">
@@ -895,7 +946,7 @@ function EmailSettingsPanel() {
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
   const adminAuth = (): Record<string, string> => {
-    const tok = localStorage.getItem("ds_api_token") ?? "";
+    const tok = getToken() || localStorage.getItem("ds_api_token") || "";
     return tok ? { Authorization: `Bearer ${tok}` } : {};
   };
 
