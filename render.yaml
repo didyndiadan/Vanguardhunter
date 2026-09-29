@@ -3,7 +3,7 @@ services:
     name: vanguard-hunter
     runtime: node
     plan: starter
-    buildCommand: npm install && npm run build
+    buildCommand: npm install --legacy-peer-deps && npm run build
     startCommand: npm run start
     healthCheckPath: /api/healthz
     envVars:
