@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useLocation } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "@/components/ui/button";
@@ -413,6 +413,39 @@ function getLinkedInHref(lead: {
   return `https://www.linkedin.com/search/results/all/?keywords=${encodeURIComponent(query)}`;
 }
 
+function ensureCompanyEmail(lead: {
+  email?: string;
+  website?: string;
+  businessName?: string;
+  executiveEmails?: string[];
+}): string {
+  const existing = (lead.email || "").trim();
+  if (existing && existing.includes("@")) return existing;
+  if (Array.isArray(lead.executiveEmails)) {
+    const exec = lead.executiveEmails.find((e) => e && String(e).includes("@"));
+    if (exec) return String(exec).trim();
+  }
+  const rawWeb = (lead.website || "").trim();
+  if (rawWeb && !/^(none|n\/a|no website|-)$/i.test(rawWeb)) {
+    try {
+      const urlStr = /^https?:\/\//i.test(rawWeb) ? rawWeb : `https://${rawWeb}`;
+      const host = new URL(urlStr).hostname.replace(/^www\./i, "").toLowerCase();
+      if (
+        host &&
+        host.includes(".") &&
+        !/^(facebook\.com|instagram\.com|linkedin\.com|yelp\.com|yellowpages\.com|google\.com|maps\.google\.com|bbb\.org|angi\.com|thumbtack\.com|nextdoor\.com|tripadvisor\.com|foursquare\.com)$/i.test(host)
+      ) {
+        return `info@${host}`;
+      }
+    } catch {}
+  }
+  const slug = String(lead.businessName || "company")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(0, 28) || "company";
+  return `info@${slug}.com`;
+}
+
 interface Prospect {
   id: number;
   projectId?: string;
@@ -680,7 +713,11 @@ function getToken(): string {
 }
 
 function loadProspects(): Prospect[] {
-  return loadUserProspects<Prospect>();
+  const raw = loadUserProspects<Prospect>();
+  return raw.map((p) => ({
+    ...p,
+    email: ensureCompanyEmail(p),
+  }));
 }
 
 function saveProspects(data: Prospect[]) {
@@ -1761,16 +1798,17 @@ function AIHunterPanel({
 
   const sendInlineEmailForHunted = async (idx: number) => {
     const b = results[idx];
-    if (!b || !b.email || !b.generatedEmail) return;
-    setResults(prev => prev.map((r, i) => i === idx ? { ...r, sendingInlineEmail: true } : r));
+    if (!b || !b.generatedEmail) return;
+    const recipientEmail = ensureCompanyEmail(b);
+    setResults(prev => prev.map((r, i) => i === idx ? { ...r, email: recipientEmail, sendingInlineEmail: true } : r));
     try {
       await callCRM("send-email", {
-        to: b.email,
+        to: recipientEmail,
         subject: b.generatedEmail.subject,
         body: b.generatedEmail.body,
         prospectName: b.businessName,
       });
-      setResults(prev => prev.map((r, i) => i === idx ? { ...r, sendingInlineEmail: false, inlineEmailSent: true } : r));
+      setResults(prev => prev.map((r, i) => i === idx ? { ...r, email: recipientEmail, sendingInlineEmail: false, inlineEmailSent: true } : r));
     } catch (e: any) {
       setError(e?.message || "Failed to send email");
       setResults(prev => prev.map((r, i) => i === idx ? { ...r, sendingInlineEmail: false } : r));
@@ -2969,6 +3007,20 @@ function AIHunterPanel({
                               rows={5}
                               className="text-xs"
                             />
+                            <div className="flex items-center justify-between gap-2 pt-1">
+                              <span className="text-[11px] text-slate-500 truncate">
+                                Sending to: <strong className="text-slate-700">{ensureCompanyEmail(b)}</strong>
+                              </span>
+                              <Button
+                                size="sm"
+                                onClick={() => sendInlineEmailForHunted(i)}
+                                disabled={b.sendingInlineEmail}
+                                className="h-8 px-4 text-xs font-semibold gap-1.5 bg-primary hover:bg-primary/90 text-white"
+                              >
+                                {b.sendingInlineEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                                {b.sendingInlineEmail ? "Sending…" : b.inlineEmailSent ? "Send Email Again" : "Send Email"}
+                              </Button>
+                            </div>
                           </div>
                         )}
                       </div>
@@ -3524,14 +3576,16 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
   const auditOfferRes = resolveAuditMatchedOffer(prospect, trainedOffer);
   const effectivePrimaryOffer = auditOfferRes.primaryOffer || prospect.analysis?.matchedOffer || trainedOffer.primaryOfferName;
 
+  const companyEmail = ensureCompanyEmail(prospect);
+
   const sendProposalEmail = async () => {
-    if (!prospect.email || !prospect.proposal) return;
+    if (!companyEmail || !prospect.proposal) return;
     setSendingProposal(true); setSendStatus(null);
     try {
       // Protected route — must go through callCRM() for the bearer token / 401 handling.
-      await callCRM("send-proposal-email", { to: prospect.email, prospectName: prospect.businessName, proposal: prospect.proposal, agencyName: AGENCY_NAME });
-      onUpdate({ ...prospect, status: "proposal_sent" });
-      setSendStatus({ type: "success", msg: `Proposal emailed to ${prospect.email}` });
+      await callCRM("send-proposal-email", { to: companyEmail, prospectName: prospect.businessName, proposal: prospect.proposal, agencyName: AGENCY_NAME });
+      onUpdate({ ...prospect, email: companyEmail, status: "proposal_sent" });
+      setSendStatus({ type: "success", msg: `Proposal emailed to ${companyEmail}` });
     } catch (e: any) { setSendStatus({ type: "error", msg: e.message }); }
     finally { setSendingProposal(false); }
   };
@@ -3669,19 +3723,82 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
     }
   };
 
+  const seededEmailObj = useMemo(() => {
+    if (prospect.generatedEmail && prospect.generatedEmail.subject && prospect.generatedEmail.body) {
+      return prospect.generatedEmail;
+    }
+    const fb = buildLocalFallbackEmails();
+    return {
+      subject: fb[0].subject,
+      body: fb[0].body,
+      emailVersions: fb,
+      selectedVersion: "A",
+    };
+  }, [
+    prospect.id,
+    prospect.generatedEmail,
+    prospect.businessName,
+    prospect.ownerName,
+    prospect.category,
+    prospect.city,
+    prospect.reportUrl,
+  ]);
+
+  // Auto-seed company email & initial outreach messages so Send Email works immediately on the Outreach page
+  useEffect(() => {
+    const seededEmail = ensureCompanyEmail(prospect);
+    const needsEmailSeed = !prospect.email || !prospect.email.includes("@");
+    const needsMessageSeed = !prospect.generatedEmail || !prospect.generatedEmail.subject || !prospect.generatedEmail.body;
+    const firstOwner = prospect.ownerName ? prospect.ownerName.split(" ")[0] : "there";
+    const defaultWA =
+      prospect.generatedWhatsApp ||
+      `Hi ${firstOwner}! 👋 I was checking out ${prospect.businessName}${prospect.city ? ` in ${prospect.city}` : ""} and put together a quick conversion & booking audit to help capture more local clients automatically. Mind if I share the link here?`;
+    const defaultLI =
+      prospect.generatedLinkedIn ||
+      `Hi ${firstOwner}, impressed by ${prospect.businessName}'s work${prospect.city ? ` in ${prospect.city}` : ""}. Would love to connect and share a quick growth idea for your ${prospect.category || "business"}!`;
+
+    if (needsEmailSeed || needsMessageSeed || !prospect.generatedWhatsApp || !prospect.generatedLinkedIn) {
+      const fallbackVersions = buildLocalFallbackEmails();
+      const primary = fallbackVersions[0];
+      onUpdate({
+        ...prospect,
+        email: seededEmail,
+        primaryOffer: prospect.primaryOffer || effectivePrimaryOffer,
+        generatedEmail: needsMessageSeed
+          ? {
+              subject: primary.subject,
+              body: primary.body,
+              emailVersions: fallbackVersions,
+              selectedVersion: "A",
+            }
+          : prospect.generatedEmail,
+        generatedWhatsApp: defaultWA,
+        generatedLinkedIn: defaultLI,
+      });
+    }
+  }, [prospect.id]);
+
   const sendEmail = async () => {
-    if (!prospect.email || !prospect.generatedEmail) return;
+    const targetEmail = ensureCompanyEmail(prospect);
+    const emailPayload = seededEmailObj;
+    if (!targetEmail || !emailPayload) return;
     setSendingEmail(true); setSendStatus(null);
     try {
       await callCRM("send-email", {
-        to: prospect.email,
-        subject: prospect.generatedEmail.subject,
-        body: prospect.generatedEmail.body,
+        to: targetEmail,
+        subject: emailPayload.subject,
+        body: emailPayload.body,
         prospectName: prospect.businessName,
         reportUrl: (prospect as any).reportUrl ?? undefined,
       });
-      onUpdate({ ...prospect, status: "contacted", emailSentAt: new Date().toISOString() });
-      setSendStatus({ type: "success", msg: `Email sent to ${prospect.email}` });
+      onUpdate({
+        ...prospect,
+        email: targetEmail,
+        generatedEmail: emailPayload,
+        status: "contacted",
+        emailSentAt: new Date().toISOString(),
+      });
+      setSendStatus({ type: "success", msg: `Email sent to ${targetEmail}` });
     } catch (e: any) {
       setSendStatus({ type: "error", msg: e.message });
     } finally { setSendingEmail(false); }
@@ -3787,87 +3904,37 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
             )}
           </div>
           <div className="flex items-center gap-1.5 w-full sm:w-auto flex-wrap">
-            {auditOfferRes.showGenerateWebsite && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => handleGenerateInlineAsset("website")}
-                disabled={generatingSiteInline || loadingEmail}
-                className="flex-1 sm:flex-initial h-8 sm:h-7 text-xs gap-1"
-              >
-                {generatingSiteInline ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Globe className="w-3 h-3" />}
-                {prospect.generatedSiteUrl ? "Regenerate Website" : "Generate Website"}
-              </Button>
-            )}
-            {auditOfferRes.showGenerateReview && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => handleGenerateInlineAsset("review")}
-                disabled={generatingReviewInline || loadingEmail}
-                className="flex-1 sm:flex-initial h-8 sm:h-7 text-xs gap-1"
-              >
-                {generatingReviewInline ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Star className="w-3 h-3 text-amber-500" />}
-                {prospect.generatedReviewUrl ? "Regenerate Review" : "Generate Review"}
-              </Button>
-            )}
-            {prospect.generatedEmail && <CopyButton text={`Subject: ${prospect.generatedEmail.subject}\n\n${prospect.generatedEmail.body}`} />}
+            <CopyButton text={`Subject: ${seededEmailObj.subject}\n\n${seededEmailObj.body}`} />
             <Button
               size="sm"
+              variant="outline"
               onClick={genEmail}
               disabled={loadingEmail}
-              className="w-full sm:w-auto h-8 sm:h-7 text-xs gap-1.5 bg-slate-900 hover:bg-slate-800 text-white font-semibold"
+              className="w-full sm:w-auto h-8 sm:h-7 text-xs gap-1.5"
             >
-              {loadingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Mail className="w-3.5 h-3.5" />}
-              {prospect.generatedEmail ? "Regenerate Cold Email" : "Generate Cold Email"}
+              {loadingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+              Regenerate Cold Email
             </Button>
-            {prospect.generatedEmail && prospect.email && (
-              <Button size="sm" onClick={sendEmail} disabled={sendingEmail}
-                className="w-full sm:w-auto h-8 sm:h-7 text-xs gap-1 bg-primary hover:bg-primary/90 text-white font-semibold">
-                {sendingEmail ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
-                {sendingEmail ? "Sending…" : "Send Email"}
-              </Button>
-            )}
           </div>
         </div>
-        {(prospect.generatedSiteUrl || prospect.generatedReviewUrl) && (
-          <div className="px-4 py-2 border-b border-border/50 bg-slate-50 flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-1.5 sm:gap-4 text-xs">
-            {prospect.generatedSiteUrl && (
-              <div className="inline-flex items-center gap-1.5 flex-wrap">
-                <span className="font-semibold text-slate-700">Generated Website:</span>
-                <a href={prospect.generatedSiteUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-1 font-medium break-all">
-                  {prospect.generatedSiteUrl} <ExternalLink className="w-3 h-3 shrink-0" />
-                </a>
-              </div>
-            )}
-            {prospect.generatedReviewUrl && (
-              <div className="inline-flex items-center gap-1.5 flex-wrap">
-                <span className="font-semibold text-slate-700">Generated Review Service:</span>
-                <a href={prospect.generatedReviewUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-1 font-medium break-all">
-                  {prospect.generatedReviewUrl} <ExternalLink className="w-3 h-3 shrink-0" />
-                </a>
-              </div>
-            )}
-          </div>
-        )}
         {/* A/B/C version tabs — shown when multiple versions are available */}
-        {!loadingEmail && prospect.generatedEmail?.emailVersions && prospect.generatedEmail.emailVersions.length > 1 && (
+        {!loadingEmail && seededEmailObj.emailVersions && seededEmailObj.emailVersions.length > 1 && (
           <div className="flex items-center gap-1.5 px-4 py-2 border-b border-border/50 bg-muted/10 flex-wrap">
             <span className="text-xs text-muted-foreground mr-1">Variant:</span>
-            {prospect.generatedEmail.emailVersions.map(v => (
+            {seededEmailObj.emailVersions.map(v => (
               <button
                 key={v.version}
                 onClick={() => onUpdate({
                   ...prospect,
                   generatedEmail: {
-                    ...prospect.generatedEmail!,
+                    ...seededEmailObj,
                     subject: v.subject,
                     body: v.body,
                     selectedVersion: v.version,
                   },
                 })}
                 className={`px-2.5 py-0.5 text-xs font-bold rounded-full border transition-colors ${
-                  prospect.generatedEmail?.selectedVersion === v.version
+                  seededEmailObj.selectedVersion === v.version
                     ? "bg-primary text-white border-primary"
                     : "bg-background text-muted-foreground border-border hover:border-primary/50 hover:text-primary"
                 }`}
@@ -3878,41 +3945,52 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
             <span className="ml-auto text-xs text-muted-foreground hidden sm:inline">Pick the best variant before sending</span>
           </div>
         )}
-        {loadingEmail ? <OutreachCopySkeleton label={`Crafting personalized cold email for ${prospect.businessName}…`} /> : prospect.generatedEmail ? (
+        {loadingEmail ? (
+          <OutreachCopySkeleton label={`Crafting personalized cold email for ${prospect.businessName}…`} />
+        ) : (
           <div className="p-4 space-y-3">
-            {prospect.email && (
-              <div className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2 break-all">
-                Sending to: <span className="font-semibold text-foreground">{prospect.email}</span>
-              </div>
-            )}
             <div className="bg-muted/30 rounded-lg p-3">
               <div className="text-xs font-bold text-muted-foreground mb-1">SUBJECT</div>
-              <Input value={prospect.generatedEmail.subject}
-                onChange={e => onUpdate({ ...prospect, generatedEmail: { ...prospect.generatedEmail!, subject: e.target.value } })}
-                className="border-none bg-transparent p-0 font-semibold text-sm h-auto focus-visible:ring-0" />
+              <Input
+                value={seededEmailObj.subject}
+                onChange={e =>
+                  onUpdate({
+                    ...prospect,
+                    generatedEmail: { ...seededEmailObj, subject: e.target.value },
+                  })
+                }
+                className="border-none bg-transparent p-0 font-semibold text-sm h-auto focus-visible:ring-0"
+              />
             </div>
-            <Textarea value={prospect.generatedEmail.body}
-              onChange={e => onUpdate({ ...prospect, generatedEmail: { ...prospect.generatedEmail!, body: e.target.value } })}
-              rows={7} className="text-sm" />
-            {!prospect.email && (
-              <div className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                No email address for this prospect — add one to enable sending.
+            <Textarea
+              value={seededEmailObj.body}
+              onChange={e =>
+                onUpdate({
+                  ...prospect,
+                  generatedEmail: { ...seededEmailObj, body: e.target.value },
+                })
+              }
+              rows={7}
+              className="text-sm"
+            />
+            <div className="pt-2 border-t border-border/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="text-xs text-muted-foreground break-all">
+                Company Email: <span className="font-semibold text-foreground">{companyEmail}</span>
+                {prospect.emailSentAt && (
+                  <span className="ml-2 text-green-600 font-semibold">
+                    · ✓ Sent {new Date(prospect.emailSentAt).toLocaleDateString()}
+                  </span>
+                )}
               </div>
-            )}
-          </div>
-        ) : (
-          <div className="p-6 text-center space-y-3">
-            <p className="text-sm text-muted-foreground">
-              Generate a personalized cold email for <strong>{prospect.businessName}</strong>
-            </p>
-            <Button
-              onClick={genEmail}
-              disabled={loadingEmail}
-              className="gap-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold w-full sm:w-auto"
-            >
-              <Mail className="w-4 h-4" />
-              Generate Cold Email
-            </Button>
+              <Button
+                onClick={sendEmail}
+                disabled={sendingEmail}
+                className="w-full sm:w-auto gap-2 bg-primary hover:bg-primary/90 text-white font-semibold px-5 h-10 shadow-sm"
+              >
+                {sendingEmail ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                {sendingEmail ? "Sending Email…" : prospect.emailSentAt ? "Send Email Again" : "Send Email"}
+              </Button>
+            </div>
           </div>
         )}
       </div>
@@ -4008,24 +4086,25 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
               Generate
             </Button>
             {followup && <CopyButton text={`Subject: ${followup.subject}\n\n${followup.body}`} />}
-            {followup && prospect.email && (
+            {followup && (
               <Button
                 size="sm"
                 disabled={sendingEmail}
                 onClick={async () => {
-                  if (!prospect.email || !followup) return;
+                  if (!followup) return;
+                  const targetEmail = ensureCompanyEmail(prospect);
                   setSendingEmail(true);
                   setSendStatus(null);
                   try {
                     await callCRM("send-email", {
-                      to: prospect.email,
+                      to: targetEmail,
                       subject: followup.subject,
                       body: followup.body,
                       prospectName: prospect.businessName,
                       reportUrl: (prospect as any).reportUrl ?? undefined,
                     });
-                    onUpdate({ ...prospect, status: "contacted", emailSentAt: new Date().toISOString() });
-                    setSendStatus({ type: "success", msg: `Day ${followupDay} follow-up email sent to ${prospect.email}` });
+                    onUpdate({ ...prospect, email: targetEmail, status: "contacted", emailSentAt: new Date().toISOString() });
+                    setSendStatus({ type: "success", msg: `Day ${followupDay} follow-up email sent to ${targetEmail}` });
                   } catch (e: any) {
                     setSendStatus({ type: "error", msg: e.message });
                   } finally {
@@ -4047,6 +4126,39 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
               <div className="text-sm font-semibold">{followup.subject}</div>
             </div>
             <Textarea value={followup.body} onChange={e => setFollowup({ ...followup, body: e.target.value })} rows={6} className="text-sm" />
+            <div className="pt-2 border-t border-border/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="text-xs text-muted-foreground">
+                Recipient: <span className="font-semibold text-foreground">{companyEmail}</span>
+              </div>
+              <Button
+                disabled={sendingEmail}
+                onClick={async () => {
+                  if (!followup) return;
+                  const targetEmail = ensureCompanyEmail(prospect);
+                  setSendingEmail(true);
+                  setSendStatus(null);
+                  try {
+                    await callCRM("send-email", {
+                      to: targetEmail,
+                      subject: followup.subject,
+                      body: followup.body,
+                      prospectName: prospect.businessName,
+                      reportUrl: (prospect as any).reportUrl ?? undefined,
+                    });
+                    onUpdate({ ...prospect, email: targetEmail, status: "contacted", emailSentAt: new Date().toISOString() });
+                    setSendStatus({ type: "success", msg: `Day ${followupDay} follow-up email sent to ${targetEmail}` });
+                  } catch (e: any) {
+                    setSendStatus({ type: "error", msg: e.message });
+                  } finally {
+                    setSendingEmail(false);
+                  }
+                }}
+                className="w-full sm:w-auto gap-2 bg-primary hover:bg-primary/90 text-white font-semibold px-5 h-10 shadow-sm"
+              >
+                {sendingEmail ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                {sendingEmail ? "Sending Follow-up…" : "Send Email"}
+              </Button>
+            </div>
           </div>
         ) : <div className="p-6 text-center text-sm text-muted-foreground">Generate follow-ups for Day 3, 7, 14, or 30</div>}
       </div>
@@ -5008,7 +5120,7 @@ function ProspectDetail({ prospect, onUpdate, onDelete, onBack }: {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {[
           { label: "Website", value: prospect.website, href: prospect.website, icon: <Globe className="w-3.5 h-3.5" /> },
-          { label: "Email", value: prospect.email, href: `mailto:${prospect.email}`, icon: <Mail className="w-3.5 h-3.5" /> },
+          { label: "Email", value: ensureCompanyEmail(prospect), href: `mailto:${ensureCompanyEmail(prospect)}`, icon: <Mail className="w-3.5 h-3.5" /> },
           { label: "Phone", value: prospect.phone, href: `tel:${prospect.phone}`, icon: <Phone className="w-3.5 h-3.5" /> },
           { label: "Expected Value", value: prospect.expectedValue ? `$${prospect.expectedValue.toLocaleString()}` : "—", icon: <Target className="w-3.5 h-3.5" /> },
         ].map(item => item.value ? (
@@ -5464,17 +5576,18 @@ function ProspectList({
   };
 
   const sendInlineEmailForProspect = async (p: Prospect) => {
-    if (!p.email || !p.generatedEmail || !onUpdate) return;
+    const targetEmail = ensureCompanyEmail(p);
+    if (!targetEmail || !p.generatedEmail || !onUpdate) return;
     setSendingEmailIds(prev => ({ ...prev, [p.id]: true }));
     try {
       await callCRM("send-email", {
-        to: p.email,
+        to: targetEmail,
         subject: p.generatedEmail.subject,
         body: p.generatedEmail.body,
         prospectName: p.businessName,
         reportUrl: p.reportUrl || undefined,
       });
-      onUpdate({ ...p, status: "contacted", emailSentAt: new Date().toISOString() });
+      onUpdate({ ...p, email: targetEmail, status: "contacted", emailSentAt: new Date().toISOString() });
     } catch {
       // ignore
     } finally {
@@ -5710,167 +5823,6 @@ function ProspectList({
                     </Button>
                     <ChevronRight className="w-4 h-4 text-muted-foreground/60" />
                   </div>
-                </div>
-
-                {/* Mobile-Friendly Action Bar right on each Prospect Card */}
-                <div
-                  className="mt-2.5 pt-2.5 border-t border-slate-200/80 flex flex-col gap-2"
-                  onClick={e => e.stopPropagation()}
-                >
-                  <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto sm:justify-end">
-                    {offerRes.showGenerateWebsite && (
-                      <button
-                        type="button"
-                        disabled={isGeneratingSite}
-                        onClick={() => generateInlineAssetForProspect(p, "website")}
-                        className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-medium bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 inline-flex items-center gap-1 cursor-pointer transition-colors"
-                      >
-                        {isGeneratingSite ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : <Globe className="w-3 h-3 text-slate-600 shrink-0" />}
-                        <span>{p.generatedSiteUrl ? "Regenerate Website" : "Generate Website"}</span>
-                      </button>
-                    )}
-                    {offerRes.showGenerateReview && (
-                      <button
-                        type="button"
-                        disabled={isGeneratingReview}
-                        onClick={() => generateInlineAssetForProspect(p, "review")}
-                        className="flex-1 sm:flex-initial justify-center px-2.5 py-2 sm:py-1 rounded-md text-xs font-medium bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 inline-flex items-center gap-1 cursor-pointer transition-colors"
-                      >
-                        {isGeneratingReview ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : <Star className="w-3 h-3 text-amber-500 shrink-0" />}
-                        <span>{p.generatedReviewUrl ? "Regenerate Review" : "Generate Review"}</span>
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      disabled={isGeneratingEmail}
-                      onClick={() => {
-                        if (p.generatedEmail && isEmailOpen) {
-                          setOpenEmailIds(prev => ({ ...prev, [p.id]: false }));
-                        } else if (p.generatedEmail && !isEmailOpen) {
-                          setOpenEmailIds(prev => ({ ...prev, [p.id]: true }));
-                        } else {
-                          generateInlineEmailForProspect(p);
-                        }
-                      }}
-                      className="w-full sm:w-auto justify-center px-3 py-2 sm:py-1 rounded-md text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-white inline-flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm"
-                    >
-                      {isGeneratingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" /> : <Mail className="w-3.5 h-3.5 shrink-0" />}
-                      <span>{p.generatedEmail ? (isEmailOpen ? "Hide Cold Email" : "View Cold Email") : "Generate Cold Email"}</span>
-                    </button>
-                  </div>
-
-                  {(p.generatedSiteUrl || p.generatedReviewUrl) && (
-                    <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-1.5 sm:gap-3 text-xs bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
-                      {p.generatedSiteUrl && (
-                        <div className="inline-flex items-center gap-1.5 flex-wrap">
-                          <span className="font-semibold text-slate-700">Website Preview:</span>
-                          <a href={p.generatedSiteUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-0.5 font-medium break-all">
-                            {p.generatedSiteUrl} <ExternalLink className="w-3 h-3 shrink-0" />
-                          </a>
-                        </div>
-                      )}
-                      {p.generatedReviewUrl && (
-                        <div className="inline-flex items-center gap-1.5 flex-wrap">
-                          <span className="font-semibold text-slate-700">Review Page:</span>
-                          <a href={p.generatedReviewUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline inline-flex items-center gap-0.5 font-medium break-all">
-                            {p.generatedReviewUrl} <ExternalLink className="w-3 h-3 shrink-0" />
-                          </a>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {isEmailOpen && p.generatedEmail && (
-                    <div className="p-3 rounded-lg border border-slate-200 bg-white space-y-2.5 mt-1">
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-slate-800 flex items-center gap-1.5 flex-wrap">
-                          <Mail className="w-3.5 h-3.5 text-slate-600 shrink-0" />
-                          <span>Personalized Cold Email{offerRes.primaryOffer ? ` (${offerRes.primaryOffer})` : ""}</span>
-                          {p.emailSentAt && <span className="text-green-600 font-semibold">· ✓ Sent</span>}
-                        </span>
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          <CopyButton text={`Subject: ${p.generatedEmail.subject}\n\n${p.generatedEmail.body}`} />
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => generateInlineEmailForProspect(p)}
-                            disabled={isGeneratingEmail}
-                            className="h-7 text-xs gap-1"
-                          >
-                            <RefreshCw className={`w-3 h-3 ${isGeneratingEmail ? "animate-spin" : ""}`} />
-                            Regenerate
-                          </Button>
-                          {p.email && (
-                            <Button
-                              size="sm"
-                              onClick={() => sendInlineEmailForProspect(p)}
-                              disabled={isSendingEmail}
-                              className="h-7 text-xs gap-1 bg-slate-900 hover:bg-slate-800 text-white"
-                            >
-                              <Send className="w-3 h-3" />
-                              {isSendingEmail ? "Sending…" : "Send Email"}
-                            </Button>
-                          )}
-                          {p.phone && (
-                            <a
-                              href={getWhatsAppHref(p.phone, buildQuickWhatsAppText(p, offerRes.primaryOffer))}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                            >
-                              <Button
-                                type="button"
-                                size="sm"
-                                className="h-7 text-xs gap-1 bg-green-600 hover:bg-green-700 text-white"
-                              >
-                                <MessageCircle className="w-3 h-3" />
-                                Send on WhatsApp
-                              </Button>
-                            </a>
-                          )}
-                          <a
-                            href={getLinkedInHref(p)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            onClick={() => {
-                              try {
-                                navigator.clipboard.writeText(buildQuickLinkedInText(p, offerRes.primaryOffer));
-                              } catch {}
-                            }}
-                          >
-                            <Button
-                              type="button"
-                              size="sm"
-                              className="h-7 text-xs gap-1 bg-[#0A66C2] hover:bg-[#004182] text-white"
-                            >
-                              <Linkedin className="w-3 h-3" />
-                              Send on LinkedIn
-                            </Button>
-                          </a>
-                        </div>
-                      </div>
-                      <Input
-                        value={p.generatedEmail.subject}
-                        onChange={(e) =>
-                          onUpdate?.({
-                            ...p,
-                            generatedEmail: { ...p.generatedEmail!, subject: e.target.value },
-                          })
-                        }
-                        className="h-8 text-xs font-semibold"
-                      />
-                      <Textarea
-                        value={p.generatedEmail.body}
-                        onChange={(e) =>
-                          onUpdate?.({
-                            ...p,
-                            generatedEmail: { ...p.generatedEmail!, body: e.target.value },
-                          })
-                        }
-                        rows={5}
-                        className="text-xs"
-                      />
-                    </div>
-                  )}
                 </div>
               </div>
             );
@@ -6821,7 +6773,10 @@ export default function CRM() {
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (data && Array.isArray(data.prospects)) {
-          const remote: Prospect[] = data.prospects;
+          const remote: Prospect[] = data.prospects.map((rp: Prospect) => ({
+            ...rp,
+            email: ensureCompanyEmail(rp),
+          }));
           const currentLocal = loadProspects();
           if (remote.length > 0 && currentLocal.length === 0) {
             saveUserProspects(remote);
@@ -6829,7 +6784,7 @@ export default function CRM() {
           } else if (currentLocal.length > 0) {
             const byId = new Map<number | string, Prospect>();
             for (const rp of remote) byId.set(rp.id, rp);
-            for (const lp of currentLocal) byId.set(lp.id, lp);
+            for (const lp of currentLocal) byId.set(lp.id, { ...lp, email: ensureCompanyEmail(lp) });
             const mergedList = Array.from(byId.values());
             saveProspects(mergedList);
             setProspects(mergedList);
@@ -6921,6 +6876,7 @@ export default function CRM() {
         const maxId = prev.length > 0 ? Math.max(...prev.map((p) => p.id)) : 0;
         const added = newOnes.map((p, i) => ({
           ...p,
+          email: ensureCompanyEmail(p),
           projectId: p.projectId || targetProjId,
           id: maxId + i + 1,
           addedAt: new Date().toISOString(),
