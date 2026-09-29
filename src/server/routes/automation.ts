@@ -1,11 +1,11 @@
 import { Router } from "express";
-import nodemailer from "nodemailer";
 import { promises as dnsPromises } from "dns";
 import { ImapFlow } from "imapflow";
 import { db, emailAccountsTable, automationSettingsTable, emailTrackingTable, followUpQueueTable, inboxRepliesTable } from "../../db";
 import { eq, and, lte, isNull, desc } from "drizzle-orm";
 import { getGeminiAI } from "./api-keys";
 import { sendMail as brevoSendMail, brevoTransporter } from "../lib/brevo-mailer";
+import { makeSmartTransporter, resolveIpv4Host } from "../lib/smtp-mailer";
 import { requireAdmin } from "../lib/admin-auth";
 import { scrapeBusinessDirectories } from "../lib/business-scrapers";
 import { createReport, buildReportEmailSection, getAgencyBaseUrl } from "./reports";
@@ -36,22 +36,8 @@ const router = Router();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function makeTransporter(acct: { host: string; port: number; secure: boolean; user: string; password: string }) {
-  const port = acct.port || 587;
-  const secure = port === 465;
-  const pass = (acct.password || "").replace(/\s/g, "");
-  const user = (acct.user || "").trim();
-  return nodemailer.createTransport({
-    host: acct.host,
-    port,
-    secure,
-    requireTLS: !secure,
-    auth: { user, pass },
-    tls: { rejectUnauthorized: false },
-    connectionTimeout: 15000,
-    greetingTimeout: 10000,
-    socketTimeout: 15000,
-  } as any);
+function makeTransporter(acct: { host: string; port: number; secure: boolean; user: string; password: string; provider?: string; fromName?: string; fromEmail?: string }) {
+  return makeSmartTransporter(acct);
 }
 
 async function generateText(prompt: string): Promise<string> {
@@ -227,14 +213,18 @@ function cleanPassword(password: string): string {
 }
 
 function validateCredentials(provider: string, cleanedPassword: string, user: string): string | null {
-  if (provider === "gmail" && cleanedPassword.length !== 16) {
-    return `Gmail requires a 16-character App Password (not your regular password). You provided ${cleanedPassword.length} characters. Generate one at myaccount.google.com/apppasswords.`;
+  if (
+    provider === "gmail" &&
+    cleanedPassword.length !== 16 &&
+    !cleanedPassword.startsWith("https://script.google.com/")
+  ) {
+    return `Gmail requires a 16-character App Password (or a Google Apps Script HTTPS Bridge URL). You provided ${cleanedPassword.length} characters. Generate one at myaccount.google.com/apppasswords.`;
   }
   if (provider === "sendgrid" && user.trim().toLowerCase() !== "apikey") {
     return `SendGrid requires the username to be exactly "apikey", not your email address.`;
   }
-  if (provider === "resend" && user.trim().toLowerCase() !== "resend") {
-    return `Resend requires the username to be exactly "resend".`;
+  if (provider === "resend" && user.trim().toLowerCase() !== "resend" && !cleanedPassword.startsWith("re_")) {
+    return `Resend requires the username to be "resend" or an API key starting with "re_".`;
   }
   return null;
 }
@@ -973,13 +963,17 @@ Return ONLY valid JSON: { "emailVersions":[{"version":"A","subject":"string","bo
 async function readImapMessages(acct: {
   user: string; password: string; imapHost: string; imapPort: number; id: number;
 }): Promise<Array<{ messageId: string; from: string; subject: string; text: string; date: Date }>> {
+  const rawImapHost =
+    acct.imapHost && !acct.imapHost.startsWith("owner:") ? acct.imapHost : "imap.gmail.com";
+  const ipv4ImapHost = await resolveIpv4Host(rawImapHost);
   const client = new ImapFlow({
-    host: acct.imapHost || "imap.gmail.com",
+    host: ipv4ImapHost,
     port: acct.imapPort || 993,
     secure: true,
+    servername: rawImapHost,
     auth: { user: acct.user.trim(), pass: (acct.password || "").replace(/\s/g, "") },
     logger: false,
-    tls: { rejectUnauthorized: false },
+    tls: { rejectUnauthorized: false, servername: rawImapHost },
   } as any);
 
   const out: Array<{ messageId: string; from: string; subject: string; text: string; date: Date }> = [];

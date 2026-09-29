@@ -44,11 +44,28 @@ export interface SmtpAccountItem {
   createdAt?: string;
 }
 
+export const GMAIL_APPS_SCRIPT_BRIDGE_CODE = `function doPost(e) {
+  try {
+    var d = JSON.parse(e.postData.contents || "{}");
+    if (d.action === "ping") {
+      return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
+    }
+    GmailApp.sendEmail(d.to, d.subject || "", d.text || "", {
+      htmlBody: d.html || d.text || "",
+      name: d.fromName || "Outreach Team",
+      replyTo: d.replyTo || d.fromEmail || ""
+    });
+    return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: String(err) })).setMimeType(ContentService.MimeType.JSON);
+  }
+}`;
+
 export const SMTP_PROVIDER_PRESETS = [
   {
     id: "gmail",
     name: "Gmail (Personal)",
-    badge: "Most Popular · 16-Digit App Password",
+    badge: "Most Popular · 16-Digit App Password (IPv4 Forced)",
     host: "smtp.gmail.com",
     port: 587,
     secure: false,
@@ -64,6 +81,29 @@ export const SMTP_PROVIDER_PRESETS = [
       "3. Open Google App Passwords directly (myaccount.google.com/apppasswords) or search 'App passwords' in the top search bar.",
       "4. Type a name like 'Vanguard Mailer' and click Create.",
       "5. Copy the 16-letter App Password shown in the yellow box and paste it into the App Password field below (spaces are removed automatically).",
+      "NOTE FOR RENDER FREE TIER: Render's Free plan blocks outbound SMTP ports 25, 465 & 587. If on Render Free tier, select 'Gmail (Render HTTPS Bridge · Port 443)' next to this tab to send from your Gmail over HTTPS Port 443 for free!",
+    ],
+  },
+  {
+    id: "gmail_https",
+    name: "Gmail (Render HTTPS Bridge · Port 443)",
+    badge: "Bypasses Render Free Tier Port Block · 100% Free",
+    host: "script.google.com",
+    port: 443,
+    secure: true,
+    recommendedLimit: 100,
+    userPlaceholder: "yourname@gmail.com",
+    passLabel: "Google Apps Script Web App URL (https://script.google.com/...) *",
+    passPlaceholder: "https://script.google.com/macros/s/.../exec",
+    appPasswordUrl: "https://script.google.com/home/start",
+    securityUrl: "https://script.google.com/home/start",
+    steps: [
+      "1. Why use this? Render's Free Web Service tier blocks outbound SMTP ports 25, 465, and 587. This bridge sends from your real Gmail inbox over HTTPS Port 443 (which is NEVER blocked) and requires no 2-Step Verification or paid plan!",
+      "2. Click 'Open Google Apps Script' below and click '+ New Project'.",
+      "3. Delete any code in the editor, click 'Copy 10-Line Gmail Bridge Code' below, and paste it in.",
+      "4. Click the blue 'Deploy' button (top right) → 'New deployment' → click the gear icon → select 'Web app'.",
+      "5. Set 'Execute as' to 'Me' and 'Who has access' to 'Anyone', then click 'Deploy' and 'Authorize access' with your Gmail account.",
+      "6. Copy the generated Web App URL (https://script.google.com/macros/s/.../exec) and paste it into the Web App URL field below!",
     ],
   },
   {
@@ -148,21 +188,21 @@ export const SMTP_PROVIDER_PRESETS = [
   },
   {
     id: "brevo",
-    name: "Brevo (Sendinblue) SMTP",
-    badge: "High-Volume Transactional Relay",
+    name: "Brevo (Sendinblue) SMTP / API",
+    badge: "Port 2525 & HTTPS 443 · Works on Render Free Tier",
     host: "smtp-relay.brevo.com",
-    port: 587,
+    port: 2525,
     secure: false,
     recommendedLimit: 300,
     userPlaceholder: "Your Brevo Login Email (or 7a8b9c...@smtp-brevo.com)",
-    passLabel: "Brevo Master SMTP Key (xsmtpsib-...) *",
-    passPlaceholder: "xsmtpsib-...",
+    passLabel: "Brevo SMTP Key (xsmtpsib-...) or API Key (xkeysib-...) *",
+    passPlaceholder: "xsmtpsib-... or xkeysib-...",
     appPasswordUrl: "https://app.brevo.com/settings/keys/smtp",
-    securityUrl: "https://app.brevo.com/settings/keys/smtp",
+    securityUrl: "https://app.brevo.com/settings/keys/api",
     steps: [
       "1. Log in to your Brevo dashboard and open Settings → SMTP & API (app.brevo.com/settings/keys/smtp).",
       "2. Under the SMTP tab, copy your 'SMTP Login' into the Email/Username field.",
-      "3. Click 'Generate a new SMTP key', copy the key starting with 'xsmtpsib-...', and paste it into the Password field.",
+      "3. Paste either your SMTP Key (xsmtpsib-..., connects via Port 2525 which is open on Render) OR an API Key (xkeysib-..., connects via HTTPS Port 443).",
       "4. Set your verified sender email in the 'From Email' field.",
     ],
   },
@@ -334,6 +374,18 @@ export const SmtpAppPasswordGuide: React.FC<{
 
             {(activePreset.appPasswordUrl || activePreset.securityUrl) && (
               <div className="pt-2 flex flex-wrap items-center gap-2.5">
+                {activePreset.id === "gmail_https" && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(GMAIL_APPS_SCRIPT_BRIDGE_CODE);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-2xs cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copy 10-Line Gmail Bridge Code</span>
+                  </button>
+                )}
                 {activePreset.appPasswordUrl && (
                   <a
                     href={activePreset.appPasswordUrl}
@@ -341,7 +393,11 @@ export const SmtpAppPasswordGuide: React.FC<{
                     rel="noopener noreferrer"
                     className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-xs font-bold shadow-2xs"
                   >
-                    <span>Open {activePreset.name.split(" ")[0]} App Passwords Page</span>
+                    <span>
+                      {activePreset.id === "gmail_https"
+                        ? "Open Google Apps Script (script.google.com)"
+                        : `Open ${activePreset.name.split(" ")[0]} App Passwords Page`}
+                    </span>
                     <ExternalLink className="w-3.5 h-3.5" />
                   </a>
                 )}
@@ -891,7 +947,7 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
                   {activePreset.passLabel}
                 </label>
                 <input
-                  type="password"
+                  type={selectedPresetId === "gmail_https" ? "url" : "password"}
                   required
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}

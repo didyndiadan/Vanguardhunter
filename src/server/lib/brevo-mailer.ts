@@ -1,5 +1,5 @@
-import nodemailer from "nodemailer";
 import { getConfigKey } from "../routes/api-keys";
+import { makeSmartTransporter } from "./smtp-mailer";
 
 async function getBrevoCredentials(): Promise<{ user: string; pass: string }> {
   const user =
@@ -7,29 +7,33 @@ async function getBrevoCredentials(): Promise<{ user: string; pass: string }> {
     (await getConfigKey("BREVO_SMTP_USER")) ||
     "";
   const pass =
+    process.env.BREVO_API_KEY ||
     process.env.BREVO_PASS ||
     process.env.BREVO_SMTP_PASSWORD ||
+    (await getConfigKey("BREVO_API_KEY")) ||
     (await getConfigKey("BREVO_SMTP_KEY")) ||
     "";
-  if (!user || !pass) {
+  if (!user && !pass.startsWith("xkeysib-")) {
     throw new Error("Brevo SMTP not configured. Add BREVO_SMTP_USER and BREVO_SMTP_KEY in Admin → AI Setup.");
   }
-  return { user, pass };
+  if (!pass) {
+    throw new Error("Brevo SMTP not configured. Add BREVO_SMTP_USER and BREVO_SMTP_KEY in Admin → AI Setup.");
+  }
+  return { user: user || "noreply@devstudio.ai", pass };
 }
 
 function makeBrevoTransport(user: string, pass: string) {
-  return nodemailer.createTransport({
-    host: "smtp-relay.brevo.com",
-    port: 587,
-    secure: false,
-    requireTLS: true,
-    auth: { type: "LOGIN", user, pass },
-    tls: { rejectUnauthorized: false },
-    connectionTimeout: 15000,
-    greetingTimeout: 10000,
-    socketTimeout: 15000,
-    authMethod: "PLAIN",
-  } as any);
+  return makeSmartTransporter(
+    {
+      host: "smtp-relay.brevo.com",
+      port: process.env.RENDER ? 2525 : 587,
+      secure: false,
+      user,
+      password: pass,
+      provider: "brevo",
+    },
+    { type: "LOGIN" }
+  );
 }
 
 export async function verifyBrevo(): Promise<void> {

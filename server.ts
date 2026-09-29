@@ -1,5 +1,13 @@
 import "dotenv/config";
+import dns from "node:dns";
+import "./src/server/lib/smtp-mailer";
 import express from "express";
+
+try {
+  if (typeof dns.setDefaultResultOrder === "function") {
+    dns.setDefaultResultOrder("ipv4first");
+  }
+} catch {}
 import cors from "cors";
 import fs from "fs";
 import path from "path";

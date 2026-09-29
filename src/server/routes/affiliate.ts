@@ -1,10 +1,10 @@
 import { Router } from "express";
-import nodemailer from "nodemailer";
 import { randomUUID } from "crypto";
 import { db, emailAccountsTable, affiliateCampaignsTable, affiliateContactsTable, emailTrackingTable } from "../../db";
 import { eq, and, asc, sql, inArray } from "drizzle-orm";
 import { getGeminiAI } from "./api-keys";
 import { requireAdmin } from "../lib/admin-auth";
+import { makeSmartTransporter } from "../lib/smtp-mailer";
 
 const router = Router();
 
@@ -14,15 +14,8 @@ const activeSenders = new Map<number, { running: boolean }>();
 
 // ─── Email helpers (self-contained, parallel to crm-ai.ts) ────────────────────
 
-function makeTransporter(acct: { host: string; port: number; secure: boolean; user: string; password: string }) {
-  const port = acct.port || 587;
-  const secure = port === 465;
-  return nodemailer.createTransport({
-    host: acct.host, port, secure, requireTLS: !secure,
-    auth: { user: acct.user.trim(), pass: acct.password.replace(/\s/g, "") },
-    tls: { rejectUnauthorized: false },
-    connectionTimeout: 15000, greetingTimeout: 10000, socketTimeout: 15000,
-  } as any);
+function makeTransporter(acct: { host: string; port: number; secure: boolean; user: string; password: string; provider?: string; fromName?: string; fromEmail?: string }) {
+  return makeSmartTransporter(acct);
 }
 
 function todayStr() {

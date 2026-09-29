@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { randomBytes } from "crypto";
-import nodemailer from "nodemailer";
+import { makeSmartTransporter } from "../lib/smtp-mailer";
 import {
   db,
   generatedWebsitesTable,
@@ -1785,16 +1785,7 @@ router.post("/website-builder/sites/:siteId/send-email", async (req: Request, re
     let sentVia = "Brevo / Rotational SMTP";
     if (accounts.length > 0) {
       const acct = accounts[0];
-      const port = acct.port || 587;
-      const secure = port === 465;
-      const transporter = nodemailer.createTransport({
-        host: acct.host,
-        port,
-        secure,
-        requireTLS: !secure,
-        auth: { user: acct.user.trim(), pass: acct.password.replace(/\s/g, "") },
-        tls: { rejectUnauthorized: false },
-      } as any);
+      const transporter = makeSmartTransporter(acct);
 
       await transporter.sendMail({
         from: `"${acct.fromName || "Website Preview Team"}" <${acct.fromEmail || acct.user}>`,
@@ -2411,16 +2402,7 @@ router.post("/website-builder/public/:siteId/claim", async (req: Request, res: R
 
         if (accounts.length > 0) {
           const acct = accounts[0];
-          const port = acct.port || 587;
-          const secure = port === 465;
-          const transporter = nodemailer.createTransport({
-            host: acct.host,
-            port,
-            secure,
-            requireTLS: !secure,
-            auth: { user: acct.user.trim(), pass: acct.password.replace(/\s/g, "") },
-            tls: { rejectUnauthorized: false },
-          } as any);
+          const transporter = makeSmartTransporter(acct);
 
           await transporter.sendMail({
             from: `"${acct.fromName || "Website Activation Team"}" <${acct.fromEmail || acct.user}>`,
@@ -2627,16 +2609,7 @@ router.post("/website-builder/sites/:siteId/send-payment-email", async (req: Req
     let sentVia = "Brevo / Rotational SMTP";
     if (accounts.length > 0) {
       const acct = accounts[0];
-      const port = acct.port || 587;
-      const secure = port === 465;
-      const transporter = nodemailer.createTransport({
-        host: acct.host,
-        port,
-        secure,
-        requireTLS: !secure,
-        auth: { user: acct.user.trim(), pass: acct.password.replace(/\s/g, "") },
-        tls: { rejectUnauthorized: false },
-      } as any);
+      const transporter = makeSmartTransporter(acct);
 
       await transporter.sendMail({
         from: `"${acct.fromName || "Website Activation & Billing"}" <${acct.fromEmail || acct.user}>`,

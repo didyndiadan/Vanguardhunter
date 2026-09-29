@@ -1,6 +1,6 @@
 import { Router } from "express";
-import nodemailer from "nodemailer";
 import { randomUUID } from "crypto";
+import { makeSmartTransporter } from "../lib/smtp-mailer";
 import { promises as dnsPromises } from "dns";
 import { getGeminiAI, getConfigKey } from "./api-keys";
 import {
@@ -94,22 +94,8 @@ const router = Router();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function makeTransporter(acct: { host: string; port: number; secure: boolean; user: string; password: string }) {
-  const port = acct.port || 587;
-  const secure = port === 465;
-  const pass = (acct.password || "").replace(/\s/g, "");
-  const user = (acct.user || "").trim();
-  return nodemailer.createTransport({
-    host: acct.host,
-    port,
-    secure,
-    requireTLS: !secure,
-    auth: { user, pass },
-    tls: { rejectUnauthorized: false },
-    connectionTimeout: 15000,
-    greetingTimeout: 10000,
-    socketTimeout: 15000,
-  } as any);
+function makeTransporter(acct: { host: string; port: number; secure: boolean; user: string; password: string; provider?: string; fromName?: string; fromEmail?: string }) {
+  return makeSmartTransporter(acct);
 }
 
 async function generateText(prompt: string, systemInstruction?: string): Promise<string> {
