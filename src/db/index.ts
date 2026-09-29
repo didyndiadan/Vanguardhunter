@@ -2,6 +2,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { drizzle as drizzlePg } from "drizzle-orm/node-postgres";
 import { sql } from "drizzle-orm";
+import { execFileSync } from "child_process";
 import pg from "pg";
 import fs from "fs";
 import os from "os";
@@ -14,18 +15,59 @@ let dbInstance: ReturnType<typeof drizzlePglite<typeof schema>>;
 let pgliteClient: PGlite | null = null;
 let pgPool: pg.Pool | null = null;
 
-function initPgliteFallback() {
-  const dataDir = process.env.PGDATA_DIR || path.join(os.tmpdir(), "ai-business-hunter-pgdata-v2");
+const PGLITE_LOW_MEM_START_PARAMS = [
+  ...PGlite.defaultStartParams,
+  "-c",
+  "shared_buffers=4MB",
+  "-c",
+  "work_mem=1MB",
+  "-c",
+  "temp_buffers=1MB",
+  "-c",
+  "wal_buffers=256kB",
+];
+
+function prepareCleanPgliteDataDir(forceReset = false): string {
+  const dataDir = process.env.PGDATA_DIR || path.join(os.tmpdir(), "ai-business-hunter-pgdata-v3");
+  const templateDir = path.join(process.cwd(), "dist", "pgdata-template");
+
   try {
-    fs.mkdirSync(dataDir, { recursive: true });
     const pidFile = path.join(dataDir, "postmaster.pid");
-    if (fs.existsSync(pidFile)) {
-      try { fs.unlinkSync(pidFile); } catch {}
+    if (forceReset || fs.existsSync(pidFile)) {
+      fs.rmSync(dataDir, { recursive: true, force: true });
     }
-    pgliteClient = new PGlite(dataDir);
+
+    if (!fs.existsSync(path.join(dataDir, "PG_VERSION"))) {
+      if (!fs.existsSync(path.join(templateDir, "PG_VERSION"))) {
+        const scriptPath = path.join(process.cwd(), "scripts", "prebuild-pgdata.mjs");
+        if (fs.existsSync(scriptPath)) {
+          try {
+            execFileSync(process.execPath, [scriptPath], { stdio: "ignore", timeout: 25000 });
+          } catch {}
+        }
+      }
+      if (fs.existsSync(path.join(templateDir, "PG_VERSION"))) {
+        fs.rmSync(dataDir, { recursive: true, force: true });
+        fs.cpSync(templateDir, dataDir, { recursive: true });
+      } else {
+        fs.mkdirSync(dataDir, { recursive: true });
+      }
+    }
   } catch {
-    pgliteClient = new PGlite();
+    try {
+      fs.mkdirSync(dataDir, { recursive: true });
+    } catch {}
   }
+
+  return dataDir;
+}
+
+function initPgliteFallback(forceReset = false) {
+  const dataDir = prepareCleanPgliteDataDir(forceReset);
+  pgliteClient = new PGlite(dataDir, {
+    relaxedDurability: true,
+    startParams: PGLITE_LOW_MEM_START_PARAMS,
+  });
   dbInstance = drizzlePglite(pgliteClient, { schema });
 }
 
@@ -432,9 +474,11 @@ export async function initDatabase(): Promise<void> {
       try {
         await pgliteClient.exec(SCHEMA_SQL);
       } catch (pgliteErr) {
-        console.warn("[db] On-disk PGlite failed to initialize, falling back to clean PGlite instance:", pgliteErr);
-        pgliteClient = new PGlite();
-        dbInstance = drizzlePglite(pgliteClient, { schema });
+        console.warn("[db] On-disk PGlite recovery needed, resetting from clean disk template:", pgliteErr);
+        try {
+          await pgliteClient.close();
+        } catch {}
+        initPgliteFallback(true);
         await pgliteClient.exec(SCHEMA_SQL);
       }
       await pgliteClient.exec(`

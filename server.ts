@@ -3,7 +3,6 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
-import { createServer as createViteServer } from "vite";
 import { initDatabase } from "./src/db";
 import crmAiRouter from "./src/server/routes/crm-ai";
 import automationRouter, { startScheduler } from "./src/server/routes/automation";
@@ -76,14 +75,21 @@ async function startServer() {
 
   const distPath = path.join(process.cwd(), "dist");
   const hasBuiltDist = fs.existsSync(path.join(distPath, "index.html"));
+  const isProdRuntime =
+    Boolean(process.env.RENDER) ||
+    process.env.NODE_ENV === "production";
 
-  if (process.env.NODE_ENV !== "production" || !hasBuiltDist) {
-    const vitePromise = createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+  if (!isProdRuntime || !hasBuiltDist) {
+    let vitePromise: Promise<any> | null = null;
     app.use(async (req, res, next) => {
       try {
+        if (!vitePromise) {
+          const { createServer: createViteServer } = await import("vite");
+          vitePromise = createViteServer({
+            server: { middlewareMode: true },
+            appType: "spa",
+          });
+        }
         const vite = await vitePromise;
         vite.middlewares(req, res, next);
       } catch (err) {
@@ -91,7 +97,7 @@ async function startServer() {
       }
     });
   } else {
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, { maxAge: "1h" }));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
