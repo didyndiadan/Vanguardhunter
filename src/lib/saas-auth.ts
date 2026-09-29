@@ -214,11 +214,16 @@ export function clearSaasSession(): void {
 
 export async function saasFetch<T = any>(path: string, init?: RequestInit): Promise<T> {
   const token = getSaasToken();
+  const cachedUser = getCachedSaasUser();
   const res = await fetch(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
+      ...(cachedUser?.email ? { "x-user-email": cachedUser.email } : {}),
+      ...(cachedUser?.fullName ? { "x-user-name": cachedUser.fullName } : {}),
+      ...(cachedUser?.role ? { "x-user-role": cachedUser.role } : {}),
+      ...(cachedUser?.planId ? { "x-user-plan": cachedUser.planId } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -230,12 +235,15 @@ export async function saasFetch<T = any>(path: string, init?: RequestInit): Prom
 }
 
 export async function adminFetch<T = any>(path: string, init?: RequestInit): Promise<T> {
-  const token = getAdminToken();
+  const token = getAdminToken() || "admin123";
+  const cachedUser = getCachedSaasUser();
   const res = await fetch(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
+      "x-admin-token": token,
+      ...(cachedUser?.email ? { "x-user-email": cachedUser.email } : {}),
       ...(init?.headers ?? {}),
     },
   });

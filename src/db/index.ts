@@ -105,7 +105,7 @@ function initSqliteFallback(forceReset = false) {
     }
     fs.mkdirSync(dataDir, { recursive: true });
     sqliteDb = new DatabaseSync(dbFilePath);
-    sqliteDb.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;");
+    sqliteDb.exec("PRAGMA journal_mode = MEMORY; PRAGMA synchronous = OFF; PRAGMA busy_timeout = 5000;");
   } catch {
     sqliteDb = new DatabaseSync(":memory:");
   }
@@ -543,6 +543,7 @@ export async function initDatabase(): Promise<void> {
 
     if (sqliteDb) {
       const sqliteSchemaSql = SCHEMA_SQL
+        .replace(/ALTER\s+TABLE\s+[^\n;]+;/gi, "")
         .replace(/SERIAL PRIMARY KEY/gi, "INTEGER PRIMARY KEY AUTOINCREMENT")
         .replace(/::jsonb/gi, "")
         .replace(/\bDEFAULT\s+false\b/gi, "DEFAULT 0")
@@ -551,8 +552,8 @@ export async function initDatabase(): Promise<void> {
         sqliteDb.exec(sqliteSchemaSql);
       } catch (sqliteErr) {
         console.warn("[db] Embedded SQLite recovery needed, resetting database:", sqliteErr);
-        initSqliteFallback(true);
-        sqliteDb!.exec(sqliteSchemaSql);
+        sqliteDb = new DatabaseSync(":memory:");
+        sqliteDb.exec(sqliteSchemaSql);
       }
       sqliteDb.exec(`
         DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';

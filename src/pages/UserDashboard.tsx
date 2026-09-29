@@ -295,26 +295,34 @@ export default function UserDashboard() {
   const dashboardSearchInputRef = useRef<HTMLInputElement | null>(null);
 
   const loadDashboard = useCallback(async () => {
-    if (!getSaasToken()) {
+    const token = getSaasToken();
+    const cached = getCachedSaasUser();
+    if (!token && !cached) {
       clearSaasSession();
       setLocation("/auth?mode=login&redirect=/dashboard");
       return;
     }
+    if (cached) {
+      setUser((prev) => prev || cached);
+      setProfileName((prev) => prev || cached.fullName || "");
+      setProfileCompany((prev) => prev || cached.companyName || "");
+    }
     setLoading(true);
     try {
       const [meData, plansData, cfgData, reportsData, crmData] = await Promise.all([
-        saasFetch("/api/saas/auth/me"),
-        fetch("/api/saas/plans").then((r) => r.json()),
-        fetch("/api/saas/billing/config").then((r) => r.json()),
+        saasFetch("/api/saas/auth/me").catch(() => ({ user: cached })),
+        fetch("/api/saas/plans").then((r) => r.json()).catch(() => ({ plans: [] })),
+        fetch("/api/saas/billing/config").then((r) => r.json()).catch(() => null),
         saasFetch("/api/reports").catch(() => ({ reports: [] })),
         saasFetch("/api/crm/prospects").catch(() => ({ prospects: [] })),
       ]);
 
-      if (meData.user) {
-        setUser(meData.user);
-        setProfileName(meData.user.fullName);
-        setProfileCompany(meData.user.companyName);
-        localStorage.setItem("vh_saas_user", JSON.stringify(meData.user));
+      const resolvedUser = meData?.user || cached;
+      if (resolvedUser) {
+        setUser(resolvedUser);
+        setProfileName(resolvedUser.fullName || "");
+        setProfileCompany(resolvedUser.companyName || "");
+        localStorage.setItem("vh_saas_user", JSON.stringify(resolvedUser));
         // Now that vh_saas_user is set to the authenticated user, reload user-scoped projects & prospects
         setProjects(loadProjects());
         const localProspects = loadUserProspects<ExportableLead>();
@@ -327,20 +335,20 @@ export default function UserDashboard() {
         }
         syncProjectsFromServer().then((merged) => {
           if (merged.length > 0) setProjects(merged);
-        });
+        }).catch(() => {});
       }
-      if (meData.plan) setActivePlan(meData.plan);
-      if (Array.isArray(meData.activities)) setActivities(meData.activities);
-      if (Array.isArray(meData.payments)) setPayments(meData.payments);
-      if (Array.isArray(meData.supportMessages)) {
+      if (meData?.plan) setActivePlan(meData.plan);
+      if (Array.isArray(meData?.activities)) setActivities(meData.activities);
+      if (Array.isArray(meData?.payments)) setPayments(meData.payments);
+      if (Array.isArray(meData?.supportMessages)) {
         setSupportMessages(meData.supportMessages);
         const unread = meData.supportMessages.filter(
           (m: SupportMessage) => !m.readByUser && m.senderRole === "admin"
         ).length;
         setUnreadSupportCount(unread);
       }
-      if (meData.workspaceCounts) setWorkspaceCounts(meData.workspaceCounts);
-      if (Array.isArray(plansData.plans)) {
+      if (meData?.workspaceCounts) setWorkspaceCounts(meData.workspaceCounts);
+      if (Array.isArray(plansData?.plans)) {
         setAllPlans(plansData.plans);
         const urlParams = new URLSearchParams(window.location.search);
         const requestedPlanId = urlParams.get("plan");
@@ -364,8 +372,10 @@ export default function UserDashboard() {
       }
     } catch (err) {
       console.error("Failed to load user dashboard:", err);
-      clearSaasSession();
-      setLocation("/auth?mode=login&redirect=/dashboard");
+      if (!cached) {
+        clearSaasSession();
+        setLocation("/auth?mode=login&redirect=/dashboard");
+      }
     } finally {
       setLoading(false);
     }

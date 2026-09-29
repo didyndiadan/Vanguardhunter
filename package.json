@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "dev": "tsx server.ts",
     "start": "NODE_ENV=production node --no-warnings --max-old-space-size=384 dist/server.mjs",
