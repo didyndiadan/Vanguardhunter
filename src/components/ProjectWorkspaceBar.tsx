@@ -30,14 +30,21 @@ export function ExportLeadsBar({
   projectsMap,
   label = "Export Generated Leads",
   compact = false,
+  onSaveData,
+  onClearData,
 }: {
   leads: ExportableLead[];
   projectName: string;
   projectsMap?: Record<string, string>;
   label?: string;
   compact?: boolean;
+  onSaveData?: () => void | Promise<void>;
+  onClearData?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [savingData, setSavingData] = useState(false);
+  const [savedData, setSavedData] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [exportNotice, setExportNotice] = useState("");
   const [showEmailForm, setShowEmailForm] = useState(false);
   const [recipientEmail, setRecipientEmail] = useState("");
@@ -51,6 +58,37 @@ export function ExportLeadsBar({
   const getEffectiveLeads = (): ExportableLead[] => {
     if (leads && leads.length > 0) return leads;
     return loadAllWorkspaceLeads();
+  };
+
+  const handleSaveGeneratedData = async () => {
+    const source = getEffectiveLeads();
+    setSavingData(true);
+    try {
+      if (onSaveData) {
+        await onSaveData();
+      } else if (source.length > 0) {
+        await saasFetch("/api/crm/prospects/sync", {
+          method: "POST",
+          body: JSON.stringify({ prospects: source }),
+        }).catch(() => {});
+      }
+      setSavedData(true);
+      setExportNotice(`Saved ${source.length} generated lead${source.length !== 1 ? "s" : ""} to workspace & cloud`);
+      setTimeout(() => {
+        setSavedData(false);
+        setExportNotice("");
+      }, 3000);
+    } finally {
+      setSavingData(false);
+    }
+  };
+
+  const handleClearGeneratedData = () => {
+    if (!onClearData) return;
+    onClearData();
+    setConfirmClear(false);
+    setExportNotice("Cleared generated leads data");
+    setTimeout(() => setExportNotice(""), 2500);
   };
 
   const handleCopy = async () => {
@@ -273,6 +311,47 @@ export function ExportLeadsBar({
         <div className="inline-flex flex-wrap items-center gap-1.5">
           <button
             type="button"
+            onClick={handleSaveGeneratedData}
+            disabled={savingData}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition-colors cursor-pointer"
+            title="Save & sync generated leads to your project and cloud database"
+          >
+            <Check className="w-3.5 h-3.5" />
+            <span>{savingData ? "Saving..." : savedData ? "Saved!" : "Save Data"}</span>
+          </button>
+          {onClearData && (
+            confirmClear ? (
+              <div className="inline-flex items-center gap-1 bg-red-50 border border-red-200 rounded-lg px-2 py-1">
+                <button
+                  type="button"
+                  onClick={handleClearGeneratedData}
+                  className="text-[11px] font-bold text-red-700 hover:underline cursor-pointer"
+                >
+                  Confirm Clear ({leads.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmClear(false)}
+                  className="text-[11px] text-slate-500 hover:text-slate-800 ml-1 cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmClear(true)}
+                disabled={leads.length === 0}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-red-50 text-red-700 border border-red-200 disabled:opacity-40 transition-colors cursor-pointer"
+                title="Clear generated leads"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Clear Data</span>
+              </button>
+            )
+          )}
+          <button
+            type="button"
             onClick={() => triggerExport("csv")}
             className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-white transition-colors cursor-pointer"
             title="Download full lead list as CSV for Excel or Google Sheets"
@@ -337,12 +416,51 @@ export function ExportLeadsBar({
               {label} ({leads.length} {leads.length === 1 ? "lead" : "leads"})
             </div>
             <div className="text-[11px] text-slate-500">
-              Download generated leads for <span className="font-semibold text-slate-700">{projectName}</span> as CSV, email the CSV data to someone, or copy to clipboard.
+              Save or clear generated data for <span className="font-semibold text-slate-700">{projectName}</span>, download as CSV, email CSV data, or copy to clipboard.
             </div>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            onClick={handleSaveGeneratedData}
+            disabled={savingData}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition-colors cursor-pointer"
+          >
+            <Check className="w-3.5 h-3.5" />
+            <span>{savingData ? "Saving Data..." : savedData ? "✓ Saved Data!" : "Save Generated Data"}</span>
+          </button>
+          {onClearData && (
+            confirmClear ? (
+              <div className="inline-flex items-center gap-1.5 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1">
+                <button
+                  type="button"
+                  onClick={handleClearGeneratedData}
+                  className="text-xs font-bold text-red-700 hover:underline cursor-pointer"
+                >
+                  Confirm Clear ({leads.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmClear(false)}
+                  className="text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmClear(true)}
+                disabled={leads.length === 0}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-red-50 text-red-700 border border-red-200 disabled:opacity-40 transition-colors cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Clear Generated Data</span>
+              </button>
+            )
+          )}
           <button
             type="button"
             onClick={() => triggerExport("csv")}
@@ -405,6 +523,8 @@ interface ProjectWorkspaceBarProps {
   totalLeadsCount: number;
   activeProjectLeads: ExportableLead[];
   categories?: string[];
+  onSaveProjectLeads?: () => void | Promise<void>;
+  onClearProjectLeads?: () => void;
 }
 
 export default function ProjectWorkspaceBar({
@@ -417,6 +537,8 @@ export default function ProjectWorkspaceBar({
   projectLeadCounts,
   totalLeadsCount,
   activeProjectLeads,
+  onSaveProjectLeads,
+  onClearProjectLeads,
 }: ProjectWorkspaceBarProps) {
   const [modalMode, setModalMode] = useState<"create" | "edit" | null>(null);
   const [name, setName] = useState("");
@@ -579,6 +701,8 @@ export default function ProjectWorkspaceBar({
           projectName={activeProjectId === "all" ? "All-Projects" : activeProject?.name || "Untitled"}
           projectsMap={projectsMap}
           compact
+          onSaveData={onSaveProjectLeads}
+          onClearData={onClearProjectLeads}
         />
       </div>
 

@@ -88,7 +88,13 @@ async function startServer() {
     process.env.NODE_ENV === "production";
 
   if (!isProdRuntime || !hasBuiltDist) {
-    let vitePromise: Promise<any> | null = null;
+    let vitePromise: Promise<any> | null = import("vite").then(
+      ({ createServer: createViteServer }) =>
+        createViteServer({
+          server: { middlewareMode: true },
+          appType: "spa",
+        })
+    );
     app.use(async (req, res, next) => {
       try {
         if (!vitePromise) {

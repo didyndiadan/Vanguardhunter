@@ -98,6 +98,7 @@ export interface AiTrainingProfile {
   offerDetails: string;
   targetPainPoints: string;
   staticEmailExample: string;
+  staticEmailTemplate?: string;
   subjectLineGuide: string;
   aiInstructions: string;
   tone: "conversational" | "direct" | "friendly" | "analytical";
@@ -105,6 +106,36 @@ export interface AiTrainingProfile {
   includeAuditReportLink: boolean;
   isTrained: boolean;
   updatedAt: string;
+}
+
+export function getCachedTrainingProfile(): AiTrainingProfile | null {
+  try {
+    const scope = getUserStorageScope();
+    const scopedRaw = localStorage.getItem(`vh_ai_training_profile_${scope}`);
+    if (scopedRaw) {
+      return JSON.parse(scopedRaw) as AiTrainingProfile;
+    }
+    const globalRaw = localStorage.getItem("vh_ai_training_profile");
+    if (globalRaw) {
+      return JSON.parse(globalRaw) as AiTrainingProfile;
+    }
+  } catch {}
+  return null;
+}
+
+export function setCachedTrainingProfile(profile: AiTrainingProfile | null): void {
+  try {
+    const scope = getUserStorageScope();
+    if (!profile) {
+      localStorage.removeItem(`vh_ai_training_profile_${scope}`);
+      localStorage.removeItem("vh_ai_training_profile");
+    } else {
+      const serialized = JSON.stringify(profile);
+      localStorage.setItem(`vh_ai_training_profile_${scope}`, serialized);
+      localStorage.setItem("vh_ai_training_profile", serialized);
+    }
+    window.dispatchEvent(new CustomEvent("vh-ai-training-updated", { detail: profile }));
+  } catch {}
 }
 
 export interface SeededAccountInfo {

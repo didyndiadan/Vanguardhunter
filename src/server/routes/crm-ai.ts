@@ -362,6 +362,38 @@ function buildFallbackAnalysis(params: {
   };
 }
 
+function hydrateTrainedTemplateText(
+  rawTemplate: string,
+  ctx: {
+    biz: string;
+    ownerName?: string;
+    category?: string;
+    city?: string;
+    matchedOffer: string;
+    senderName: string;
+    agencyName: string;
+    reportUrl?: string;
+    demoWebsiteUrl?: string;
+    reviewServiceUrl?: string;
+  }
+): string {
+  return rawTemplate
+    .replace(/\{\{\s*Business_?Name\s*\}\}/gi, ctx.biz)
+    .replace(/\{\{\s*Company_?Name\s*\}\}/gi, ctx.agencyName)
+    .replace(/\{\{\s*Owner_?Name\s*\}\}/gi, ctx.ownerName || `${ctx.biz} Team`)
+    .replace(/\{\{\s*First_?Name\s*\}\}/gi, ctx.ownerName ? ctx.ownerName.split(" ")[0] : `${ctx.biz} Team`)
+    .replace(/\{\{\s*Category\s*\}\}/gi, ctx.category || "local")
+    .replace(/\{\{\s*City\s*\}\}/gi, ctx.city || "your area")
+    .replace(/\{\{\s*Matched_?Offer\s*\}\}/gi, ctx.matchedOffer)
+    .replace(/\{\{\s*Primary_?Offer\s*\}\}/gi, ctx.matchedOffer)
+    .replace(/\{\{\s*Sender_?Name\s*\}\}/gi, ctx.senderName)
+    .replace(/\{\{\s*Agency_?Name\s*\}\}/gi, ctx.agencyName)
+    .replace(/\{\{\s*My_?Business\s*\}\}/gi, ctx.agencyName)
+    .replace(/\{\{\s*Website_?URL\s*\}\}/gi, ctx.demoWebsiteUrl || "")
+    .replace(/\{\{\s*Review_?URL\s*\}\}/gi, ctx.reviewServiceUrl || "")
+    .replace(/\{\{\s*Report_?URL\s*\}\}/gi, ctx.reportUrl || "");
+}
+
 function buildFallbackEmailVersions(params: {
   businessName: string;
   ownerName?: string;
@@ -370,20 +402,51 @@ function buildFallbackEmailVersions(params: {
   website?: string;
   senderName: string;
   agencyName: string;
+  websiteUrl?: string;
+  senderEmail?: string;
   offerDetails?: string;
+  targetPainPoints?: string;
   callToAction?: string;
   reportUrl?: string;
   demoWebsiteUrl?: string;
   reviewServiceUrl?: string;
   staticEmailTemplate?: string;
+  staticEmailExample?: string;
+  subjectLineGuide?: string;
   matchedOffer?: string;
+  includeAuditReportLink?: boolean;
+  servicesOffered?: Array<{ id?: string; name: string; description: string; targetSignals?: string }>;
 }) {
   const biz = params.businessName || "your business";
   const greeting = params.ownerName ? `Hi ${params.ownerName},` : `Hi ${biz} Team,`;
   const cityPart = params.city ? ` in ${params.city}` : "";
   const catPart = (params.category || "local").toLowerCase();
-  const cta = params.callToAction || "Would you be open to a quick 5-minute walkthrough this week?";
-  const matchedOffer = params.matchedOffer || "Website Creation & Review Service";
+  const cta = params.callToAction
+    ? hydrateTrainedTemplateText(params.callToAction, {
+        biz,
+        ownerName: params.ownerName,
+        category: params.category,
+        city: params.city,
+        matchedOffer: params.matchedOffer || "Primary Offer",
+        senderName: params.senderName,
+        agencyName: params.agencyName,
+        reportUrl: params.reportUrl,
+        demoWebsiteUrl: params.demoWebsiteUrl,
+        reviewServiceUrl: params.reviewServiceUrl,
+      })
+    : `If you're open to it, just reply to this email and I'll share the details tailored for ${biz}.`;
+  const matchedOffer =
+    params.matchedOffer ||
+    params.servicesOffered?.[0]?.name ||
+    "Website Creation & Review Service";
+  const matchedServiceObj = (params.servicesOffered || []).find(
+    (s) => s.name.toLowerCase() === matchedOffer.toLowerCase()
+  ) || params.servicesOffered?.[0];
+  const matchedOfferDesc =
+    matchedServiceObj?.description ||
+    params.offerDetails ||
+    "modern conversion systems and automated client growth";
+
   const linkLines: string[] = [];
   if (params.demoWebsiteUrl) {
     linkLines.push(`• Live Website Preview for ${biz}: ${params.demoWebsiteUrl}`);
@@ -391,47 +454,88 @@ function buildFallbackEmailVersions(params: {
   if (params.reviewServiceUrl) {
     linkLines.push(`• 5-Star Customer Review Page for ${biz}: ${params.reviewServiceUrl}`);
   }
-  if (params.reportUrl) {
-    linkLines.push(`• Website & Conversion Audit Report: ${params.reportUrl}`);
+  if (params.reportUrl && params.includeAuditReportLink !== false) {
+    linkLines.push(`• Personalized Audit Report: ${params.reportUrl}`);
   }
   const reportLine = linkLines.length > 0
     ? `\n\nHere is what we prepared for ${biz}:\n${linkLines.join("\n")}`
     : "";
-  const signOff = `\n\nBest regards,\n${params.senderName}\n${params.agencyName}`;
 
-  let versionABody = `${greeting}\n\nWhile reviewing ${catPart} businesses${cityPart}, I noticed an opportunity to help ${biz} capture more local clients with our primary offer: ${matchedOffer}.\n\nAt ${params.agencyName}, we specialize in ${params.offerDetails || "custom conversion websites and automated 5-star Google review systems"} so local customers can easily find, trust, and book with you.${reportLine}\n\n${cta}${signOff}`;
+  const sigParts = [
+    "Best regards,",
+    params.senderName,
+    params.agencyName,
+    ...(params.websiteUrl ? [params.websiteUrl] : []),
+    ...(params.senderEmail ? [params.senderEmail] : []),
+  ];
+  const signOff = `\n\n${sigParts.join("\n")}`;
 
-  if (params.staticEmailTemplate && params.staticEmailTemplate.trim()) {
-    versionABody = params.staticEmailTemplate
-      .replace(/\{\{\s*Business_Name\s*\}\}/gi, biz)
-      .replace(/\{\{\s*BusinessName\s*\}\}/gi, biz)
-      .replace(/\{\{\s*Owner_Name\s*\}\}/gi, params.ownerName || `${biz} Team`)
-      .replace(/\{\{\s*Category\s*\}\}/gi, params.category || "local")
-      .replace(/\{\{\s*City\s*\}\}/gi, params.city || "your area")
-      .replace(/\{\{\s*Matched_Offer\s*\}\}/gi, matchedOffer)
-      .replace(/\{\{\s*Sender_Name\s*\}\}/gi, params.senderName)
-      .replace(/\{\{\s*My_Business\s*\}\}/gi, params.agencyName)
-      .replace(/\{\{\s*Report_URL\s*\}\}/gi, params.reportUrl || "");
-    if (linkLines.length > 0 && !versionABody.includes(params.demoWebsiteUrl || "___") && !versionABody.includes(params.reviewServiceUrl || "___")) {
-      versionABody = `${versionABody.trim()}${reportLine}`;
+  const rawStatic = (params.staticEmailExample || params.staticEmailTemplate || "").trim();
+
+  let versionASubject = `Quick idea for ${biz}${cityPart}`;
+  if (params.subjectLineGuide && params.subjectLineGuide.trim()) {
+    const hydratedSubj = hydrateTrainedTemplateText(params.subjectLineGuide.trim(), {
+      biz,
+      ownerName: params.ownerName,
+      category: params.category,
+      city: params.city,
+      matchedOffer,
+      senderName: params.senderName,
+      agencyName: params.agencyName,
+    });
+    versionASubject = hydratedSubj.includes(biz) ? hydratedSubj : `${hydratedSubj} — ${biz}`;
+  }
+
+  let versionABody = `${greeting}\n\nI was looking at ${biz}${cityPart} today and noticed a couple of areas where potential customers might be slipping through the cracks—especially around ${matchedOffer}.\n\nAt ${params.agencyName}, ${params.offerDetails || `we help ${catPart} businesses capture more clients with ${matchedOfferDesc}`}.${reportLine}\n\n${cta}${signOff}`;
+
+  if (rawStatic) {
+    let hydrated = hydrateTrainedTemplateText(rawStatic, {
+      biz,
+      ownerName: params.ownerName,
+      category: params.category,
+      city: params.city,
+      matchedOffer,
+      senderName: params.senderName,
+      agencyName: params.agencyName,
+      reportUrl: params.reportUrl,
+      demoWebsiteUrl: params.demoWebsiteUrl,
+      reviewServiceUrl: params.reviewServiceUrl,
+    });
+    // If the user wrote a static message without {{BusinessName}} tags, ensure the greeting addresses this lead
+    if (!/\{\{\s*(Business_?Name|Owner_?Name|First_?Name)\s*\}\}/i.test(rawStatic) && !hydrated.toLowerCase().includes(biz.toLowerCase())) {
+      hydrated = hydrated.replace(/^(hi|hello|hey)\s+[^\n,]+,/i, greeting);
+      if (!hydrated.toLowerCase().includes(biz.toLowerCase())) {
+        hydrated = `${greeting}\n\nI was reviewing ${biz}${cityPart} (${catPart}) and wanted to reach out regarding ${matchedOffer}.\n\n${hydrated.replace(/^(hi|hello|hey)\s+[^\n,]+\n+/i, "")}`;
+      }
     }
+    if (
+      linkLines.length > 0 &&
+      (!params.demoWebsiteUrl || !hydrated.includes(params.demoWebsiteUrl)) &&
+      (!params.reviewServiceUrl || !hydrated.includes(params.reviewServiceUrl))
+    ) {
+      hydrated = `${hydrated.trim()}${reportLine}`;
+    }
+    if (!hydrated.toLowerCase().includes(params.senderName.toLowerCase())) {
+      hydrated = `${hydrated.trim()}${signOff}`;
+    }
+    versionABody = hydrated;
   }
 
   return [
     {
       version: "A",
-      subject: `Quick idea for ${biz} — ${matchedOffer}`,
+      subject: versionASubject,
       body: versionABody,
     },
     {
       version: "B",
-      subject: `Website & 5-Star Review setup for ${biz}`,
-      body: `${greeting}\n\nI was looking at ${biz}${cityPart} today and saw a clear opportunity to turn more of your search visitors into paying clients and 5-star Google reviews using ${matchedOffer}.\n\nWe provide ${params.offerDetails || "clean, conversion-ready websites and automated 5-star review pages"} tailored specifically for ${catPart} businesses.${reportLine}\n\n${cta}${signOff}`,
+      subject: `${matchedOffer} for ${biz}${cityPart}`,
+      body: `${greeting}\n\nI was looking at ${biz}${cityPart} today and saw a clear opportunity to help your ${catPart} team capture more high-intent clients using ${matchedOffer}.\n\nAt ${params.agencyName}, we focus on ${matchedOfferDesc}${params.offerDetails && params.offerDetails !== matchedOfferDesc ? ` (${params.offerDetails})` : ""}.${reportLine}\n\n${cta}${signOff}`,
     },
     {
       version: "C",
       subject: `${biz} — ${matchedOffer}`,
-      body: `${greeting}\n\nMost ${catPart} businesses${cityPart} miss out on new inquiries and 5-star reviews simply because customers don't have a fast mobile website or a direct 1-tap review link.\n\nWe prepared a streamlined ${matchedOffer} setup for ${biz} to help capture both automatically.${reportLine}\n\n${cta}${signOff}`,
+      body: `${greeting}\n\nWhile reviewing ${catPart} businesses${cityPart}, I noticed a few areas where ${biz} could convert more local traffic into booked clients${params.targetPainPoints ? ` (especially around ${params.targetPainPoints.split(",")[0].trim().toLowerCase()})` : ""}.\n\nWe put together a tailored ${matchedOffer} approach for ${biz}: ${matchedOfferDesc}.${reportLine}\n\n${cta}${signOff}`,
     },
   ];
 }
@@ -2110,20 +2214,20 @@ Return ONLY a JSON object with this exact structure:
 { "matchedOffer":"Name of the #1 matching service/offer from the user's list", "analysis":{"websiteScore":<0-100>,"leadScore":<0-100>,"conversionScore":<0-100>,"mobileScore":<0-100>,"seoScore":<0-100>,"growthPotential":<0-100>,"checks":{"responsiveDesign":<bool>,"sslCertificate":<bool>,"modernUI":<bool>,"whatsappButton":<bool>,"contactForm":<bool>,"bookingSystem":<bool>,"onlineOrdering":<bool>,"paymentIntegration":<bool>,"customerPortal":<bool>,"membershipArea":<bool>,"blog":<bool>,"seoBasics":<bool>,"analytics":<bool>,"socialMedia":<bool>,"emailCapture":<bool>,"liveChat":<bool>,"aiChatbot":<bool>,"callToAction":<bool>,"trustElements":<bool>},"issues":[{"title":"string","description":"string","priority":"high|medium|low"}],"opportunities":[{"title":"string","impact":"string","effort":"low|medium|high"}],"recommendedFeatures":["string"],"projectType":"Small Website|Medium Web App|Large SaaS","estimatedValue":{"min":<number>,"max":<number>},"deliveryWeeks":{"min":<1 or 2>,"max":<1 or 2>},"summary":"2-3 sentence plain English summary focusing on why our matched offers fit this business"}, "aiAgent":{"type":"receptionist|booking|sales|support|social","score":<0-100>,"fitReason":"1 sentence why our matched offer fits their business","topPain":"the #1 pain our offer solves for them right now"}, "pitchType":"ai_agent|website|both", "emailVersions":[{"version":"A","subject":"string","body":"string"},{"version":"B","subject":"string","body":"string"},{"version":"C","subject":"string","body":"string"}],"whatsapp":"string","linkedin":"string" }
 Be specific to a ${category} business in ${city}. If no website, give website scores of 5-25.`;
   try {
+    const matched = matchBestOfferFromTraining(training.servicesOffered, {
+      website,
+      category,
+      painPoint,
+      missingSignals: resolvedMissing,
+      cmsPlatform: resolvedCms,
+      siteContent,
+    });
+    const matchedOfferName = matched.name;
     let data: any;
     try {
       const text = await generateText(prompt);
       data = parseJSON(text);
     } catch {
-      const matched = matchBestOfferFromTraining(training.servicesOffered, {
-        website,
-        category,
-        painPoint,
-        missingSignals: resolvedMissing,
-        cmsPlatform: resolvedCms,
-        siteContent,
-      });
-      const matchedOfferName = matched.name;
       const fbAnalysis = buildFallbackAnalysis({
         businessName: businessName || "Business",
         category,
@@ -2144,11 +2248,18 @@ Be specific to a ${category} business in ${city}. If no website, give website sc
         website,
         senderName: effectiveSender,
         agencyName: effectiveAgency,
+        websiteUrl: training.websiteUrl,
+        senderEmail: training.senderEmail,
         offerDetails: training.offerDetails,
+        targetPainPoints: training.targetPainPoints,
         callToAction: training.callToAction,
         reportUrl: "{{REPORT_URL}}",
-        staticEmailTemplate: training.staticEmailTemplate,
+        staticEmailExample: training.staticEmailExample,
+        staticEmailTemplate: training.staticEmailExample || training.staticEmailTemplate,
+        subjectLineGuide: training.subjectLineGuide,
         matchedOffer: matchedOfferName,
+        includeAuditReportLink: training.includeAuditReportLink,
+        servicesOffered: training.servicesOffered,
       });
       data = {
         matchedOffer: matchedOfferName,
@@ -2185,18 +2296,51 @@ Be specific to a ${category} business in ${city}. If no website, give website sc
       } catch { /* report creation failure must never break email generation */ }
     }
 
+    const trainedTemplateEmails = buildFallbackEmailVersions({
+      businessName: businessName || "Business",
+      ownerName,
+      category,
+      city,
+      website,
+      senderName: effectiveSender,
+      agencyName: effectiveAgency,
+      websiteUrl: training.websiteUrl,
+      senderEmail: training.senderEmail,
+      offerDetails: training.offerDetails,
+      targetPainPoints: training.targetPainPoints,
+      callToAction: training.callToAction,
+      reportUrl: data?.reportUrl || "",
+      staticEmailExample: training.staticEmailExample,
+      staticEmailTemplate: training.staticEmailExample || training.staticEmailTemplate,
+      subjectLineGuide: training.subjectLineGuide,
+      matchedOffer: data?.matchedOffer || data?.analysis?.matchedOffer || matchedOfferName,
+      includeAuditReportLink: training.includeAuditReportLink,
+      servicesOffered: training.servicesOffered,
+    });
+
     if (Array.isArray(data?.emailVersions) && data.emailVersions.length > 0) {
-      const processedVersions = data.emailVersions.map((v: any) => {
+      const processedVersions = data.emailVersions.map((v: any, idx: number) => {
+        if (idx === 0 && training.staticEmailExample?.trim()) {
+          return {
+            version: "A",
+            subject: fillPlaceholders(trainedTemplateEmails[0].subject, effectiveSender, effectiveAgency),
+            body: fillPlaceholders(trainedTemplateEmails[0].body, effectiveSender, effectiveAgency),
+          };
+        }
         let bodyText = String(v.body || "");
         if (data.reportUrl) {
           bodyText = bodyText.replace(/\{\{REPORT_URL\}\}/g, data.reportUrl);
         } else {
           bodyText = bodyText.replace(/[^\n.!?]*\{\{REPORT_URL\}\}[^\n]*/g, "").trim();
         }
+        let filledBody = fillPlaceholders(bodyText, effectiveSender, effectiveAgency);
+        if (!filledBody.toLowerCase().includes(effectiveSender.toLowerCase())) {
+          filledBody = `${filledBody.trim()}\n\nBest regards,\n${effectiveSender}\n${effectiveAgency}`;
+        }
         return {
-          version: v.version || "A",
+          version: v.version || (idx === 0 ? "A" : idx === 1 ? "B" : "C"),
           subject: fillPlaceholders(String(v.subject || ""), effectiveSender, effectiveAgency),
-          body: fillPlaceholders(bodyText, effectiveSender, effectiveAgency),
+          body: filledBody,
         };
       });
       data.emailVersions = processedVersions;
@@ -2206,6 +2350,14 @@ Be specific to a ${category} business in ${city}. If no website, give website sc
         body: primary.body,
         emailVersions: processedVersions,
         selectedVersion: primary.version || "A",
+      };
+    } else {
+      data.emailVersions = trainedTemplateEmails;
+      data.email = {
+        subject: trainedTemplateEmails[0].subject,
+        body: trainedTemplateEmails[0].body,
+        emailVersions: trainedTemplateEmails,
+        selectedVersion: "A",
       };
     }
 
@@ -2385,30 +2537,55 @@ Return ONLY valid JSON (no markdown, no prose):
     } catch {
       // Fall through to fallback versions below
     }
+    const trainedTemplateVersions = buildFallbackEmailVersions({
+      businessName: businessName || "Business",
+      ownerName,
+      category,
+      city,
+      website,
+      senderName,
+      agencyName,
+      websiteUrl: training.websiteUrl,
+      senderEmail: training.senderEmail,
+      offerDetails: training.offerDetails,
+      targetPainPoints: training.targetPainPoints,
+      callToAction: training.callToAction,
+      reportUrl,
+      demoWebsiteUrl,
+      reviewServiceUrl,
+      staticEmailExample: training.staticEmailExample,
+      staticEmailTemplate: training.staticEmailExample || training.staticEmailTemplate,
+      subjectLineGuide: training.subjectLineGuide,
+      matchedOffer: effectivePrimaryOffer,
+      includeAuditReportLink: training.includeAuditReportLink,
+      servicesOffered: training.servicesOffered,
+    });
+
     if (!versions.length) {
-      versions = buildFallbackEmailVersions({
-        businessName: businessName || "Business",
-        ownerName,
-        category,
-        city,
-        website,
-        senderName,
-        agencyName,
-        offerDetails: training.offerDetails,
-        callToAction: training.callToAction,
-        reportUrl,
-        demoWebsiteUrl,
-        reviewServiceUrl,
-        staticEmailTemplate: training.staticEmailTemplate,
-        matchedOffer: effectivePrimaryOffer,
-      });
+      versions = trainedTemplateVersions;
+    } else if (training.staticEmailExample?.trim()) {
+      versions = [
+        trainedTemplateVersions[0],
+        versions[1] || versions[0] || trainedTemplateVersions[1],
+        versions[2] || trainedTemplateVersions[2],
+      ].map((v, idx) => ({
+        version: idx === 0 ? "A" : idx === 1 ? "B" : "C",
+        subject: v.subject,
+        body: v.body,
+      }));
     }
 
-    const processed = versions.map(v => ({
-      version: v.version,
-      subject: fillPlaceholders(v.subject || "", senderName, agencyName),
-      body: fillPlaceholders(v.body || "", senderName, agencyName),
-    }));
+    const processed = versions.map(v => {
+      let bodyText = fillPlaceholders(v.body || "", senderName, agencyName);
+      if (!bodyText.toLowerCase().includes(senderName.toLowerCase())) {
+        bodyText = `${bodyText.trim()}\n\nBest regards,\n${senderName}\n${agencyName}`;
+      }
+      return {
+        version: v.version,
+        subject: fillPlaceholders(v.subject || "", senderName, agencyName),
+        body: bodyText,
+      };
+    });
 
     const primary = processed[0] ?? { version: "A", subject: "", body: "" };
     res.json({ versions: processed, subject: primary.subject, body: primary.body, trainedProfileUsed: { senderName, businessName: agencyName } });
@@ -2521,10 +2698,17 @@ Return ONLY valid JSON:
         website: sampleWebsite,
         senderName: profile.senderName,
         agencyName: profile.businessName,
+        websiteUrl: profile.websiteUrl,
+        senderEmail: profile.senderEmail,
         offerDetails: profile.offerDetails,
+        targetPainPoints: profile.targetPainPoints,
         callToAction: profile.callToAction,
-        staticEmailTemplate: profile.staticEmailTemplate,
+        staticEmailExample: profile.staticEmailExample,
+        staticEmailTemplate: profile.staticEmailExample || profile.staticEmailTemplate,
+        subjectLineGuide: profile.subjectLineGuide,
         matchedOffer: matched.name,
+        includeAuditReportLink: profile.includeAuditReportLink,
+        servicesOffered: profile.servicesOffered,
       })[0];
       data = {
         matchedOffer: matched.name,
@@ -2655,11 +2839,18 @@ Return ONLY valid JSON:
             website: biz.website,
             senderName,
             agencyName,
+            websiteUrl: training.websiteUrl,
+            senderEmail: training.senderEmail,
             offerDetails: training.offerDetails,
+            targetPainPoints: training.targetPainPoints,
             callToAction: training.callToAction,
             reportUrl,
-            staticEmailTemplate: training.staticEmailTemplate,
+            staticEmailExample: training.staticEmailExample,
+            staticEmailTemplate: training.staticEmailExample || training.staticEmailTemplate,
+            subjectLineGuide: training.subjectLineGuide,
             matchedOffer,
+            includeAuditReportLink: training.includeAuditReportLink,
+            servicesOffered: training.servicesOffered,
           })[0];
           subject = fb.subject;
           body = fb.body;

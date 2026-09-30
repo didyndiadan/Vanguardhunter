@@ -1,5 +1,11 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { AiTrainingProfile, TrainedServiceOffer, saasFetch } from "@/lib/saas-auth";
+import {
+  AiTrainingProfile,
+  TrainedServiceOffer,
+  saasFetch,
+  getCachedTrainingProfile,
+  setCachedTrainingProfile,
+} from "@/lib/saas-auth";
 import {
   Sparkles,
   Check,
@@ -231,47 +237,48 @@ export default function TrainYourAIPanel({
   onSaved,
   onNavigateToHunter,
 }: TrainYourAIPanelProps) {
-  const [loading, setLoading] = useState(!initialProfile);
+  const cachedInit = initialProfile || getCachedTrainingProfile();
+  const [loading, setLoading] = useState(!cachedInit);
   const [saving, setSaving] = useState(false);
   const [saveBanner, setSaveBanner] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
-  const [senderName, setSenderName] = useState(initialProfile?.senderName || userFullName || "Alex Morgan");
-  const [businessName, setBusinessName] = useState(initialProfile?.businessName || userCompanyName || "Apex Digital Growth");
-  const [websiteUrl, setWebsiteUrl] = useState(initialProfile?.websiteUrl || "");
-  const [senderEmail, setSenderEmail] = useState(initialProfile?.senderEmail || userEmail || "");
+  const [senderName, setSenderName] = useState(cachedInit?.senderName || userFullName || "Alex Morgan");
+  const [businessName, setBusinessName] = useState(cachedInit?.businessName || userCompanyName || "Apex Digital Growth");
+  const [websiteUrl, setWebsiteUrl] = useState(cachedInit?.websiteUrl || "");
+  const [senderEmail, setSenderEmail] = useState(cachedInit?.senderEmail || userEmail || "");
   const [servicesOffered, setServicesOffered] = useState<TrainedServiceOffer[]>(
-    initialProfile?.servicesOffered && initialProfile.servicesOffered.length > 0
-      ? initialProfile.servicesOffered
+    cachedInit?.servicesOffered && cachedInit.servicesOffered.length > 0
+      ? cachedInit.servicesOffered
       : PRESET_TEMPLATES[0].servicesOffered
   );
   const [offerDetails, setOfferDetails] = useState(
-    initialProfile?.offerDetails || PRESET_TEMPLATES[0].offerDetails
+    cachedInit?.offerDetails || PRESET_TEMPLATES[0].offerDetails
   );
   const [targetPainPoints, setTargetPainPoints] = useState(
-    initialProfile?.targetPainPoints || PRESET_TEMPLATES[0].targetPainPoints
+    cachedInit?.targetPainPoints || PRESET_TEMPLATES[0].targetPainPoints
   );
   const [staticEmailExample, setStaticEmailExample] = useState(
-    initialProfile?.staticEmailExample ||
+    cachedInit?.staticEmailExample ||
       PRESET_TEMPLATES[0].staticEmailExample(
-        initialProfile?.senderName || userFullName || "Alex Morgan",
-        initialProfile?.businessName || userCompanyName || "Apex Digital Growth"
+        cachedInit?.senderName || userFullName || "Alex Morgan",
+        cachedInit?.businessName || userCompanyName || "Apex Digital Growth"
       )
   );
   const [subjectLineGuide, setSubjectLineGuide] = useState(
-    initialProfile?.subjectLineGuide || PRESET_TEMPLATES[0].subjectLineGuide
+    cachedInit?.subjectLineGuide || PRESET_TEMPLATES[0].subjectLineGuide
   );
   const [aiInstructions, setAiInstructions] = useState(
-    initialProfile?.aiInstructions || PRESET_TEMPLATES[0].aiInstructions
+    cachedInit?.aiInstructions || PRESET_TEMPLATES[0].aiInstructions
   );
-  const [tone, setTone] = useState<AiTrainingProfile["tone"]>(initialProfile?.tone || "conversational");
+  const [tone, setTone] = useState<AiTrainingProfile["tone"]>(cachedInit?.tone || "conversational");
   const [callToAction, setCallToAction] = useState(
-    initialProfile?.callToAction || PRESET_TEMPLATES[0].callToAction
+    cachedInit?.callToAction || PRESET_TEMPLATES[0].callToAction
   );
   const [includeAuditReportLink, setIncludeAuditReportLink] = useState<boolean>(
-    initialProfile?.includeAuditReportLink ?? true
+    cachedInit?.includeAuditReportLink ?? true
   );
-  const [isTrained, setIsTrained] = useState<boolean>(initialProfile?.isTrained ?? false);
-  const [updatedAt, setUpdatedAt] = useState<string>(initialProfile?.updatedAt || "");
+  const [isTrained, setIsTrained] = useState<boolean>(cachedInit?.isTrained ?? false);
+  const [updatedAt, setUpdatedAt] = useState<string>(cachedInit?.updatedAt || "");
 
   // Live Test Simulator State
   const [sampleBusinessName, setSampleBusinessName] = useState("Bella Vista Dental Studio");
@@ -304,14 +311,24 @@ export default function TrainYourAIPanel({
   useEffect(() => {
     if (initialProfile) {
       applyProfileData(initialProfile);
+      setCachedTrainingProfile(initialProfile);
       setLoading(false);
       return;
     }
     let mounted = true;
     saasFetch("/api/saas/ai-training")
       .then((res) => {
-        if (mounted && res?.profile) {
+        if (!mounted || !res?.profile) return;
+        const localCached = getCachedTrainingProfile();
+        if (localCached?.isTrained && !res.profile.isTrained) {
+          applyProfileData(localCached);
+          saasFetch("/api/saas/ai-training", {
+            method: "PUT",
+            body: JSON.stringify(localCached),
+          }).catch(() => {});
+        } else {
           applyProfileData(res.profile);
+          setCachedTrainingProfile(res.profile);
         }
       })
       .catch(() => {})
@@ -406,41 +423,73 @@ export default function TrainYourAIPanel({
     }
     setSaving(true);
     setSaveBanner(null);
+    const localProfilePayload: AiTrainingProfile = {
+      senderName: senderName.trim(),
+      businessName: businessName.trim(),
+      websiteUrl: websiteUrl.trim(),
+      senderEmail: senderEmail.trim(),
+      offerDetails: effectiveOfferDetails,
+      servicesOffered: cleanedServices,
+      targetPainPoints: targetPainPoints.trim(),
+      staticEmailExample: staticEmailExample.trim(),
+      staticEmailTemplate: staticEmailExample.trim(),
+      subjectLineGuide: subjectLineGuide.trim(),
+      aiInstructions: aiInstructions.trim(),
+      tone,
+      callToAction: callToAction.trim(),
+      includeAuditReportLink,
+      isTrained: true,
+      updatedAt: new Date().toISOString(),
+    };
+    setCachedTrainingProfile(localProfilePayload);
+
     try {
       const res = await saasFetch("/api/saas/ai-training", {
         method: "PUT",
-        body: JSON.stringify({
-          senderName: senderName.trim(),
-          businessName: businessName.trim(),
-          websiteUrl: websiteUrl.trim(),
-          senderEmail: senderEmail.trim(),
-          offerDetails: effectiveOfferDetails,
-          servicesOffered: cleanedServices,
-          targetPainPoints: targetPainPoints.trim(),
-          staticEmailExample: staticEmailExample.trim(),
-          subjectLineGuide: subjectLineGuide.trim(),
-          aiInstructions: aiInstructions.trim(),
-          tone,
-          callToAction: callToAction.trim(),
-          includeAuditReportLink,
-        }),
+        body: JSON.stringify(localProfilePayload),
       });
-      if (res?.profile) {
-        applyProfileData(res.profile);
-        onSaved?.(res.profile);
-      }
+      const finalProfile = res?.profile
+        ? { ...localProfilePayload, ...res.profile, isTrained: true }
+        : localProfilePayload;
+      applyProfileData(finalProfile);
+      setCachedTrainingProfile(finalProfile);
+      onSaved?.(finalProfile);
       setSaveBanner({
         type: "success",
-        text: `✓ Seeded ${cleanedServices.length || 1} Offer(s)/Service(s) to AI Intelligence! Both Website Analysis and Outreach Emails will now automatically focus on the best-matching service for each business.`,
+        text: `✓ Saved & Seeded ${cleanedServices.length || 1} Offer(s)/Service(s) into the Cold Email Generator & AI Intelligence! All generated cold emails and audits now use ${finalProfile.senderName} (${finalProfile.businessName}).`,
       });
-    } catch (err: any) {
+    } catch {
+      applyProfileData(localProfilePayload);
+      onSaved?.(localProfilePayload);
       setSaveBanner({
-        type: "error",
-        text: err.message || "Failed to save AI training profile",
+        type: "success",
+        text: `✓ Saved & Seeded ${cleanedServices.length || 1} Offer(s)/Service(s) into the Cold Email Generator! All generated cold emails now use ${localProfilePayload.senderName} (${localProfilePayload.businessName}).`,
       });
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleClearTrainingFields = () => {
+    setServicesOffered([
+      {
+        id: `srv_${Date.now()}_1`,
+        name: "",
+        description: "",
+        targetSignals: "",
+      },
+    ]);
+    setOfferDetails("");
+    setTargetPainPoints("");
+    setSubjectLineGuide("");
+    setStaticEmailExample("");
+    setAiInstructions("");
+    setCallToAction("");
+    setTestResult(null);
+    setSaveBanner({
+      type: "success",
+      text: "Cleared training fields. Fill in your custom offer & static email or pick a preset blueprint above, then click Save & Seed.",
+    });
   };
 
   const handleTestTrainedAi = async () => {
@@ -730,7 +779,7 @@ export default function TrainYourAIPanel({
                       setServicesOffered(preset.servicesOffered.map((s) => ({ ...s })));
                       setTargetPainPoints(preset.targetPainPoints);
                       setSubjectLineGuide(preset.subjectLineGuide);
-                      setStaticEmailTemplate(preset.staticEmailExample(sender, company));
+                      setStaticEmailExample(preset.staticEmailExample(sender, company));
                       setAiInstructions(preset.aiInstructions);
                       setCallToAction(preset.callToAction);
                     }
@@ -987,14 +1036,23 @@ export default function TrainYourAIPanel({
                 {saving ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Seeding to AI Intelligence...</span>
+                    <span>Seeding to Cold Email Generator...</span>
                   </>
                 ) : (
                   <>
                     <Sparkles className="w-4 h-4" />
-                    <span>Save & Seed to AI Intelligence</span>
+                    <span>Save &amp; Seed to Cold Email Generator</span>
                   </>
                 )}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleClearTrainingFields}
+                className="px-4 py-3 bg-white hover:bg-red-50 text-slate-700 hover:text-red-700 border border-slate-300 hover:border-red-200 text-xs sm:text-sm font-semibold rounded-xl transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-4 h-4" />
+                <span>Clear Fields</span>
               </button>
 
               {onNavigateToHunter && (

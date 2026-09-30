@@ -19,7 +19,16 @@ import {
   Database, ArrowLeft, Wand2,
 } from "lucide-react";
 import API_BASE from "@/lib/api";
-import { getCachedSaasUser, getSaasToken, clearSaasSession, isUserAdmin, saasFetch } from "@/lib/saas-auth";
+import {
+  getCachedSaasUser,
+  getSaasToken,
+  clearSaasSession,
+  isUserAdmin,
+  saasFetch,
+  AiTrainingProfile,
+  getCachedTrainingProfile,
+  setCachedTrainingProfile,
+} from "@/lib/saas-auth";
 import OwnerWebsiteBuilderPanel from "@/components/OwnerWebsiteBuilderPanel";
 import TrainYourAIPanel from "@/components/TrainYourAIPanel";
 import MultiSmtpManagerPanel, { SmtpAppPasswordGuide } from "@/components/MultiSmtpManagerPanel";
@@ -115,6 +124,18 @@ function useApolloConfig(): ApolloModuleConfig {
 }
 
 interface TrainedOfferSummary {
+  senderName: string;
+  businessName: string;
+  websiteUrl: string;
+  senderEmail: string;
+  staticEmailExample: string;
+  subjectLineGuide: string;
+  aiInstructions: string;
+  tone: string;
+  callToAction: string;
+  includeAuditReportLink: boolean;
+  isTrained: boolean;
+  updatedAt: string;
   primaryOfferName: string;
   hasWebsiteOffer: boolean;
   hasReviewOffer: boolean;
@@ -122,59 +143,275 @@ interface TrainedOfferSummary {
   reviewOfferName: string;
   servicesOffered: Array<{ id?: string; name: string; description: string; targetSignals?: string }>;
   offerDetails: string;
+  targetPainPoints: string;
+}
+
+function buildTrainedOfferSummaryFromProfile(p?: Partial<AiTrainingProfile> | null): TrainedOfferSummary {
+  const cachedUser = getCachedSaasUser();
+  const senderName = p?.senderName?.trim() || cachedUser?.fullName?.trim() || "Alex Morgan";
+  const businessName = p?.businessName?.trim() || cachedUser?.companyName?.trim() || "Apex Digital Growth";
+  const websiteUrl = p?.websiteUrl?.trim() || "";
+  const senderEmail = p?.senderEmail?.trim() || cachedUser?.email?.trim() || "";
+  const list = Array.isArray(p?.servicesOffered) ? p!.servicesOffered.filter((s) => s?.name?.trim()) : [];
+  const offerDetails =
+    p?.offerDetails?.trim() ||
+    (list.length > 0
+      ? list.map((s) => `${s.name}: ${s.description}`).join(" | ")
+      : "We build modern, high-converting websites and automated 5-star Google review generation systems for local businesses.");
+  const combinedText = `${offerDetails} ${list.map((s) => `${s.name} ${s.description}`).join(" ")}`;
+  const websiteSrv = list.find((s) => /website|web design|site|redesign|landing page/i.test(`${s.name} ${s.description}`));
+  const reviewSrv = list.find((s) => /review|reputation|5-star|star|google maps/i.test(`${s.name} ${s.description}`));
+  const hasWeb = list.length === 0 || Boolean(websiteSrv) || /website|web design|site|redesign|landing page/i.test(combinedText);
+  const hasRev = list.length === 0 || Boolean(reviewSrv) || /review|reputation|5-star|star|google maps/i.test(combinedText);
+  let primaryOfferName = "Website Creation & Review Service";
+  if (list.length > 0 && !(hasWeb && hasRev && list.length === 2 && websiteSrv && reviewSrv)) {
+    primaryOfferName = list[0].name;
+  } else if (hasWeb && hasRev) {
+    primaryOfferName = "Website Creation & Review Service";
+  } else if (hasWeb) {
+    primaryOfferName = websiteSrv?.name || "Website Creation Service";
+  } else if (hasRev) {
+    primaryOfferName = reviewSrv?.name || "5-Star Review Service";
+  }
+
+  const defaultStatic = `Hi {{BusinessName}} Team,\n\nI was looking at {{BusinessName}} in {{City}} today and noticed a couple of quick areas where potential customers might be slipping through the cracks—especially around {{MatchedOffer}}.\n\nAt ${businessName}, we help {{Category}} businesses turn more of their local traffic into booked clients without adding extra work for your team.\n\nIf you're open to it, I'd love to share 2–3 specific ideas tailored to {{BusinessName}}. Just reply to this email and I'll send them right over.\n\nBest regards,\n${senderName}\n${businessName}`;
+
+  return {
+    senderName,
+    businessName,
+    websiteUrl,
+    senderEmail,
+    staticEmailExample: (p?.staticEmailExample || p?.staticEmailTemplate || defaultStatic).trim(),
+    subjectLineGuide: (p?.subjectLineGuide || "Quick idea for {{BusinessName}} in {{City}}").trim(),
+    aiInstructions: (p?.aiInstructions || "").trim(),
+    tone: p?.tone || "conversational",
+    callToAction: (p?.callToAction || "If you're open to it, just reply to this email and I'll send the details right over.").trim(),
+    includeAuditReportLink: p?.includeAuditReportLink ?? true,
+    isTrained: Boolean(p?.isTrained),
+    updatedAt: p?.updatedAt || "",
+    primaryOfferName,
+    hasWebsiteOffer: hasWeb,
+    hasReviewOffer: hasRev,
+    websiteOfferName: websiteSrv?.name || "Website Creation & Mobile Redesign",
+    reviewOfferName: reviewSrv?.name || "5-Star Review Service & Reputation Shield",
+    servicesOffered: list,
+    offerDetails,
+    targetPainPoints: (p?.targetPainPoints || "").trim(),
+  };
+}
+
+function hydrateClientTemplate(
+  rawTemplate: string,
+  ctx: {
+    biz: string;
+    ownerName?: string;
+    category?: string;
+    city?: string;
+    matchedOffer: string;
+    senderName: string;
+    businessName: string;
+    reportUrl?: string;
+    demoWebsiteUrl?: string;
+    reviewServiceUrl?: string;
+  }
+): string {
+  return rawTemplate
+    .replace(/\{\{\s*Business_?Name\s*\}\}/gi, ctx.biz)
+    .replace(/\{\{\s*Company_?Name\s*\}\}/gi, ctx.businessName)
+    .replace(/\{\{\s*Owner_?Name\s*\}\}/gi, ctx.ownerName || `${ctx.biz} Team`)
+    .replace(/\{\{\s*First_?Name\s*\}\}/gi, ctx.ownerName ? ctx.ownerName.split(" ")[0] : `${ctx.biz} Team`)
+    .replace(/\{\{\s*Category\s*\}\}/gi, ctx.category || "local")
+    .replace(/\{\{\s*City\s*\}\}/gi, ctx.city || "your area")
+    .replace(/\{\{\s*Matched_?Offer\s*\}\}/gi, ctx.matchedOffer)
+    .replace(/\{\{\s*Primary_?Offer\s*\}\}/gi, ctx.matchedOffer)
+    .replace(/\{\{\s*Sender_?Name\s*\}\}/gi, ctx.senderName)
+    .replace(/\{\{\s*Agency_?Name\s*\}\}/gi, ctx.businessName)
+    .replace(/\{\{\s*My_?Business\s*\}\}/gi, ctx.businessName)
+    .replace(/\{\{\s*Website_?URL\s*\}\}/gi, ctx.demoWebsiteUrl || "")
+    .replace(/\{\{\s*Review_?URL\s*\}\}/gi, ctx.reviewServiceUrl || "")
+    .replace(/\{\{\s*Report_?URL\s*\}\}/gi, ctx.reportUrl || "");
+}
+
+function buildTrainedEmailsForLead(
+  lead: {
+    businessName?: string;
+    ownerName?: string;
+    category?: string;
+    city?: string;
+    website?: string;
+    reportUrl?: string;
+    generatedSiteUrl?: string;
+    generatedReviewUrl?: string;
+    primaryOffer?: string;
+    analysis?: WebsiteAnalysis;
+  },
+  trained: TrainedOfferSummary,
+  overrides?: {
+    primaryOffer?: string;
+    websiteUrl?: string;
+    demoWebsiteUrl?: string;
+    reviewUrl?: string;
+    reviewServiceUrl?: string;
+    reportUrl?: string;
+  }
+): { version: string; subject: string; body: string }[] {
+  const biz = lead.businessName || "your business";
+  const firstOwner = lead.ownerName ? lead.ownerName.split(" ")[0] : "";
+  const greeting = firstOwner ? `Hi ${firstOwner},` : `Hi ${biz} Team,`;
+  const cat = (lead.category || "local").toLowerCase();
+  const cityPart = lead.city ? ` in ${lead.city}` : "";
+  const matchedOffer =
+    overrides?.primaryOffer ||
+    lead.primaryOffer ||
+    lead.analysis?.matchedOffer ||
+    trained.primaryOfferName ||
+    "Website Creation & Review Service";
+  const matchedSrv =
+    trained.servicesOffered.find((s) => s.name.toLowerCase() === matchedOffer.toLowerCase()) ||
+    trained.servicesOffered[0];
+  const matchedDesc = matchedSrv?.description || trained.offerDetails;
+
+  const demoWebsiteUrl = overrides?.websiteUrl ?? overrides?.demoWebsiteUrl ?? lead.generatedSiteUrl ?? "";
+  const reviewServiceUrl = overrides?.reviewUrl ?? overrides?.reviewServiceUrl ?? lead.generatedReviewUrl ?? "";
+  const reportUrl = overrides?.reportUrl ?? lead.reportUrl ?? "";
+
+  const linkLines: string[] = [];
+  if (demoWebsiteUrl) linkLines.push(`• Live Website Preview for ${biz}: ${demoWebsiteUrl}`);
+  if (reviewServiceUrl) linkLines.push(`• 5-Star Customer Review Page for ${biz}: ${reviewServiceUrl}`);
+  if (reportUrl && trained.includeAuditReportLink !== false) {
+    linkLines.push(`• Personalized Website & Conversion Audit: ${reportUrl}`);
+  }
+  const linksBlock = linkLines.length > 0 ? `\n\nHere is what we put together for ${biz}:\n${linkLines.join("\n")}` : "";
+
+  const sigLines = [
+    "Best regards,",
+    trained.senderName,
+    trained.businessName,
+    ...(trained.websiteUrl ? [trained.websiteUrl] : []),
+    ...(trained.senderEmail ? [trained.senderEmail] : []),
+  ];
+  const signOff = `\n\n${sigLines.join("\n")}`;
+
+  const ctx = {
+    biz,
+    ownerName: lead.ownerName,
+    category: lead.category || "local",
+    city: lead.city || "your area",
+    matchedOffer,
+    senderName: trained.senderName,
+    businessName: trained.businessName,
+    reportUrl,
+    demoWebsiteUrl,
+    reviewServiceUrl,
+  };
+
+  const cta = trained.callToAction
+    ? hydrateClientTemplate(trained.callToAction, ctx)
+    : `Would you be open to a quick walkthrough tailored for ${biz}?`;
+
+  let subjectA = `Quick idea for ${biz}${cityPart}`;
+  if (trained.subjectLineGuide) {
+    const hydratedSubj = hydrateClientTemplate(trained.subjectLineGuide, ctx);
+    subjectA = hydratedSubj.includes(biz) ? hydratedSubj : `${hydratedSubj} — ${biz}`;
+  }
+
+  let bodyA = `${greeting}\n\nI was looking at ${biz}${cityPart} today and noticed a couple of quick areas where potential customers might be slipping through the cracks—especially around ${matchedOffer}.\n\nAt ${trained.businessName}, ${trained.offerDetails}.${linksBlock}\n\n${cta}${signOff}`;
+
+  if (trained.staticEmailExample && trained.staticEmailExample.trim()) {
+    let hydrated = hydrateClientTemplate(trained.staticEmailExample.trim(), ctx);
+    if (
+      !/\{\{\s*(Business_?Name|Owner_?Name|First_?Name)\s*\}\}/i.test(trained.staticEmailExample) &&
+      !hydrated.toLowerCase().includes(biz.toLowerCase())
+    ) {
+      hydrated = hydrated.replace(/^(hi|hello|hey)\s+[^\n,]+,/i, greeting);
+      if (!hydrated.toLowerCase().includes(biz.toLowerCase())) {
+        hydrated = `${greeting}\n\nI was reviewing ${biz}${cityPart} (${cat}) and wanted to reach out regarding ${matchedOffer}.\n\n${hydrated.replace(/^(hi|hello|hey)\s+[^\n,]+\n+/i, "")}`;
+      }
+    }
+    if (
+      linkLines.length > 0 &&
+      (!demoWebsiteUrl || !hydrated.includes(demoWebsiteUrl)) &&
+      (!reviewServiceUrl || !hydrated.includes(reviewServiceUrl))
+    ) {
+      hydrated = `${hydrated.trim()}${linksBlock}`;
+    }
+    if (!hydrated.toLowerCase().includes(trained.senderName.toLowerCase())) {
+      hydrated = `${hydrated.trim()}${signOff}`;
+    }
+    bodyA = hydrated;
+  }
+
+  return [
+    {
+      version: "A",
+      subject: subjectA,
+      body: bodyA,
+    },
+    {
+      version: "B",
+      subject: `${matchedOffer} for ${biz}${cityPart}`,
+      body: `${greeting}\n\nI was looking at ${biz}${cityPart} today and saw a clear opportunity to help your ${cat} team capture more high-intent clients using ${matchedOffer}.\n\nAt ${trained.businessName}, we focus on ${matchedDesc}.${linksBlock}\n\n${cta}${signOff}`,
+    },
+    {
+      version: "C",
+      subject: `${biz} — ${matchedOffer}`,
+      body: `${greeting}\n\nWhile reviewing ${cat} businesses${cityPart}, I noticed a few areas where ${biz} could convert more local traffic into booked clients${trained.targetPainPoints ? ` (especially around ${trained.targetPainPoints.split(",")[0].trim().toLowerCase()})` : ""}.\n\nWe prepared a tailored ${matchedOffer} blueprint for ${biz}: ${matchedDesc}.${linksBlock}\n\n${cta}${signOff}`,
+    },
+  ];
 }
 
 function useTrainedOfferSummary(): TrainedOfferSummary {
-  const [summary, setSummary] = useState<TrainedOfferSummary>({
-    primaryOfferName: "Website Creation & Review Service",
-    hasWebsiteOffer: true,
-    hasReviewOffer: true,
-    websiteOfferName: "Website Creation & Mobile Redesign",
-    reviewOfferName: "5-Star Review Service & Reputation Shield",
-    servicesOffered: [],
-    offerDetails: "Custom conversion websites and 5-star Google review generation systems",
-  });
+  const [summary, setSummary] = useState<TrainedOfferSummary>(() =>
+    buildTrainedOfferSummaryFromProfile(getCachedTrainingProfile())
+  );
 
   useEffect(() => {
-    saasFetch<{
-      profile?: {
-        offerDetails?: string;
-        servicesOffered?: Array<{ id?: string; name: string; description: string; targetSignals?: string }>;
-      };
-    }>("/api/saas/ai-training")
+    const handleProfileEvent = (e: Event) => {
+      const custom = e as CustomEvent<AiTrainingProfile | null>;
+      const prof = custom.detail || getCachedTrainingProfile();
+      setSummary(buildTrainedOfferSummaryFromProfile(prof));
+    };
+    window.addEventListener("vh-ai-training-updated", handleProfileEvent);
+
+    saasFetch<{ profile?: AiTrainingProfile }>("/api/saas/ai-training")
       .then((res) => {
         const p = res?.profile;
         if (!p) return;
-        const list = Array.isArray(p.servicesOffered) ? p.servicesOffered.filter((s) => s?.name?.trim()) : [];
-        const combinedText = `${p.offerDetails || ""} ${list.map((s) => `${s.name} ${s.description}`).join(" ")}`;
-        const websiteSrv = list.find((s) => /website|web design|site|redesign|landing page/i.test(`${s.name} ${s.description}`));
-        const reviewSrv = list.find((s) => /review|reputation|5-star|star|google maps/i.test(`${s.name} ${s.description}`));
-        const hasWeb = list.length === 0 || Boolean(websiteSrv) || /website|web design|site|redesign|landing page/i.test(combinedText);
-        const hasRev = list.length === 0 || Boolean(reviewSrv) || /review|reputation|5-star|star|google maps/i.test(combinedText);
-        let primaryOfferName = "Website Creation & Review Service";
-        if (hasWeb && hasRev) {
-          primaryOfferName = "Website Creation & Review Service";
-        } else if (list.length > 0) {
-          primaryOfferName = list[0].name;
-        } else if (hasWeb) {
-          primaryOfferName = websiteSrv?.name || "Website Creation Service";
-        } else if (hasRev) {
-          primaryOfferName = reviewSrv?.name || "5-Star Review Service";
+        const localCached = getCachedTrainingProfile();
+        if (localCached?.isTrained && !p.isTrained) {
+          setSummary(buildTrainedOfferSummaryFromProfile(localCached));
+          saasFetch("/api/saas/ai-training", {
+            method: "PUT",
+            body: JSON.stringify(localCached),
+          }).catch(() => {});
+        } else {
+          setCachedTrainingProfile(p);
+          setSummary(buildTrainedOfferSummaryFromProfile(p));
         }
-        setSummary({
-          primaryOfferName,
-          hasWebsiteOffer: hasWeb,
-          hasReviewOffer: hasRev,
-          websiteOfferName: websiteSrv?.name || "Website Creation & Mobile Redesign",
-          reviewOfferName: reviewSrv?.name || "5-Star Review Service & Reputation Shield",
-          servicesOffered: list,
-          offerDetails: p.offerDetails || "Custom conversion websites and 5-star Google review generation systems",
-        });
       })
       .catch(() => {});
+
+    return () => {
+      window.removeEventListener("vh-ai-training-updated", handleProfileEvent);
+    };
   }, []);
 
   return summary;
+}
+
+function getTrainedOfferSignature(trained: TrainedOfferSummary): string {
+  return [
+    trained.senderName,
+    trained.businessName,
+    trained.websiteUrl,
+    trained.senderEmail,
+    trained.primaryOfferName,
+    trained.offerDetails,
+    trained.subjectLineGuide,
+    trained.staticEmailExample,
+    trained.callToAction,
+    trained.updatedAt,
+  ].join("::");
 }
 
 function resolveAuditMatchedOffer(
@@ -478,7 +715,7 @@ interface Prospect {
   painPoint?: string;
   emailSentAt?: string;
   analysis?: WebsiteAnalysis;
-  generatedEmail?: { subject: string; body: string; emailVersions?: { version: string; subject: string; body: string }[]; selectedVersion?: string };
+  generatedEmail?: { subject: string; body: string; emailVersions?: { version: string; subject: string; body: string }[]; selectedVersion?: string; trainedSignature?: string };
   generatedWhatsApp?: string;
   generatedLinkedIn?: string;
   proposal?: ProposalData;
@@ -552,7 +789,7 @@ interface HuntedBusiness {
   sendingInlineEmail?: boolean;
   inlineEmailSent?: boolean;
   inlineOpen?: boolean;
-  generatedEmail?: { subject: string; body: string; emailVersions?: { version: string; subject: string; body: string }[]; selectedVersion?: string };
+  generatedEmail?: { subject: string; body: string; emailVersions?: { version: string; subject: string; body: string }[]; selectedVersion?: string; trainedSignature?: string };
 }
 
 interface WebsiteAnalysis {
@@ -741,19 +978,40 @@ function handleAuthFailure() {
 
 async function authFetch(path: string, init: RequestInit = {}) {
   const tok = getToken();
+  const cachedUser = getCachedSaasUser();
   const r = await fetch(`${apiBase()}${path}`, {
     ...init,
-    headers: { ...(init.headers || {}), Authorization: `Bearer ${tok}` },
+    headers: {
+      ...(init.headers || {}),
+      Authorization: `Bearer ${tok}`,
+      ...(cachedUser?.email ? { "x-user-email": cachedUser.email } : {}),
+      ...(cachedUser?.fullName ? { "x-user-name": cachedUser.fullName } : {}),
+      ...(cachedUser?.role ? { "x-user-role": cachedUser.role } : {}),
+      ...(cachedUser?.planId ? { "x-user-plan": cachedUser.planId } : {}),
+    },
   });
   return r;
 }
 
 async function callCRM(endpoint: string, body: object) {
   const tok = getToken();
+  const cachedUser = getCachedSaasUser();
+  const cachedTraining = getCachedTrainingProfile();
+  const enrichedBody =
+    cachedTraining && typeof body === "object" && body !== null && !("trainingProfile" in body)
+      ? { ...body, trainingProfile: cachedTraining }
+      : body;
   const r = await fetch(`${apiBase()}/api/crm/${endpoint}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
-    body: JSON.stringify(body),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${tok}`,
+      ...(cachedUser?.email ? { "x-user-email": cachedUser.email } : {}),
+      ...(cachedUser?.fullName ? { "x-user-name": cachedUser.fullName } : {}),
+      ...(cachedUser?.role ? { "x-user-role": cachedUser.role } : {}),
+      ...(cachedUser?.planId ? { "x-user-plan": cachedUser.planId } : {}),
+    },
+    body: JSON.stringify(enrichedBody),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
@@ -2138,7 +2396,8 @@ function AIHunterPanel({
           const generated = await callCRM("auto-generate", {
             businessName: b.businessName, category: b.category,
             website: b.website, city: b.city, country: b.country,
-            ownerName: b.ownerName, painPoint: b.painPoint, agencyName: AGENCY_NAME,
+            ownerName: b.ownerName, painPoint: b.painPoint,
+            agencyName: trainedOffer.businessName || AGENCY_NAME,
             cmsPlatform: b.cmsPlatform, missingSignals: b.missingSignals,
           });
           if (generated.analysis) {
@@ -2153,7 +2412,21 @@ function AIHunterPanel({
               generated.analysis.matchedOffer ||
               prospect.primaryOffer;
           }
-          if (generated.email) prospect.generatedEmail = generated.email;
+          if (generated.email) {
+            prospect.generatedEmail = {
+              ...generated.email,
+              trainedSignature: getTrainedOfferSignature(trainedOffer),
+            };
+          } else {
+            const trainedVersions = buildTrainedEmailsForLead(prospect, trainedOffer);
+            prospect.generatedEmail = {
+              subject: trainedVersions[0].subject,
+              body: trainedVersions[0].body,
+              emailVersions: trainedVersions,
+              selectedVersion: "A",
+              trainedSignature: getTrainedOfferSignature(trainedOffer),
+            };
+          }
           if (generated.whatsapp) prospect.generatedWhatsApp = generated.whatsapp;
           if (generated.linkedin) prospect.generatedLinkedIn = generated.linkedin;
           // Store report link so it can be injected when the email is sent
@@ -2178,7 +2451,24 @@ function AIHunterPanel({
           prospect.analysis = fbAnalysis;
           const resolvedAfterAudit = resolveAuditMatchedOffer({ ...b, analysis: fbAnalysis }, trainedOffer);
           prospect.primaryOffer = resolvedAfterAudit.primaryOffer || fbAnalysis.matchedOffer || prospect.primaryOffer;
+          const trainedVersions = buildTrainedEmailsForLead(prospect, trainedOffer);
+          prospect.generatedEmail = {
+            subject: trainedVersions[0].subject,
+            body: trainedVersions[0].body,
+            emailVersions: trainedVersions,
+            selectedVersion: "A",
+            trainedSignature: getTrainedOfferSignature(trainedOffer),
+          };
         }
+      } else if (!prospect.generatedEmail) {
+        const trainedVersions = buildTrainedEmailsForLead(prospect, trainedOffer);
+        prospect.generatedEmail = {
+          subject: trainedVersions[0].subject,
+          body: trainedVersions[0].body,
+          emailVersions: trainedVersions,
+          selectedVersion: "A",
+          trainedSignature: getTrainedOfferSignature(trainedOffer),
+        };
       }
 
       toImport.push(prospect);
@@ -2539,6 +2829,19 @@ function AIHunterPanel({
                 ? `Export Selected Scraped Leads`
                 : `Export All Scraped Leads`
             }
+            onSaveData={() => {
+              if (activeProject?.id) {
+                saveProjectHuntedResults(activeProject.id, results);
+              }
+              setProgress(`✓ Saved ${results.length} generated lead${results.length === 1 ? "" : "s"} to "${activeProject?.name || "Project"}" workspace.`);
+            }}
+            onClearData={() => {
+              setResults([]);
+              if (activeProject?.id) {
+                saveProjectHuntedResults(activeProject.id, []);
+              }
+              setProgress("✓ Cleared generated leads from AI Hunter.");
+            }}
           />
 
           <div className="rounded-xl border border-border/50 overflow-hidden">
@@ -2654,12 +2957,41 @@ function AIHunterPanel({
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    if (activeProject?.id) {
+                      saveProjectHuntedResults(activeProject.id, results);
+                    }
+                    setProgress(`✓ Saved ${results.length} generated lead${results.length === 1 ? "" : "s"} in "${activeProject?.name || "Project"}".`);
+                  }}
+                  className="gap-1.5 font-semibold h-8 text-xs border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  Save Generated Data
+                </Button>
+                <Button
                   onClick={importSelected}
                   disabled={selectedCount === 0}
                   className="gap-2 font-semibold h-8 text-xs sm:text-sm"
                 >
                   <Download className="w-3.5 h-3.5" />
                   Import {selectedCount > 0 ? selectedCount : ""} to Project {autoGenerate ? "+ Auto-Generate" : ""}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setResults([]);
+                    if (activeProject?.id) {
+                      saveProjectHuntedResults(activeProject.id, []);
+                    }
+                    setProgress("✓ Cleared generated leads from AI Hunter.");
+                  }}
+                  className="gap-1.5 font-semibold h-8 text-xs border-red-200 bg-red-50 text-red-700 hover:bg-red-100"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Clear Generated Data
                 </Button>
               </div>
             </div>
@@ -3412,35 +3744,11 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
   const issues = prospect.analysis?.issues.slice(0, 3).map(i => i.title).join(", ") || "";
   const opportunities = prospect.analysis?.opportunities.slice(0, 2).map(o => o.title).join(", ") || "";
 
-  const buildLocalFallbackEmails = () => {
-    const biz = prospect.businessName || "your business";
-    const firstOwner = prospect.ownerName ? prospect.ownerName.split(" ")[0] : "";
-    const greeting = firstOwner ? `Hi ${firstOwner},` : `Hi ${biz} Team,`;
-    const cat = (prospect.category || "local").toLowerCase();
-    const cityPart = prospect.city ? ` in ${prospect.city}` : "";
-    const reportLine = prospect.reportUrl
-      ? `\n\nI also put together a custom Website & Conversion Audit for ${biz} here:\n${prospect.reportUrl}`
-      : "";
-    const signOff = `\n\nBest regards,\n${AGENCY_NAME}`;
-
-    return [
-      {
-        version: "A",
-        subject: `Quick growth idea for ${biz}`,
-        body: `${greeting}\n\nWhile reviewing ${cat} businesses${cityPart}, I noticed ${biz} has a strong local reputation, but mobile visitors don't currently have a fast 1-click booking or instant quote flow.\n\nWe help ${cat} businesses turn missed website visitors into booked clients automatically.${reportLine}\n\nWould you be open to a quick 5-minute walkthrough this week?${signOff}`,
-      },
-      {
-        version: "B",
-        subject: `Capturing more ${prospect.city || "local"} clients for ${biz}`,
-        body: `${greeting}\n\nI was looking at ${biz}${cityPart} today and saw a clear opportunity to convert more of your search traffic into booked appointments without adding extra phone work for your team.${reportLine}\n\nWould you be open to seeing a quick preview of how this would work for ${biz}?${signOff}`,
-      },
-      {
-        version: "C",
-        subject: `${biz} — website & conversion upgrade`,
-        body: `${greeting}\n\nMost ${cat} businesses${cityPart} lose 30–40% of after-hours inquiries when visitors have to wait for a callback.\n\nWe built a streamlined conversion & booking blueprint tailored for ${biz}.${reportLine}\n\nCan I send over a 60-second overview?${signOff}`,
-      },
-    ];
-  };
+  const buildLocalFallbackEmails = () =>
+    buildTrainedEmailsForLead(prospect, trainedOffer, {
+      demoWebsiteUrl: prospect.generatedSiteUrl,
+      reviewServiceUrl: prospect.generatedReviewUrl,
+    });
 
   const genEmailWithOverrides = async (overrides?: {
     websiteUrl?: string;
@@ -3451,6 +3759,10 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
     const demoWebsiteUrl = overrides?.websiteUrl ?? prospect.generatedSiteUrl ?? "";
     const reviewServiceUrl = overrides?.reviewUrl ?? prospect.generatedReviewUrl ?? "";
     const nextSiteId = overrides?.siteId ?? prospect.generatedSiteId;
+    const fallbackVersions = buildTrainedEmailsForLead(prospect, trainedOffer, {
+      demoWebsiteUrl,
+      reviewServiceUrl,
+    });
     try {
       const data = await callCRM("generate-email", {
         businessName: prospect.businessName, ownerName: prospect.ownerName,
@@ -3459,18 +3771,20 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
         city: prospect.city,
         cmsPlatform: prospect.cmsPlatform,
         missingSignals: prospect.missingSignals,
-        issues, opportunities, agencyName: AGENCY_NAME,
+        issues: issues || trainedOffer.targetPainPoints,
+        opportunities: trainedOffer.offerDetails || opportunities,
+        agencyName: trainedOffer.businessName || AGENCY_NAME,
         reportUrl: prospect.reportUrl || "",
         primaryOffer: effectivePrimaryOffer,
         demoWebsiteUrl,
         reviewServiceUrl,
       });
-      const fallbackVersions = buildLocalFallbackEmails();
       const versions: { version: string; subject: string; body: string }[] =
         Array.isArray(data?.versions) && data.versions.length > 0
           ? data.versions
           : fallbackVersions;
       const primary = versions[0] ?? fallbackVersions[0];
+      const currentSig = getTrainedOfferSignature(trainedOffer);
       onUpdate({
         ...prospect,
         primaryOffer: effectivePrimaryOffer,
@@ -3482,11 +3796,16 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
           body: primary.body || fallbackVersions[0].body,
           emailVersions: versions,
           selectedVersion: primary.version || "A",
+          trainedSignature: currentSig,
         },
       });
+      setSendStatus({
+        type: "success",
+        msg: `Generated personalized cold email using your trained offer (${effectivePrimaryOffer})`,
+      });
     } catch {
-      const fallbackVersions = buildLocalFallbackEmails();
       const primary = fallbackVersions[0];
+      const currentSig = getTrainedOfferSignature(trainedOffer);
       onUpdate({
         ...prospect,
         primaryOffer: effectivePrimaryOffer,
@@ -3498,7 +3817,12 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
           body: primary.body,
           emailVersions: fallbackVersions,
           selectedVersion: "A",
+          trainedSignature: currentSig,
         },
+      });
+      setSendStatus({
+        type: "success",
+        msg: `Applied your trained AI template (${effectivePrimaryOffer})`,
       });
     } finally { setLoadingEmail(false); }
   };
@@ -3542,39 +3866,56 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
     }
   };
 
+  const currentTrainedSignature = getTrainedOfferSignature(trainedOffer);
+
   const seededEmailObj = useMemo(() => {
-    if (prospect.generatedEmail && prospect.generatedEmail.subject && prospect.generatedEmail.body) {
+    const fb = buildLocalFallbackEmails();
+    if (
+      prospect.generatedEmail &&
+      prospect.generatedEmail.subject &&
+      prospect.generatedEmail.body &&
+      (Boolean(prospect.emailSentAt) || prospect.generatedEmail.trainedSignature === currentTrainedSignature)
+    ) {
       return prospect.generatedEmail;
     }
-    const fb = buildLocalFallbackEmails();
     return {
       subject: fb[0].subject,
       body: fb[0].body,
       emailVersions: fb,
       selectedVersion: "A",
+      trainedSignature: currentTrainedSignature,
     };
   }, [
     prospect.id,
+    prospect.emailSentAt,
     prospect.generatedEmail,
     prospect.businessName,
     prospect.ownerName,
     prospect.category,
     prospect.city,
     prospect.reportUrl,
+    prospect.generatedSiteUrl,
+    prospect.generatedReviewUrl,
+    currentTrainedSignature,
   ]);
 
-  // Auto-seed company email & initial outreach messages so Send Email works immediately on the Outreach page
+  // Auto-seed company email & initial outreach messages using the user's Train Your AI profile automatically
   useEffect(() => {
     const seededEmail = ensureCompanyEmail(prospect);
     const needsEmailSeed = !prospect.email || !prospect.email.includes("@");
-    const needsMessageSeed = !prospect.generatedEmail || !prospect.generatedEmail.subject || !prospect.generatedEmail.body;
+    const needsMessageSeed =
+      !prospect.emailSentAt &&
+      (!prospect.generatedEmail ||
+        !prospect.generatedEmail.subject ||
+        !prospect.generatedEmail.body ||
+        prospect.generatedEmail.trainedSignature !== currentTrainedSignature);
     const firstOwner = prospect.ownerName ? prospect.ownerName.split(" ")[0] : "there";
     const defaultWA =
       prospect.generatedWhatsApp ||
-      `Hi ${firstOwner}! 👋 I was checking out ${prospect.businessName}${prospect.city ? ` in ${prospect.city}` : ""} and put together a quick conversion & booking audit to help capture more local clients automatically. Mind if I share the link here?`;
+      `Hi ${firstOwner}! 👋 This is ${trainedOffer.senderName} from ${trainedOffer.businessName}. I was checking out ${prospect.businessName}${prospect.city ? ` in ${prospect.city}` : ""} and put together a quick ${effectivePrimaryOffer} idea to help capture more local clients automatically. Mind if I share the link here?`;
     const defaultLI =
       prospect.generatedLinkedIn ||
-      `Hi ${firstOwner}, impressed by ${prospect.businessName}'s work${prospect.city ? ` in ${prospect.city}` : ""}. Would love to connect and share a quick growth idea for your ${prospect.category || "business"}!`;
+      `Hi ${firstOwner}, impressed by ${prospect.businessName}'s work${prospect.city ? ` in ${prospect.city}` : ""}. Would love to connect and share a quick ${effectivePrimaryOffer} idea for your ${prospect.category || "business"}! — ${trainedOffer.senderName}`;
 
     if (needsEmailSeed || needsMessageSeed || !prospect.generatedWhatsApp || !prospect.generatedLinkedIn) {
       const fallbackVersions = buildLocalFallbackEmails();
@@ -3582,20 +3923,24 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
       onUpdate({
         ...prospect,
         email: seededEmail,
-        primaryOffer: prospect.primaryOffer || effectivePrimaryOffer,
+        primaryOffer: effectivePrimaryOffer || prospect.primaryOffer,
         generatedEmail: needsMessageSeed
           ? {
               subject: primary.subject,
               body: primary.body,
               emailVersions: fallbackVersions,
               selectedVersion: "A",
+              trainedSignature: currentTrainedSignature,
             }
           : prospect.generatedEmail,
         generatedWhatsApp: defaultWA,
         generatedLinkedIn: defaultLI,
       });
     }
-  }, [prospect.id]);
+  }, [
+    prospect.id,
+    currentTrainedSignature,
+  ]);
 
   const sendEmail = async () => {
     const targetEmail = ensureCompanyEmail(prospect);
@@ -3729,7 +4074,7 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
               variant="outline"
               onClick={genEmail}
               disabled={loadingEmail}
-              className="w-full sm:w-auto h-8 sm:h-7 text-xs gap-1.5"
+              className="h-8 sm:h-7 text-xs gap-1.5"
             >
               {loadingEmail ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
               Regenerate Cold Email
@@ -3750,6 +4095,7 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
                     subject: v.subject,
                     body: v.body,
                     selectedVersion: v.version,
+                    trainedSignature: currentTrainedSignature,
                   },
                 })}
                 className={`px-2.5 py-0.5 text-xs font-bold rounded-full border transition-colors ${
@@ -3775,7 +4121,11 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
                 onChange={e =>
                   onUpdate({
                     ...prospect,
-                    generatedEmail: { ...seededEmailObj, subject: e.target.value },
+                    generatedEmail: {
+                      ...seededEmailObj,
+                      subject: e.target.value,
+                      trainedSignature: currentTrainedSignature,
+                    },
                   })
                 }
                 className="border-none bg-transparent p-0 font-semibold text-sm h-auto focus-visible:ring-0"
@@ -3786,7 +4136,11 @@ function OutreachPanel({ prospect, onUpdate }: { prospect: Prospect; onUpdate: (
               onChange={e =>
                 onUpdate({
                   ...prospect,
-                  generatedEmail: { ...seededEmailObj, body: e.target.value },
+                  generatedEmail: {
+                    ...seededEmailObj,
+                    body: e.target.value,
+                    trainedSignature: currentTrainedSignature,
+                  },
                 })
               }
               rows={7}
@@ -5254,6 +5608,8 @@ function ProspectList({
   onUpdate,
   projects,
   activeProjectName,
+  onSaveProjectLeads,
+  onClearProjectLeads,
 }: {
   prospects: Prospect[];
   onSelect: (p: Prospect) => void;
@@ -5261,6 +5617,8 @@ function ProspectList({
   onUpdate?: (p: Prospect) => void;
   projects?: LeadProject[];
   activeProjectName?: string;
+  onSaveProjectLeads?: () => void;
+  onClearProjectLeads?: () => void;
 }) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -5293,6 +5651,10 @@ function ProspectList({
     setLoadingEmailIds(prev => ({ ...prev, [p.id]: true }));
     setOpenEmailIds(prev => ({ ...prev, [p.id]: true }));
     try {
+      const fallbackVersions = buildTrainedEmailsForLead(p, trainedOffer, {
+        demoWebsiteUrl,
+        reviewServiceUrl,
+      });
       const data = await callCRM("generate-email", {
         businessName: p.businessName,
         ownerName: p.ownerName,
@@ -5302,20 +5664,17 @@ function ProspectList({
         city: p.city,
         cmsPlatform: p.cmsPlatform,
         missingSignals: p.missingSignals,
-        issues: p.painPoint || "",
+        issues: p.painPoint || trainedOffer.targetPainPoints || "",
         opportunities: trainedOffer.offerDetails,
-        agencyName: AGENCY_NAME,
+        agencyName: trainedOffer.businessName || AGENCY_NAME,
         reportUrl: p.reportUrl || "",
         primaryOffer: effectiveLeadOffer,
         demoWebsiteUrl,
         reviewServiceUrl,
       });
-      const versions = Array.isArray(data?.versions) && data.versions.length > 0 ? data.versions : [];
-      const first = versions[0] || {
-        version: "A",
-        subject: data?.subject || `Quick idea for ${p.businessName} — ${effectiveLeadOffer}`,
-        body: data?.body || `Hi ${p.ownerName || `${p.businessName} Team`},\n\nI was looking at ${p.businessName}${p.city ? ` in ${p.city}` : ""} today and noticed an opportunity around ${effectiveLeadOffer} to help you capture more local clients.${demoWebsiteUrl ? `\n\n• Live Website Preview: ${demoWebsiteUrl}` : ""}${reviewServiceUrl ? `\n• 5-Star Review Page: ${reviewServiceUrl}` : ""}\n\nWould you be open to taking a quick look?\n\nBest regards,\n${AGENCY_NAME}`,
-      };
+      const versions = Array.isArray(data?.versions) && data.versions.length > 0 ? data.versions : fallbackVersions;
+      const first = versions[0] || fallbackVersions[0];
+      const currentSig = getTrainedOfferSignature(trainedOffer);
       onUpdate({
         ...p,
         primaryOffer: effectiveLeadOffer,
@@ -5327,10 +5686,16 @@ function ProspectList({
           body: first.body,
           emailVersions: versions.length > 0 ? versions : [first],
           selectedVersion: first.version || "A",
+          trainedSignature: currentSig,
         },
       });
     } catch {
-      const fallbackBody = `Hi ${p.ownerName || `${p.businessName} Team`},\n\nI was looking at ${p.businessName}${p.city ? ` in ${p.city}` : ""} today and put together a tailored ${effectiveLeadOffer} breakdown to help turn more local searches into booked clients.${demoWebsiteUrl ? `\n\n• Live Website Preview: ${demoWebsiteUrl}` : ""}${reviewServiceUrl ? `\n• 5-Star Review Page: ${reviewServiceUrl}` : ""}\n\nWould you be open to a quick walkthrough this week?\n\nBest regards,\n${AGENCY_NAME}`;
+      const fallbackVersions = buildTrainedEmailsForLead(p, trainedOffer, {
+        demoWebsiteUrl,
+        reviewServiceUrl,
+      });
+      const first = fallbackVersions[0];
+      const currentSig = getTrainedOfferSignature(trainedOffer);
       onUpdate({
         ...p,
         primaryOffer: effectiveLeadOffer,
@@ -5338,8 +5703,11 @@ function ProspectList({
         generatedSiteUrl: demoWebsiteUrl || p.generatedSiteUrl,
         generatedReviewUrl: reviewServiceUrl || p.generatedReviewUrl,
         generatedEmail: {
-          subject: `Quick idea for ${p.businessName} — ${effectiveLeadOffer}`,
-          body: fallbackBody,
+          subject: first.subject,
+          body: first.body,
+          emailVersions: fallbackVersions,
+          selectedVersion: "A",
+          trainedSignature: currentSig,
         },
       });
     } finally {
@@ -5452,6 +5820,8 @@ function ProspectList({
               : undefined
           }
           label="Export Project Leads"
+          onSaveData={onSaveProjectLeads}
+          onClearData={onClearProjectLeads}
         />
       )}
 
@@ -6711,6 +7081,122 @@ export default function CRM() {
     if (selected?.id === id) setSelected(null);
   }, [prospects, selected, save]);
 
+  const handleSaveProjectLeads = useCallback(() => {
+    saveProspects(prospects);
+    saveProjects(projects);
+  }, [prospects, projects]);
+
+  const handleClearProjectLeads = useCallback(() => {
+    if (activeProjectId === "all") {
+      save([]);
+      for (const proj of projects) {
+        saveProjectHuntedResults(proj.id, []);
+      }
+    } else {
+      const remaining = prospects.filter(
+        (p) => (p.projectId || defaultProjectId) !== activeProjectId
+      );
+      save(remaining);
+      saveProjectHuntedResults(activeProjectId, []);
+    }
+    setSelected(null);
+  }, [activeProjectId, defaultProjectId, projects, prospects, save]);
+
+  const trainedOffer = useTrainedOfferSummary();
+  const currentTrainedSig = getTrainedOfferSignature(trainedOffer);
+
+  // Automatically apply Train Your AI profile to all unsent prospects whenever the trained profile loads or updates
+  useEffect(() => {
+    setProspects((prev) => {
+      if (prev.length === 0) return prev;
+      let changed = false;
+      const updated = prev.map((p) => {
+        if (p.emailSentAt) return p;
+        if (
+          p.generatedEmail &&
+          p.generatedEmail.subject &&
+          p.generatedEmail.body &&
+          p.generatedEmail.trainedSignature === currentTrainedSig
+        ) {
+          return p;
+        }
+        changed = true;
+        const offerRes = resolveAuditMatchedOffer(p, trainedOffer);
+        const matchedOffer = offerRes.primaryOffer || p.primaryOffer || trainedOffer.primaryOfferName;
+        const versions = buildTrainedEmailsForLead(
+          { ...p, primaryOffer: matchedOffer },
+          trainedOffer,
+          {
+            demoWebsiteUrl: p.generatedSiteUrl,
+            reviewServiceUrl: p.generatedReviewUrl,
+          }
+        );
+        const primary = versions[0];
+        return {
+          ...p,
+          primaryOffer: matchedOffer,
+          generatedEmail: {
+            subject: primary.subject,
+            body: primary.body,
+            emailVersions: versions,
+            selectedVersion: "A",
+            trainedSignature: currentTrainedSig,
+          },
+        };
+      });
+      if (!changed) return prev;
+      saveProspects(updated);
+      setSelected((sel) => {
+        if (!sel) return null;
+        const match = updated.find((u) => u.id === sel.id);
+        return match || sel;
+      });
+      return updated;
+    });
+  }, [currentTrainedSig]);
+
+  const handleTrainedProfileSaved = useCallback(
+    (savedProfile: AiTrainingProfile) => {
+      const summary = buildTrainedOfferSummaryFromProfile(savedProfile);
+      const sig = getTrainedOfferSignature(summary);
+      setProspects((prev) => {
+        const updated = prev.map((p) => {
+          if (p.emailSentAt) return p;
+          const offerRes = resolveAuditMatchedOffer(p, summary);
+          const matchedOffer = offerRes.primaryOffer || summary.primaryOfferName;
+          const versions = buildTrainedEmailsForLead(
+            { ...p, primaryOffer: matchedOffer },
+            summary,
+            {
+              demoWebsiteUrl: p.generatedSiteUrl,
+              reviewServiceUrl: p.generatedReviewUrl,
+            }
+          );
+          const primary = versions[0];
+          return {
+            ...p,
+            primaryOffer: matchedOffer,
+            generatedEmail: {
+              subject: primary.subject,
+              body: primary.body,
+              emailVersions: versions,
+              selectedVersion: "A",
+              trainedSignature: sig,
+            },
+          };
+        });
+        saveProspects(updated);
+        setSelected((sel) => {
+          if (!sel) return null;
+          const match = updated.find((u) => u.id === sel.id);
+          return match || sel;
+        });
+        return updated;
+      });
+    },
+    []
+  );
+
   if (selected) {
     return (
       <div className="min-h-screen bg-background">
@@ -6807,6 +7293,8 @@ export default function CRM() {
           totalLeadsCount={prospects.length}
           activeProjectLeads={activeProjectExportableLeads}
           categories={CATEGORIES}
+          onSaveProjectLeads={handleSaveProjectLeads}
+          onClearProjectLeads={handleClearProjectLeads}
         />
 
         <Tabs value={tab} onValueChange={setTab}>
@@ -6874,6 +7362,8 @@ export default function CRM() {
                   ? "All-Projects"
                   : activeProject?.name || "Project"
               }
+              onSaveProjectLeads={handleSaveProjectLeads}
+              onClearProjectLeads={handleClearProjectLeads}
             />
           </TabsContent>
 
@@ -6886,6 +7376,7 @@ export default function CRM() {
               userFullName={getCachedSaasUser()?.fullName}
               userCompanyName={getCachedSaasUser()?.companyName}
               userEmail={getCachedSaasUser()?.email}
+              onSaved={handleTrainedProfileSaved}
               onNavigateToHunter={() => setTab("hunter")}
             />
           </TabsContent>

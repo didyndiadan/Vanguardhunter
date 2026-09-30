@@ -12,6 +12,7 @@ import {
   setSaasSession,
   clearSaasSession,
   isUserAdmin,
+  getCachedTrainingProfile,
 } from "@/lib/saas-auth";
 import { ExportLeadsBar } from "@/components/ProjectWorkspaceBar";
 import MultiSmtpManagerPanel, { SmtpAppPasswordGuide } from "@/components/MultiSmtpManagerPanel";
@@ -1807,8 +1808,8 @@ export default function UserDashboard() {
                         index: "01",
                         title: "Train Your AI First (My Offers)",
                         desc: "Start here! Add your service offers, target pain points, and cold email template so the AI writes personalized emails for your offers.",
-                        meta: user?.aiTrainingProfile?.offerDetails ? "Custom Offers Trained ✓" : "Click to train your AI offers first",
-                        done: Boolean(user?.aiTrainingProfile?.offerDetails),
+                        meta: (user as any)?.aiTrainingProfile?.offerDetails || getCachedTrainingProfile()?.isTrained ? "Custom Offers Trained ✓" : "Click to train your AI offers first",
+                        done: Boolean((user as any)?.aiTrainingProfile?.offerDetails || getCachedTrainingProfile()?.isTrained),
                       },
                       {
                         step: 2 as const,
