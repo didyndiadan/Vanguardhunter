@@ -61,6 +61,8 @@ import {
   ChevronDown,
   ChevronUp,
   FileText,
+  BarChart3,
+  Database,
 } from "lucide-react";
 
 /**
@@ -1024,6 +1026,21 @@ export default function UserDashboard() {
 
             <button
               type="button"
+              onClick={() => {
+                setMobileMenuOpen(false);
+                setLocation("/crm?tab=reports");
+              }}
+              className="w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-medium rounded-lg text-slate-300 hover:text-white hover:bg-slate-900 transition-colors cursor-pointer"
+            >
+              <span className="flex items-center gap-3">
+                <BarChart3 className="w-4 h-4 text-amber-400" />
+                <span>Custom Reports &amp; Metrics</span>
+              </span>
+              <ArrowUpRight className="w-3.5 h-3.5 text-slate-500" />
+            </button>
+
+            <button
+              type="button"
               onClick={() => handleSelectTab("train-ai")}
               className={`w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-medium rounded-lg transition-colors cursor-pointer ${
                 activeTab === "train-ai"
@@ -1365,6 +1382,13 @@ export default function UserDashboard() {
             className="px-3 py-1.5 text-xs font-semibold rounded-lg whitespace-nowrap bg-[#EFF6FF] text-[#1D4ED8] cursor-pointer"
           >
             CRM Hunter →
+          </button>
+          <button
+            type="button"
+            onClick={() => setLocation("/crm?tab=reports")}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg whitespace-nowrap bg-amber-50 text-amber-800 cursor-pointer"
+          >
+            Custom Reports →
           </button>
           {isUserAdmin(user) && (
             <button

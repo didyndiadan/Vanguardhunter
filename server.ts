@@ -20,6 +20,7 @@ import apiKeysRouter from "./src/server/routes/api-keys";
 import affiliateRouter from "./src/server/routes/affiliate";
 import saasRouter from "./src/server/routes/saas";
 import websiteBuilderRouter from "./src/server/routes/website-builder";
+import crmIntegrationsReportsRouter from "./src/server/routes/crm-integrations-reports";
 
 function resolvePort(): number {
   const portArgIdx = process.argv.indexOf("--port");
@@ -69,6 +70,7 @@ async function startServer() {
   // Mount AI Business Hunter & CRM routes
   app.use("/api", saasRouter);
   app.use("/api", websiteBuilderRouter);
+  app.use("/api", crmIntegrationsReportsRouter);
   app.use("/api", crmAiRouter);
   app.use("/api", automationRouter);
   app.use("/api", reportsRouter);

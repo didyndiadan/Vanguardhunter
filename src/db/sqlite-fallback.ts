@@ -24,6 +24,10 @@ const BOOLEAN_COLUMNS = new Set([
   "read_by_user",
   "read_by_admin",
   "claim_requested",
+  "is_default",
+  "enabled",
+  "auto_sync_on_import",
+  "auto_sync_on_stage_change",
 ]);
 
 /**

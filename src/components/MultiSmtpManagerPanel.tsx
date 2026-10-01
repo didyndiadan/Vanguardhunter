@@ -20,7 +20,12 @@ import {
   Copy,
   Sparkles,
 } from "lucide-react";
-import { getSaasToken } from "@/lib/saas-auth";
+import { getSaasToken, getCachedSaasUser } from "@/lib/saas-auth";
+import {
+  upsertAccountInSmtpVault,
+  removeAccountFromSmtpVault,
+  syncSmtpVaultWithServer,
+} from "@/lib/smtp-vault";
 
 export interface SmtpAccountItem {
   id: number;
@@ -248,14 +253,19 @@ export const SMTP_PROVIDER_PRESETS = [
 
 function buildAuthHeaders(): Record<string, string> {
   const token =
-    localStorage.getItem("vh_admin_token") ||
     getSaasToken() ||
+    localStorage.getItem("vh_admin_token") ||
     localStorage.getItem("ds_api_token") ||
     localStorage.getItem("crm_token") ||
     "admin123";
+  const cachedUser = getCachedSaasUser();
   return {
     "Content-Type": "application/json",
     Authorization: `Bearer ${token}`,
+    ...(cachedUser?.email ? { "x-user-email": cachedUser.email } : {}),
+    ...(cachedUser?.fullName ? { "x-user-name": cachedUser.fullName } : {}),
+    ...(cachedUser?.role ? { "x-user-role": cachedUser.role } : {}),
+    ...(cachedUser?.planId ? { "x-user-plan": cachedUser.planId } : {}),
   };
 }
 
@@ -486,13 +496,10 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
   const loadAccounts = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch("/api/crm/email-accounts", {
-        headers: buildAuthHeaders(),
-      });
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        setAccounts(data);
-        if (onAccountsChanged) onAccountsChanged(data.length);
+      const synced = await syncSmtpVaultWithServer(buildAuthHeaders());
+      if (Array.isArray(synced)) {
+        setAccounts(synced);
+        if (onAccountsChanged) onAccountsChanged(synced.length);
       }
     } catch (err: any) {
       console.error("Failed to load SMTP accounts:", err);
@@ -528,24 +535,31 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
     setSavingSingle(true);
     try {
       const cleanEmail = user.trim();
+      const rawPass = password.trim();
+      const cleanPass = /^https?:\/\//i.test(rawPass) ? rawPass : rawPass.replace(/\s+/g, "");
+      const payload = {
+        label: label.trim() || `${selectedPresetId.toUpperCase()} · ${cleanEmail}`,
+        provider: selectedPresetId,
+        host: host.trim(),
+        port: Number(port) || 587,
+        secure: Number(port) === 465,
+        user: cleanEmail,
+        password: cleanPass,
+        fromName: fromName.trim() || "Vanguard Outreach",
+        fromEmail: fromEmail.trim() || (cleanEmail.includes("@") ? cleanEmail : ""),
+        dailyLimit: Number(dailyLimit) || 80,
+      };
+      upsertAccountInSmtpVault({ ...payload, active: true });
       const res = await fetch("/api/crm/email-accounts", {
         method: "POST",
         headers: buildAuthHeaders(),
-        body: JSON.stringify({
-          label: label.trim() || `${selectedPresetId.toUpperCase()} · ${cleanEmail}`,
-          provider: selectedPresetId,
-          host: host.trim(),
-          port: Number(port) || 587,
-          secure: Number(port) === 465,
-          user: cleanEmail,
-          password: password.replace(/\s+/g, ""),
-          fromName: fromName.trim() || "Vanguard Outreach",
-          fromEmail: fromEmail.trim() || (cleanEmail.includes("@") ? cleanEmail : ""),
-          dailyLimit: Number(dailyLimit) || 80,
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to add SMTP account");
+      if (data?.account) {
+        upsertAccountInSmtpVault({ ...payload, id: data.account.id, active: true });
+      }
 
       setLabel("");
       setUser("");
@@ -573,6 +587,21 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
 
     setSavingBulk(true);
     try {
+      for (const r of validRows) {
+        upsertAccountInSmtpVault({
+          label: `${(r.provider || "gmail").toUpperCase()} · ${r.user.trim()}`,
+          provider: r.provider || "gmail",
+          host: r.host || "smtp.gmail.com",
+          port: Number(r.port) || 587,
+          secure: Number(r.port) === 465,
+          user: r.user.trim(),
+          password: r.password.replace(/\s+/g, ""),
+          fromName: r.fromName || fromName || "Vanguard Outreach",
+          fromEmail: r.user.trim(),
+          dailyLimit: Number(dailyLimit) || 80,
+          active: true,
+        });
+      }
       const res = await fetch("/api/crm/email-accounts/bulk", {
         method: "POST",
         headers: buildAuthHeaders(),
@@ -709,6 +738,25 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
     e.preventDefault();
     if (!editingAccount) return;
     try {
+      const cleanEditPass = editPassword.trim()
+        ? /^https?:\/\//i.test(editPassword.trim())
+          ? editPassword.trim()
+          : editPassword.replace(/\s+/g, "")
+        : undefined;
+      upsertAccountInSmtpVault({
+        id: editingAccount.id,
+        label: editingAccount.label,
+        provider: editingAccount.provider,
+        host: editingAccount.host,
+        port: Number(editingAccount.port) || 587,
+        secure: Number(editingAccount.port) === 465,
+        user: editingAccount.user,
+        password: cleanEditPass,
+        fromName: editingAccount.fromName,
+        fromEmail: editingAccount.fromEmail,
+        dailyLimit: Number(editingAccount.dailyLimit) || 80,
+        active: true,
+      });
       const res = await fetch(`/api/crm/email-accounts/${editingAccount.id}`, {
         method: "PUT",
         headers: buildAuthHeaders(),
@@ -719,7 +767,7 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
           port: Number(editingAccount.port) || 587,
           secure: Number(editingAccount.port) === 465,
           user: editingAccount.user,
-          password: editPassword.trim() ? editPassword.replace(/\s+/g, "") : undefined,
+          password: cleanEditPass,
           fromName: editingAccount.fromName,
           fromEmail: editingAccount.fromEmail,
           dailyLimit: Number(editingAccount.dailyLimit) || 80,
@@ -738,6 +786,12 @@ export const MultiSmtpManagerPanel: React.FC<MultiSmtpManagerPanelProps> = ({
 
   const handleDeleteAccount = async (id: number, emailLabel: string) => {
     try {
+      const targetAcct = accounts.find((a) => a.id === id);
+      removeAccountFromSmtpVault({
+        id,
+        user: targetAcct?.user,
+        host: targetAcct?.host,
+      });
       await fetch(`/api/crm/email-accounts/${id}`, {
         method: "DELETE",
         headers: buildAuthHeaders(),

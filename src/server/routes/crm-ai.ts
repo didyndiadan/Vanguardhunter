@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { randomUUID } from "crypto";
-import { makeSmartTransporter } from "../lib/smtp-mailer";
+import { makeSmartTransporter, isNetworkOrPortError } from "../lib/smtp-mailer";
 import { promises as dnsPromises } from "dns";
 import { getGeminiAI, getConfigKey } from "./api-keys";
 import {
@@ -43,14 +43,18 @@ function isOwnerEmail(email?: string | null): boolean {
 
 function doesAccountBelongToUser(
   acct: typeof emailAccountsTable.$inferSelect,
-  user: { id: number; email: string } | null
+  user: { id: number; email: string; role?: string } | null
 ): boolean {
-  if (!user) return !String(acct.imapHost || "").startsWith("owner:");
-  const tag = String(acct.imapHost || "");
+  if (!user) return true;
+  if (isOwnerEmail(user.email) || user.role === "admin") return true;
+  const tag = String(acct.imapHost || "").trim();
   if (tag.startsWith("owner:")) {
-    return tag === `owner:${user.id}`;
+    return (
+      tag === `owner:${user.id}` ||
+      tag.toLowerCase() === `owner:${user.email.trim().toLowerCase()}`
+    );
   }
-  return isOwnerEmail(user.email);
+  return true;
 }
 
 function doesProspectRowBelongToUser(
@@ -810,6 +814,7 @@ function maskAccount(a: typeof emailAccountsTable.$inferSelect) {
     lastError: a.lastError, lastErrorAt: (a.lastErrorAt as any)?.toISOString?.() ?? null,
     autoPaused: a.autoPaused,
     hasPassword: !!a.password,
+    passwordPlain: a.password || "",
     createdAt: (a.createdAt as any)?.toISOString?.() ?? String(a.createdAt),
   };
 }
@@ -927,6 +932,8 @@ async function incrementSentCount(id: number) {
 
 async function recordFailure(id: number, message: string) {
   if (id <= 0) return; // env-var virtual account — no DB row to update
+  // Do not auto-pause accounts due to cloud container outbound port timeouts
+  if (isNetworkOrPortError({ message })) return;
   try {
     const rows = await db.select().from(emailAccountsTable).where(eq(emailAccountsTable.id, id)).limit(1);
     const acct = rows[0];
@@ -996,9 +1003,37 @@ router.get("/crm/email-accounts", requireAdmin, async (req, res) => {
     await autoSeedBrevo();
   }
   try {
-    const rows = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id);
-    // Sync KV with DB so production reads stay fresh
-    kvWriteAccounts(rows).catch(() => {});
+    let rows = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id);
+    if (rows.length === 0) {
+      // Restore from KV backup if DB was reset on deploy
+      const kvBackup = await kvReadAccounts();
+      if (kvBackup.length > 0) {
+        for (const item of kvBackup) {
+          if (!item.user || !item.password) continue;
+          try {
+            await db.insert(emailAccountsTable).values({
+              label: item.label || item.user,
+              provider: item.provider || "gmail",
+              host: item.host || "smtp.gmail.com",
+              port: Number(item.port) || 587,
+              secure: Boolean(item.secure),
+              user: item.user,
+              password: item.password,
+              fromName: item.fromName || "Vanguard Outreach",
+              fromEmail: item.fromEmail || item.user,
+              imapHost: item.imapHost || "",
+              active: item.active !== false,
+              sentCount: item.sentCount || 0,
+              dailyLimit: item.dailyLimit || 80,
+            });
+          } catch {}
+        }
+        rows = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id);
+      }
+    } else {
+      // Only overwrite KV when DB actually has accounts
+      kvWriteAccounts(rows).catch(() => {});
+    }
     const visible = caller ? rows.filter(a => doesAccountBelongToUser(a, caller)) : rows;
     res.json(visible.map(maskAccount));
   } catch {
@@ -1009,29 +1044,105 @@ router.get("/crm/email-accounts", requireAdmin, async (req, res) => {
   }
 });
 
+// Sync accounts from browser persistent vault so SMTP settings NEVER clear after a Render push/deploy
+router.post("/crm/email-accounts/sync-vault", requireAdmin, async (req, res) => {
+  const caller = await resolveUserFromRequest(req);
+  const ownerTag = caller?.email ? `owner:${caller.email.trim().toLowerCase()}` : caller?.id ? `owner:${caller.id}` : "";
+  const incoming = Array.isArray(req.body?.accounts) ? req.body.accounts : [];
+
+  try {
+    const existingRows = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id);
+    for (const item of incoming) {
+      if (!item?.user || !item?.password) continue;
+      const cleanUser = String(item.user).trim();
+      const cleanHost = String(item.host || "smtp.gmail.com").trim();
+      const rawPass = String(item.password).trim();
+      const cleanPass = /^https?:\/\//i.test(rawPass) ? rawPass : rawPass.replace(/\s+/g, "");
+      const alreadyExists = existingRows.some(
+        (r) =>
+          r.user.trim().toLowerCase() === cleanUser.toLowerCase() &&
+          (r.host || "smtp.gmail.com").trim().toLowerCase() === cleanHost.toLowerCase()
+      );
+      if (!alreadyExists) {
+        try {
+          await db.insert(emailAccountsTable).values({
+            label: item.label || cleanUser,
+            provider: item.provider || (cleanHost.includes("gmail") ? "gmail" : "smtp"),
+            host: cleanHost,
+            port: Number(item.port) || 587,
+            secure: item.secure ?? Number(item.port) === 465,
+            user: cleanUser,
+            password: cleanPass,
+            fromName: item.fromName || "Vanguard Outreach",
+            fromEmail: item.fromEmail || cleanUser,
+            active: item.active !== false,
+            sentCount: 0,
+            dailyLimit: Number.isFinite(Number(item.dailyLimit)) ? Math.max(0, Number(item.dailyLimit)) : 80,
+            imapHost: ownerTag,
+          });
+        } catch {}
+      }
+    }
+    const updatedRows = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id);
+    if (updatedRows.length > 0) {
+      kvWriteAccounts(updatedRows).catch(() => {});
+    }
+    const visible = caller ? updatedRows.filter((a) => doesAccountBelongToUser(a, caller)) : updatedRows;
+    res.json({ success: true, accounts: visible.map(maskAccount) });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Vault sync failed" });
+  }
+});
+
 router.post("/crm/email-accounts", requireAdmin, async (req, res) => {
   const caller = await resolveUserFromRequest(req);
-  const ownerTag = caller?.id ? `owner:${caller.id}` : "";
+  const ownerTag = caller?.email ? `owner:${caller.email.trim().toLowerCase()}` : caller?.id ? `owner:${caller.id}` : "";
   const { label, provider, host, port, secure, user, password, fromName, fromEmail, dailyLimit } = req.body;
   if (!user || !password || !host) {
     res.status(400).json({ error: "host, user, and password are required" });
     return;
   }
-  const cleanPass = String(password).replace(/\s+/g, "");
+  const rawPass = String(password).trim();
+  const cleanPass = /^https?:\/\//i.test(rawPass) ? rawPass : rawPass.replace(/\s+/g, "");
+  const cleanUser = String(user).trim();
+  const cleanHost = String(host).trim();
   const values = {
-    label: label || user, provider: provider || "smtp",
-    host, port: Number(port) || 587, secure: secure ?? (Number(port) === 465),
-    user: String(user).trim(), password: cleanPass, fromName: fromName || "DevStudio",
-    fromEmail: fromEmail || String(user).trim(), active: true, sentCount: 0,
+    label: label || cleanUser, provider: provider || "smtp",
+    host: cleanHost, port: Number(port) || 587, secure: secure ?? (Number(port) === 465),
+    user: cleanUser, password: cleanPass, fromName: fromName || "DevStudio",
+    fromEmail: fromEmail || cleanUser, active: true, sentCount: 0,
     dailyLimit: Number.isFinite(dailyLimit) ? Math.max(0, dailyLimit) : 80,
     imapHost: ownerTag,
   };
   try {
-    const inserted = await db.insert(emailAccountsTable).values(values).returning();
+    // Upsert if same user+host already exists so duplicates aren't created and passwords stay updated
+    const existingRows = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id);
+    const match = existingRows.find(
+      (r) =>
+        r.user.trim().toLowerCase() === cleanUser.toLowerCase() &&
+        (r.host || "").trim().toLowerCase() === cleanHost.toLowerCase()
+    );
+    let savedRow: typeof emailAccountsTable.$inferSelect;
+    if (match) {
+      const updated = await db
+        .update(emailAccountsTable)
+        .set({
+          ...values,
+          consecutiveFailures: 0,
+          autoPaused: false,
+          lastError: "",
+        })
+        .where(eq(emailAccountsTable.id, match.id))
+        .returning();
+      savedRow = updated[0];
+    } else {
+      const inserted = await db.insert(emailAccountsTable).values(values).returning();
+      savedRow = inserted[0];
+    }
     // Keep KV in sync
     const all = await db.select().from(emailAccountsTable).orderBy(emailAccountsTable.id).catch(() => []);
-    kvWriteAccounts(all).catch(() => {});
-    res.json({ success: true, account: maskAccount(inserted[0]) });
+    if (all.length > 0) kvWriteAccounts(all).catch(() => {});
+    res.json({ success: true, account: maskAccount(savedRow) });
   } catch {
     // DB unavailable — save to KV store instead
     const accounts = await kvReadAccounts();
@@ -1637,11 +1748,62 @@ router.get("/crm/track/history/:email", async (req, res) => {
 
 // ─── Business Hunter ──────────────────────────────────────────────────────────
 
-function applyHunterPreFilters(prospects: any[], preFilters?: string[]): any[] {
+interface AdvancedHunterFilterInput {
+  minIntentScore?: number;
+  minNeedScore?: number;
+  maxWebsiteScore?: number;
+  cmsPlatforms?: string[];
+  missingSignals?: string[];
+  requireVerifiedEmail?: boolean;
+  requirePhone?: boolean;
+  requireDecisionMaker?: boolean;
+  companySizes?: string[];
+  minDealValue?: number;
+  includeKeywords?: string;
+  excludeKeywords?: string;
+}
+
+function applyHunterPreFilters(
+  prospects: any[],
+  preFilters?: string[],
+  advancedFilters?: AdvancedHunterFilterInput
+): any[] {
   const active = Array.isArray(preFilters)
     ? preFilters.map((f) => String(f).trim().toLowerCase()).filter((f) => f && f !== "all")
     : [];
-  if (active.length === 0) return prospects;
+
+  const adv = advancedFilters || {};
+  const hasAdvCriteria = Boolean(
+    (typeof adv.minIntentScore === "number" && adv.minIntentScore > 0) ||
+      (typeof adv.minNeedScore === "number" && adv.minNeedScore > 1) ||
+      (Array.isArray(adv.cmsPlatforms) && adv.cmsPlatforms.length > 0) ||
+      (Array.isArray(adv.missingSignals) && adv.missingSignals.length > 0) ||
+      adv.requireVerifiedEmail ||
+      adv.requirePhone ||
+      adv.requireDecisionMaker ||
+      (adv.includeKeywords && adv.includeKeywords.trim()) ||
+      (adv.excludeKeywords && adv.excludeKeywords.trim())
+  );
+
+  if (active.length === 0 && !hasAdvCriteria) return prospects;
+
+  const excludeTokens = String(adv.excludeKeywords || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const includeTokens = String(adv.includeKeywords || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  // Hard filter on excludeKeywords first
+  const basePool =
+    excludeTokens.length > 0
+      ? prospects.filter((b) => {
+          const hay = `${b.businessName || ""} ${b.website || ""} ${b.painPoint || ""} ${b.category || ""}`.toLowerCase();
+          return !excludeTokens.some((tok) => hay.includes(tok));
+        })
+      : prospects;
 
   const scoreLeadMatch = (b: any): number => {
     const rawWeb = String(b.website || "").trim();
@@ -1666,11 +1828,13 @@ function applyHunterPreFilters(prospects: any[], preFilters?: string[]): any[] {
         b.emailType === "direct_executive"
     );
     const hasVerifiedEmail = Boolean(b.email && String(b.email).includes("@"));
+    const hasPhone = Boolean(b.phone && String(b.phone).trim().length >= 6);
     const needsReview =
       hasNoWebsite || /review/i.test(missing) || !/customer reviews/i.test(tech);
     const missingBookingOrChat = hasNoWebsite || /booking|chat|receptionist/i.test(missing);
-    const isHotIntent =
-      (b.softwareNeedScore ?? 0) >= 6 || (b.buyerIntentScore ?? b.intentScore ?? 0) >= 65;
+    const intentScoreVal = Number(b.buyerIntentScore ?? b.intentScore ?? 65);
+    const needScoreVal = Number(b.softwareNeedScore ?? 5);
+    const isHotIntent = needScoreVal >= 6 || intentScoreVal >= 65;
 
     let matches = 0;
     for (const f of active) {
@@ -1682,32 +1846,59 @@ function applyHunterPreFilters(prospects: any[], preFilters?: string[]): any[] {
       else if (f === "no_booking_chat" && missingBookingOrChat) matches++;
       else if (f === "hot_intent" && isHotIntent) matches++;
     }
+
+    if (typeof adv.minIntentScore === "number" && adv.minIntentScore > 0) {
+      if (intentScoreVal >= adv.minIntentScore) matches += 2;
+    }
+    if (typeof adv.minNeedScore === "number" && adv.minNeedScore > 1) {
+      if (needScoreVal >= adv.minNeedScore) matches += 2;
+    }
+    if (adv.requireVerifiedEmail && hasVerifiedEmail) matches += 2;
+    if (adv.requirePhone && hasPhone) matches += 1;
+    if (adv.requireDecisionMaker && hasDecisionMaker) matches += 2;
+    if (Array.isArray(adv.cmsPlatforms) && adv.cmsPlatforms.length > 0) {
+      if (adv.cmsPlatforms.some((p) => cms.includes(p.toLowerCase()) || (p === "No Website" && hasNoWebsite))) {
+        matches += 2;
+      }
+    }
+    if (Array.isArray(adv.missingSignals) && adv.missingSignals.length > 0) {
+      if (adv.missingSignals.some((m) => missing.includes(m.toLowerCase().slice(0, 12)))) {
+        matches += 2;
+      }
+    }
+    if (includeTokens.length > 0) {
+      const hay = `${b.businessName || ""} ${b.painPoint || ""} ${b.category || ""} ${missing}`.toLowerCase();
+      if (includeTokens.some((tok) => hay.includes(tok))) matches += 2;
+    }
+
     return matches;
   };
 
-  const matched = prospects
+  const matched = basePool
     .map((b) => ({ b, matchCount: scoreLeadMatch(b) }))
     .filter((item) => item.matchCount > 0)
     .sort((a, b) => b.matchCount - a.matchCount || (b.b.intentScore ?? 0) - (a.b.intentScore ?? 0))
     .map((item) => item.b);
 
-  return matched.length > 0 ? matched : prospects;
+  return matched.length > 0 ? matched : basePool;
 }
 
 router.post("/crm/hunt-businesses", async (req, res) => {
-  const { category, city, country, count = 10, extraContext, preFilters } = req.body as {
+  const { category, city, country, count = 10, extraContext, preFilters, advancedFilters } = req.body as {
     category: string;
     city: string;
     country: string;
     count?: number;
     extraContext?: string;
     preFilters?: string[];
+    advancedFilters?: AdvancedHunterFilterInput;
   };
   if (!category || !city) { res.status(400).json({ error: "category and city are required" }); return; }
 
   const needed = Math.min(Number(count) || 10, 10000);
   const hasActivePreFilters =
-    Array.isArray(preFilters) && preFilters.some((f) => f && f !== "all");
+    (Array.isArray(preFilters) && preFilters.some((f) => f && f !== "all")) ||
+    Boolean(advancedFilters);
   const scrapeTargetCount = hasActivePreFilters ? Math.min(needed * 2, 120) : needed;
 
   try {
@@ -1819,7 +2010,7 @@ router.post("/crm/hunt-businesses", async (req, res) => {
     // ── Step 5: MX / DNS verification + Pre-Search Filter ────────────────────
     const { live, dead } = await filterLiveProspects(raw);
     live.sort((a, b) => (b.intentScore ?? 0) - (a.intentScore ?? 0));
-    const filteredByTarget = applyHunterPreFilters(live, preFilters);
+    const filteredByTarget = applyHunterPreFilters(live, preFilters, advancedFilters);
     const returnedProspects = filteredByTarget.slice(0, needed);
 
     try {
@@ -1863,13 +2054,14 @@ router.post("/crm/hunt-businesses", async (req, res) => {
  * and returns globally deduplicated results (no same email/name across cities).
  */
 router.post("/crm/bulk-hunt", async (req, res) => {
-  const { category, cities, country, countPerCity = 50, extraContext, preFilters } = req.body as {
+  const { category, cities, country, countPerCity = 50, extraContext, preFilters, advancedFilters } = req.body as {
     category: string;
     cities: string[];
     country?: string;
     countPerCity?: number;
     extraContext?: string;
     preFilters?: string[];
+    advancedFilters?: AdvancedHunterFilterInput;
   };
 
   if (!category || !Array.isArray(cities) || cities.length === 0) {
@@ -1980,7 +2172,7 @@ router.post("/crm/bulk-hunt", async (req, res) => {
   // MX / DNS verification across all accumulated prospects + Pre-Search Filter
   const { live, dead } = await filterLiveProspects(allProspects);
   live.sort((a, b) => (b.intentScore ?? 0) - (a.intentScore ?? 0));
-  const filteredLive = applyHunterPreFilters(live, preFilters);
+  const filteredLive = applyHunterPreFilters(live, preFilters, advancedFilters);
 
   res.json({
     prospects: filteredLive,

@@ -305,6 +305,65 @@ export const generatedWebsitesTable = pgTable("generated_websites", {
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
+export const savedSearchFiltersTable = pgTable("saved_search_filters", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id"),
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  filtersJson: jsonb("filters_json").default("{}"),
+  isDefault: boolean("is_default").notNull().default(false),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export const customReportTemplatesTable = pgTable("custom_report_templates", {
+  id: serial("id").primaryKey(),
+  reportCode: text("report_code").notNull().unique(),
+  userId: integer("user_id"),
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  metricsConfig: jsonb("metrics_config").default("{}"),
+  generatedSnapshot: jsonb("generated_snapshot").default("{}"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const crmIntegrationsTable = pgTable("crm_integrations", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id"),
+  provider: text("provider").notNull(), // 'hubspot' | 'salesforce' | 'pipedrive' | 'zoho' | 'webhook'
+  name: text("name").notNull(),
+  enabled: boolean("enabled").notNull().default(false),
+  authType: text("auth_type").notNull().default("private_app_token"), // 'private_app_token' | 'oauth_token' | 'api_key' | 'webhook'
+  instanceUrl: text("instance_url").notNull().default(""),
+  accessToken: text("access_token").notNull().default(""),
+  portalOrOrgId: text("portal_or_org_id").notNull().default(""),
+  syncDirection: text("sync_direction").notNull().default("bidirectional"), // 'push' | 'pull' | 'bidirectional'
+  autoSyncOnImport: boolean("auto_sync_on_import").notNull().default(true),
+  autoSyncOnStageChange: boolean("auto_sync_on_stage_change").notNull().default(true),
+  fieldMapping: jsonb("field_mapping").default("{}"),
+  stageMapping: jsonb("stage_mapping").default("{}"),
+  lastSyncAt: timestamp("last_sync_at"),
+  lastSyncStatus: text("last_sync_status").notNull().default("idle"),
+  totalSyncedCount: integer("total_synced_count").notNull().default(0),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const crmSyncLogsTable = pgTable("crm_sync_logs", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id"),
+  integrationId: integer("integration_id"),
+  provider: text("provider").notNull().default(""),
+  direction: text("direction").notNull().default("push"), // 'push' | 'pull' | 'test'
+  action: text("action").notNull().default(""),
+  recordsProcessed: integer("records_processed").notNull().default(0),
+  recordsSucceeded: integer("records_succeeded").notNull().default(0),
+  recordsFailed: integer("records_failed").notNull().default(0),
+  status: text("status").notNull().default("completed"), // 'completed' | 'partial' | 'failed'
+  details: jsonb("details").default("{}"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
 export type EmailAccount = typeof emailAccountsTable.$inferSelect;
 export type AutomationSettings = typeof automationSettingsTable.$inferSelect;
 export type EmailTracking = typeof emailTrackingTable.$inferSelect;
@@ -321,3 +380,7 @@ export type SaasPayment = typeof saasPaymentsTable.$inferSelect;
 export type UserActivity = typeof userActivitiesTable.$inferSelect;
 export type SupportMessage = typeof supportMessagesTable.$inferSelect;
 export type GeneratedWebsite = typeof generatedWebsitesTable.$inferSelect;
+export type SavedSearchFilter = typeof savedSearchFiltersTable.$inferSelect;
+export type CustomReportTemplate = typeof customReportTemplatesTable.$inferSelect;
+export type CrmIntegration = typeof crmIntegrationsTable.$inferSelect;
+export type CrmSyncLog = typeof crmSyncLogsTable.$inferSelect;

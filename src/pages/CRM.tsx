@@ -32,7 +32,20 @@ import {
 import OwnerWebsiteBuilderPanel from "@/components/OwnerWebsiteBuilderPanel";
 import TrainYourAIPanel from "@/components/TrainYourAIPanel";
 import MultiSmtpManagerPanel, { SmtpAppPasswordGuide } from "@/components/MultiSmtpManagerPanel";
+import {
+  upsertAccountInSmtpVault,
+  removeAccountFromSmtpVault,
+  syncSmtpVaultWithServer,
+} from "@/lib/smtp-vault";
 import ProjectWorkspaceBar, { ExportLeadsBar } from "@/components/ProjectWorkspaceBar";
+import AdvancedHunterFiltersBar, {
+  AdvancedLeadFilters,
+  DEFAULT_ADVANCED_FILTERS,
+  doesLeadMatchAdvancedFilters,
+} from "@/components/AdvancedHunterFiltersBar";
+import {
+  CustomMetricsReportBuilder,
+} from "@/components/CustomReportsAndCrmSyncPanel";
 import {
   LeadScrapingProgressSkeleton,
   BatchOperationProgressBanner,
@@ -1102,16 +1115,24 @@ function AccountDialog({ account, onSave, onClose }: {
   };
 
   const adminAuthHeader = (): Record<string, string> => {
-    return { Authorization: `Bearer ${getToken()}` };
+    const cachedUser = getCachedSaasUser();
+    return {
+      Authorization: `Bearer ${getToken()}`,
+      ...(cachedUser?.email ? { "x-user-email": cachedUser.email } : {}),
+      ...(cachedUser?.fullName ? { "x-user-name": cachedUser.fullName } : {}),
+      ...(cachedUser?.role ? { "x-user-role": cachedUser.role } : {}),
+      ...(cachedUser?.planId ? { "x-user-plan": cachedUser.planId } : {}),
+    };
   };
 
   const normalizedFormPayload = () => {
     const isGmailHost = form.host.toLowerCase().includes("gmail.com");
     const effectivePort = form.port === 443 && isGmailHost ? (form.secure ? 465 : 587) : form.port;
+    const rawPass = form.password ? form.password.trim() : "";
     return {
       ...form,
       port: effectivePort,
-      password: form.password ? form.password.replace(/\s+/g, "") : "",
+      password: /^https?:\/\//i.test(rawPass) ? rawPass : rawPass.replace(/\s+/g, ""),
     };
   };
 
@@ -1123,6 +1144,20 @@ function AccountDialog({ account, onSave, onClose }: {
     setSaving(true); setStatus(null);
     try {
       const payload = normalizedFormPayload();
+      upsertAccountInSmtpVault({
+        id: savedAccount?.id,
+        label: payload.label || payload.user,
+        provider: payload.provider,
+        host: payload.host,
+        port: payload.port,
+        secure: payload.secure,
+        user: payload.user,
+        password: payload.password || undefined,
+        fromName: payload.fromName,
+        fromEmail: payload.fromEmail || payload.user,
+        dailyLimit: payload.dailyLimit,
+        active: true,
+      });
       const url = savedAccount ? `${apiBase()}/api/crm/email-accounts/${savedAccount.id}` : `${apiBase()}/api/crm/email-accounts`;
       const r = await fetch(url, {
         method: savedAccount ? "PUT" : "POST",
@@ -1131,6 +1166,22 @@ function AccountDialog({ account, onSave, onClose }: {
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error((d as any).error || "Save failed");
+      if (d.account) {
+        upsertAccountInSmtpVault({
+          id: d.account.id,
+          label: d.account.label,
+          provider: d.account.provider,
+          host: d.account.host,
+          port: d.account.port,
+          secure: d.account.secure,
+          user: d.account.user,
+          password: payload.password || undefined,
+          fromName: d.account.fromName,
+          fromEmail: d.account.fromEmail,
+          dailyLimit: d.account.dailyLimit,
+          active: d.account.active,
+        });
+      }
       onSave(d.account);
     } catch (e: any) {
       setStatus({ type: "error", msg: e.message });
@@ -1145,6 +1196,20 @@ function AccountDialog({ account, onSave, onClose }: {
     setTesting(true); setStatus(null);
     try {
       const payload = normalizedFormPayload();
+      upsertAccountInSmtpVault({
+        id: savedAccount?.id,
+        label: payload.label || payload.user,
+        provider: payload.provider,
+        host: payload.host,
+        port: payload.port,
+        secure: payload.secure,
+        user: payload.user,
+        password: payload.password || undefined,
+        fromName: payload.fromName,
+        fromEmail: payload.fromEmail || payload.user,
+        dailyLimit: payload.dailyLimit,
+        active: true,
+      });
       let targetId = savedAccount?.id;
       if (!targetId) {
         const createRes = await fetch(`${apiBase()}/api/crm/email-accounts`, {
@@ -1343,14 +1408,20 @@ function EmailSettingsPanel() {
 
   const adminAuth = (): Record<string, string> => {
     const tok = getToken() || localStorage.getItem("ds_api_token") || "";
-    return tok ? { Authorization: `Bearer ${tok}` } : {};
+    const cachedUser = getCachedSaasUser();
+    return {
+      ...(tok ? { Authorization: `Bearer ${tok}` } : {}),
+      ...(cachedUser?.email ? { "x-user-email": cachedUser.email } : {}),
+      ...(cachedUser?.fullName ? { "x-user-name": cachedUser.fullName } : {}),
+      ...(cachedUser?.role ? { "x-user-role": cachedUser.role } : {}),
+      ...(cachedUser?.planId ? { "x-user-plan": cachedUser.planId } : {}),
+    };
   };
 
   const load = useCallback(async () => {
     try {
-      const r = await fetch(`${apiBase()}/api/crm/email-accounts`, { headers: adminAuth() });
-      const d = await r.json().catch(() => ([]));
-      setAccounts(Array.isArray(d) ? d : []);
+      const synced = await syncSmtpVaultWithServer(adminAuth(), apiBase());
+      setAccounts(Array.isArray(synced) ? synced : []);
     } catch { /* ignore */ } finally { setLoading(false); }
   }, []);
 
@@ -1381,6 +1452,12 @@ function EmailSettingsPanel() {
   const deleteAccount = async (id: number) => {
     setDeletingId(id);
     try {
+      const targetAcct = accounts.find(a => a.id === id);
+      removeAccountFromSmtpVault({
+        id,
+        user: targetAcct?.user,
+        host: targetAcct?.host,
+      });
       await fetch(`${apiBase()}/api/crm/email-accounts/${id}`, { method: "DELETE", headers: adminAuth() });
       setAccounts(prev => prev.filter(a => a.id !== id));
     } finally { setDeletingId(null); }
@@ -1669,6 +1746,7 @@ function AIHunterPanel({
   const trainedOffer = useTrainedOfferSummary();
   const [apolloFilter, setApolloFilter] = useState<string>("all");
   const [preSearchFilters, setPreSearchFilters] = useState<string[]>(["all"]);
+  const [advancedFilters, setAdvancedFilters] = useState<AdvancedLeadFilters>(DEFAULT_ADVANCED_FILTERS);
   const [preFilterDropdownOpen, setPreFilterDropdownOpen] = useState<boolean>(false);
   const preFilterDropdownRef = useRef<HTMLDivElement | null>(null);
   const [hunterSearchQuery, setHunterSearchQuery] = useState<string>("");
@@ -2183,6 +2261,7 @@ function AIHunterPanel({
             countPerCity: effectiveCount,
             extraContext,
             preFilters: preSearchFilters,
+            advancedFilters,
           });
           const businesses: HuntedBusiness[] = Array.isArray(resp) ? resp : (resp.prospects ?? []);
           totalFiltered += resp.filtered ?? 0;
@@ -2236,6 +2315,7 @@ function AIHunterPanel({
             count: effectiveCount,
             extraContext,
             preFilters: preSearchFilters,
+            advancedFilters,
           });
           const businesses: HuntedBusiness[] = Array.isArray(resp) ? resp : (resp.prospects ?? []);
           totalFiltered += resp.filtered ?? 0;
@@ -2710,6 +2790,15 @@ function AIHunterPanel({
             <label className="text-xs font-semibold text-muted-foreground mb-1 block">Extra Context (optional)</label>
             <Input value={extraContext} onChange={e => setExtraContext(e.target.value)} placeholder="e.g. focus on mid-size businesses, avoid chains, luxury segment…" />
           </div>
+          <div className="sm:col-span-2">
+            <AdvancedHunterFiltersBar
+              filters={advancedFilters}
+              onChange={setAdvancedFilters}
+              onApplyPresetPreFilters={setPreSearchFilters}
+              totalLeadsCount={results.length}
+              matchedLeadsCount={results.filter((b) => doesLeadMatchAdvancedFilters(b, advancedFilters)).length}
+            />
+          </div>
           <div className="sm:col-span-2 flex items-center justify-between gap-3 p-3 bg-purple-50 border border-purple-200 rounded-xl">
             <div>
               <div className="text-sm font-bold text-purple-900 flex items-center gap-2"><Bot className="w-4 h-4" /> Auto-Generate Analysis & Emails</div>
@@ -3029,6 +3118,7 @@ function AIHunterPanel({
                   )}
                   {results.map((b, i) => {
                     if (hasStrictPreMatch && !matchesPreSearchFilter(b)) return null;
+                    if (!doesLeadMatchAdvancedFilters(b, advancedFilters)) return null;
               if (hunterSearchQuery.trim()) {
                 const q = hunterSearchQuery.trim().toLowerCase();
                 const matchText = `${b.businessName || ""} ${b.website || ""} ${b.email || ""} ${b.city || ""} ${b.painPoint || ""}`.toLowerCase();
@@ -5624,6 +5714,7 @@ function ProspectList({
   const [statusFilter, setStatusFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [apolloQuickFilter, setApolloQuickFilter] = useState("all");
+  const [prospectAdvancedFilters, setProspectAdvancedFilters] = useState<AdvancedLeadFilters>(DEFAULT_ADVANCED_FILTERS);
   const [sortBy, setSortBy] = useState<SortKey>("ai-score");
   const [trackingStats, setTrackingStats] = useState<Record<string, TrackingStats>>({});
   const [openEmailIds, setOpenEmailIds] = useState<Record<number, boolean>>({});
@@ -5797,6 +5888,7 @@ function ProspectList({
         if (apolloQuickFilter === "missing_chat" && !(p.missingSignals || []).some(s => s.toLowerCase().includes("chat") || s.toLowerCase().includes("booking"))) return false;
         if (apolloQuickFilter === "has_cms" && !p.cmsPlatform) return false;
       }
+      if (!doesLeadMatchAdvancedFilters(p, prospectAdvancedFilters)) return false;
       return true;
     })
     .sort((a, b) => {
@@ -6728,10 +6820,11 @@ function ProposalRequestRow({ request }: { request: CustomRequest }) {
 
 // ─── Website Reports Panel ────────────────────────────────────────────────────
 
-function WebsiteReportsPanel() {
+function WebsiteReportsPanel({ prospects = [] }: { prospects?: Prospect[] }) {
   const [, setLocation] = useLocation();
   const [reports, setReports] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [reportSubTab, setReportSubTab] = useState<"custom_metrics" | "audit_reports">("custom_metrics");
 
   const loadReports = useCallback(async () => {
     setLoading(true);
@@ -6782,7 +6875,41 @@ function WebsiteReportsPanel() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
+      {/* Sub-navigation between Custom Metrics Report Builder and Client Website Audit Reports */}
+      <div className="flex flex-wrap items-center justify-between gap-3 p-1.5 bg-slate-100 rounded-xl border border-slate-200">
+        <div className="flex items-center gap-1 flex-wrap">
+          <button
+            type="button"
+            onClick={() => setReportSubTab("custom_metrics")}
+            className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+              reportSubTab === "custom_metrics"
+                ? "bg-white text-slate-900 shadow-sm"
+                : "text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            <BarChart3 className="w-3.5 h-3.5 text-indigo-600" />
+            <span>Customizable Metrics &amp; KPI Report Builder</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setReportSubTab("audit_reports")}
+            className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+              reportSubTab === "audit_reports"
+                ? "bg-white text-slate-900 shadow-sm"
+                : "text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            <Globe className="w-3.5 h-3.5 text-purple-600" />
+            <span>Client-Facing Website Audit Reports ({reports.length})</span>
+          </button>
+        </div>
+      </div>
+
+      {reportSubTab === "custom_metrics" ? (
+        <CustomMetricsReportBuilder prospects={prospects} />
+      ) : (
+        <>
       <div className="flex items-center justify-between">
         <div>
           <h3 className="font-bold text-lg flex items-center gap-2">
@@ -6850,6 +6977,8 @@ function WebsiteReportsPanel() {
             </div>
           ))}
         </div>
+      )}
+        </>
       )}
     </div>
   );
@@ -6949,6 +7078,11 @@ export default function CRM() {
       clearSaasSession();
       setLocation("/auth?mode=login&redirect=/crm");
     });
+    // Automatically sync persistent SMTP vault on CRM load so SMTP accounts never clear after a Render push
+    syncSmtpVaultWithServer(
+      { Authorization: `Bearer ${getToken()}` },
+      apiBase()
+    ).catch(() => {});
     // Load this user's private prospects from the server and merge with this user's local prospects
     authFetch("/api/crm/prospects")
       .then((r) => (r.ok ? r.json() : null))
@@ -7310,7 +7444,7 @@ export default function CRM() {
               {projectProspects.length > 0 && <span className="text-xs bg-primary/20 text-primary px-1.5 py-0.5 rounded-full font-bold">{projectProspects.length}</span>}
             </TabsTrigger>
             <TabsTrigger value="reports" className="flex-1 gap-1.5">
-              <Globe className="w-4 h-4" /> Audit Reports
+              <BarChart3 className="w-4 h-4" /> Reports &amp; Metrics
             </TabsTrigger>
             <TabsTrigger value="train-ai" className="flex-1 gap-1.5 text-purple-700 font-bold">
               <Wand2 className="w-4 h-4 text-purple-600" /> Train Your AI (My Offers)
@@ -7368,7 +7502,7 @@ export default function CRM() {
           </TabsContent>
 
           <TabsContent value="reports">
-            <WebsiteReportsPanel />
+            <WebsiteReportsPanel prospects={projectProspects} />
           </TabsContent>
 
           <TabsContent value="train-ai">

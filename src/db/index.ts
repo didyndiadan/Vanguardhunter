@@ -91,7 +91,16 @@ function translatePgSqlToSqlite(queryStr: string, params: any[]): { sqlText: str
 }
 
 function initSqliteFallback(forceReset = false) {
-  const dataDir = process.env.PGDATA_DIR || path.join(os.tmpdir(), "ai-business-hunter-sqlite-v4");
+  const preferredDir = process.env.PGDATA_DIR || path.join(process.cwd(), ".data");
+  let dataDir = preferredDir;
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+  } catch {
+    dataDir = path.join(os.tmpdir(), "ai-business-hunter-sqlite-v4");
+    try {
+      fs.mkdirSync(dataDir, { recursive: true });
+    } catch {}
+  }
   const dbFilePath = path.join(dataDir, "vanguard.sqlite");
   try {
     if (sqliteDb) {
@@ -105,7 +114,7 @@ function initSqliteFallback(forceReset = false) {
     }
     fs.mkdirSync(dataDir, { recursive: true });
     sqliteDb = new DatabaseSync(dbFilePath);
-    sqliteDb.exec("PRAGMA journal_mode = MEMORY; PRAGMA synchronous = OFF; PRAGMA busy_timeout = 5000;");
+    sqliteDb.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;");
   } catch {
     sqliteDb = new DatabaseSync(":memory:");
   }
@@ -485,6 +494,69 @@ CREATE TABLE IF NOT EXISTS generated_websites (
 CREATE INDEX IF NOT EXISTS idx_generated_websites_creator_created ON generated_websites(created_by_email, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_generated_websites_prospect ON generated_websites(prospect_id);
 CREATE INDEX IF NOT EXISTS idx_crm_prospects_updated ON crm_prospects(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS saved_search_filters (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  filters_json JSONB DEFAULT '{}'::jsonb,
+  is_default BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_saved_search_filters_user ON saved_search_filters(user_id);
+
+CREATE TABLE IF NOT EXISTS custom_report_templates (
+  id SERIAL PRIMARY KEY,
+  report_code TEXT NOT NULL UNIQUE,
+  user_id INTEGER,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  metrics_config JSONB DEFAULT '{}'::jsonb,
+  generated_snapshot JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_custom_report_templates_user ON custom_report_templates(user_id);
+
+CREATE TABLE IF NOT EXISTS crm_integrations (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER,
+  provider TEXT NOT NULL,
+  name TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT false,
+  auth_type TEXT NOT NULL DEFAULT 'private_app_token',
+  instance_url TEXT NOT NULL DEFAULT '',
+  access_token TEXT NOT NULL DEFAULT '',
+  portal_or_org_id TEXT NOT NULL DEFAULT '',
+  sync_direction TEXT NOT NULL DEFAULT 'bidirectional',
+  auto_sync_on_import BOOLEAN NOT NULL DEFAULT true,
+  auto_sync_on_stage_change BOOLEAN NOT NULL DEFAULT true,
+  field_mapping JSONB DEFAULT '{}'::jsonb,
+  stage_mapping JSONB DEFAULT '{}'::jsonb,
+  last_sync_at TIMESTAMP,
+  last_sync_status TEXT NOT NULL DEFAULT 'idle',
+  total_synced_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_crm_integrations_user ON crm_integrations(user_id);
+
+CREATE TABLE IF NOT EXISTS crm_sync_logs (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER,
+  integration_id INTEGER,
+  provider TEXT NOT NULL DEFAULT '',
+  direction TEXT NOT NULL DEFAULT 'push',
+  action TEXT NOT NULL DEFAULT '',
+  records_processed INTEGER NOT NULL DEFAULT 0,
+  records_succeeded INTEGER NOT NULL DEFAULT 0,
+  records_failed INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'completed',
+  details JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_crm_sync_logs_user ON crm_sync_logs(user_id);
 `;
 
 export async function initDatabase(): Promise<void> {
@@ -528,16 +600,26 @@ export async function initDatabase(): Promise<void> {
       if (pgConnected && pgPool) {
         try {
           await pgPool.query(SCHEMA_SQL);
+        } catch {
+          // Run statement-by-statement so a single migration statement never drops the Postgres connection
+          const stmts = SCHEMA_SQL.split(";")
+            .map((s) => s.trim())
+            .filter(Boolean);
+          for (const st of stmts) {
+            try {
+              await pgPool.query(st);
+            } catch (stmtErr: any) {
+              console.warn("[db] Postgres statement warning:", stmtErr?.message);
+            }
+          }
+        }
+        try {
           await pgPool.query(`
             DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
             DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
+            UPDATE email_accounts SET auto_paused = false, consecutive_failures = 0, last_error = '' WHERE auto_paused = true;
           `);
-        } catch (schemaErr: any) {
-          console.warn("[db] PostgreSQL schema init failed, falling back to embedded SQLite:", schemaErr?.message);
-          await pgPool.end().catch(() => {});
-          pgPool = null;
-          initSqliteFallback();
-        }
+        } catch {}
       }
     }
 
@@ -550,15 +632,24 @@ export async function initDatabase(): Promise<void> {
         .replace(/\bDEFAULT\s+true\b/gi, "DEFAULT 1");
       try {
         sqliteDb.exec(sqliteSchemaSql);
-      } catch (sqliteErr) {
-        console.warn("[db] Embedded SQLite recovery needed, resetting database:", sqliteErr);
-        sqliteDb = new DatabaseSync(":memory:");
-        sqliteDb.exec(sqliteSchemaSql);
+      } catch {
+        const stmts = sqliteSchemaSql
+          .split(";")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        for (const st of stmts) {
+          try {
+            sqliteDb.exec(st + ";");
+          } catch {}
+        }
       }
-      sqliteDb.exec(`
-        DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
-        DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
-      `);
+      try {
+        sqliteDb.exec(`
+          DELETE FROM crm_prospects WHERE email LIKE '%example.com%' OR website LIKE '%example.com%';
+          DELETE FROM website_reports WHERE website LIKE '%example.com%' OR report_id IN ('audit-dental-9th-st', 'audit-velvet-crumb');
+          UPDATE email_accounts SET auto_paused = 0, consecutive_failures = 0, last_error = '' WHERE auto_paused = 1;
+        `);
+      } catch {}
     }
 
     const existingSettings = await db.select().from(schema.automationSettingsTable).limit(1);
@@ -992,6 +1083,231 @@ export async function initDatabase(): Promise<void> {
           },
         ]);
       }
+    }
+
+    // Seed default Advanced Search Filter Presets if empty
+    const existingSavedFilters = await db.select().from(schema.savedSearchFiltersTable).limit(1);
+    if (existingSavedFilters.length === 0) {
+      await db.insert(schema.savedSearchFiltersTable).values([
+        {
+          userId: null,
+          name: "High-Intent Decision Makers (Score 75+ & Verified Email)",
+          description: "Targets local businesses with verified email, identified owner/founder, and buyer intent score >= 75.",
+          isDefault: true,
+          filtersJson: {
+            preFilters: ["verified_email", "decision_maker", "hot_intent"],
+            minIntentScore: 75,
+            minNeedScore: 6,
+            maxWebsiteScore: 75,
+            cmsPlatforms: [],
+            missingSignals: ["No AI Chat / Receptionist", "No Online Booking"],
+            requireVerifiedEmail: true,
+            requirePhone: false,
+            requireDecisionMaker: true,
+            companySizes: ["1-10", "11-50"],
+            minDealValue: 1500,
+            includeKeywords: "",
+            excludeKeywords: "walmart, mcdonalds, starbucks, corporate",
+          },
+        },
+        {
+          userId: null,
+          name: "No Website / DIY Wix & WordPress Redesign Targets",
+          description: "Finds businesses with no website or low-scoring DIY templates missing mobile booking.",
+          isDefault: false,
+          filtersJson: {
+            preFilters: ["no_website", "bad_website"],
+            minIntentScore: 55,
+            minNeedScore: 7,
+            maxWebsiteScore: 60,
+            cmsPlatforms: ["No Website", "Wix", "Squarespace", "GoDaddy", "WordPress"],
+            missingSignals: ["No Website Built", "No Online Booking"],
+            requireVerifiedEmail: false,
+            requirePhone: true,
+            requireDecisionMaker: false,
+            companySizes: ["1-10", "11-50"],
+            minDealValue: 2000,
+            includeKeywords: "",
+            excludeKeywords: "",
+          },
+        },
+        {
+          userId: null,
+          name: "5-Star Review Shield & Reputation Funnel Targets",
+          description: "Targets clinics, medspas, and home service contractors lacking automated Google review funnels.",
+          isDefault: false,
+          filtersJson: {
+            preFilters: ["no_reviews", "verified_email"],
+            minIntentScore: 60,
+            minNeedScore: 5,
+            maxWebsiteScore: 85,
+            cmsPlatforms: [],
+            missingSignals: ["No 5-Star Review Funnel"],
+            requireVerifiedEmail: true,
+            requirePhone: true,
+            requireDecisionMaker: false,
+            companySizes: ["1-10", "11-50", "51-200"],
+            minDealValue: 1200,
+            includeKeywords: "",
+            excludeKeywords: "",
+          },
+        },
+      ]);
+    }
+
+    // Seed default Customizable Report Templates if empty
+    const existingReportTemplates = await db.select().from(schema.customReportTemplatesTable).limit(1);
+    if (existingReportTemplates.length === 0) {
+      await db.insert(schema.customReportTemplatesTable).values([
+        {
+          reportCode: "RPT-EXEC-PIPELINE",
+          userId: null,
+          name: "Executive Revenue & Lead Conversion Report",
+          description: "Tracks end-to-end funnel velocity from AI Hunter discovery to Website Audit engagement and closed-won deal value.",
+          metricsConfig: {
+            selectedMetrics: [
+              "total_prospects",
+              "verified_email_rate",
+              "avg_intent_score",
+              "avg_website_score",
+              "audit_report_views",
+              "outreach_open_rate",
+              "pipeline_value",
+              "weighted_forecast",
+              "win_rate",
+            ],
+            groupBy: "category",
+            dateRange: "all",
+            kpiTargets: {
+              win_rate: 20,
+              outreach_open_rate: 38,
+              pipeline_value: 50000,
+              avg_intent_score: 70,
+            },
+            weights: {
+              websiteScoreWeight: 35,
+              intentScoreWeight: 40,
+              dealValueWeight: 25,
+            },
+          },
+          generatedSnapshot: {},
+        },
+        {
+          reportCode: "RPT-TECH-GAP-AUDIT",
+          userId: null,
+          name: "Digital Health & Missing Signal Opportunity Matrix",
+          description: "Analyzes scraped prospect websites by CMS platform, mobile/SEO audit scores, and top missing revenue signals.",
+          metricsConfig: {
+            selectedMetrics: [
+              "total_prospects",
+              "avg_website_score",
+              "avg_mobile_score",
+              "avg_seo_score",
+              "avg_conversion_score",
+              "missing_chat_rate",
+              "missing_booking_rate",
+              "proposal_requests",
+            ],
+            groupBy: "cmsPlatform",
+            dateRange: "30d",
+            kpiTargets: {
+              avg_website_score: 65,
+              outreach_open_rate: 35,
+              pipeline_value: 35000,
+              avg_intent_score: 65,
+            },
+            weights: {
+              websiteScoreWeight: 50,
+              intentScoreWeight: 30,
+              dealValueWeight: 20,
+            },
+          },
+          generatedSnapshot: {},
+        },
+      ]);
+    }
+
+    // Seed default Salesforce & HubSpot CRM Integration Connectors if empty
+    const existingIntegrations = await db.select().from(schema.crmIntegrationsTable).limit(1);
+    if (existingIntegrations.length === 0) {
+      await db.insert(schema.crmIntegrationsTable).values([
+        {
+          userId: null,
+          provider: "hubspot",
+          name: "HubSpot CRM (Contacts, Companies & Deals v3)",
+          enabled: true,
+          authType: "private_app_token",
+          instanceUrl: "https://api.hubapi.com",
+          accessToken: "",
+          portalOrOrgId: "HS-PORTAL-849201",
+          syncDirection: "bidirectional",
+          autoSyncOnImport: true,
+          autoSyncOnStageChange: true,
+          fieldMapping: {
+            businessName: "company",
+            ownerName: "firstname_lastname",
+            email: "email",
+            phone: "phone",
+            website: "website",
+            city: "city",
+            category: "industry",
+            expectedValue: "amount",
+            buyerIntentScore: "hs_lead_score",
+            primaryOffer: "recommended_offer__c",
+            reportUrl: "website_audit_url",
+          },
+          stageMapping: {
+            new: "appointmentscheduled",
+            contacted: "qualifiedtobuy",
+            waiting: "qualifiedtobuy",
+            proposal_sent: "presentationscheduled",
+            meeting: "decisionmakerboughtin",
+            negotiating: "contractsent",
+            won: "closedwon",
+            lost: "closedlost",
+          },
+          lastSyncStatus: "ready",
+          totalSyncedCount: 0,
+        },
+        {
+          userId: null,
+          provider: "salesforce",
+          name: "Salesforce Enterprise CRM (Lead & Opportunity SObjects)",
+          enabled: true,
+          authType: "oauth_token",
+          instanceUrl: "https://vanguard-enterprise.my.salesforce.com",
+          accessToken: "",
+          portalOrOrgId: "00D8c000004Vngd",
+          syncDirection: "bidirectional",
+          autoSyncOnImport: true,
+          autoSyncOnStageChange: true,
+          fieldMapping: {
+            businessName: "Company",
+            ownerName: "LastName",
+            email: "Email",
+            phone: "Phone",
+            website: "Website",
+            city: "City",
+            category: "Industry",
+            expectedValue: "AnnualRevenue",
+            buyerIntentScore: "Rating",
+            primaryOffer: "ProductInterest__c",
+            reportUrl: "Description",
+          },
+          stageMapping: {
+            new: "Open - Not Contacted",
+            contacted: "Working - Contacted",
+            waiting: "Working - Contacted",
+            proposal_sent: "Proposal/Price Quote",
+            meeting: "Qualification",
+            negotiating: "Negotiation/Review",
+            won: "Closed Won",
+            lost: "Closed Lost",
+          },
+          lastSyncStatus: "ready",
+          totalSyncedCount: 0,
+        },
+      ]);
     }
   } catch (err) {
     console.error("[db] Database initialization error:", err);
